@@ -16,7 +16,18 @@
 - [x] 修复单个网页 403 导致整个工具节点退出的问题
 - [x] 增加流式内容隔离和 HTTP 403 回归测试
 - [x] 建立 Stage 01 可复现快照与 PPT 讲解索引
-- [ ] 安装完整 test group 并运行目标单元测试（后续按需进行）
+
+## 2026-07-16
+
+- [x] 增加 `[S#]` 结构化来源账本、成功来源门槛和失败来源记录
+- [x] 增加 `single | multi | auto` 可选拓扑与 researcher/reviewer 明确角色
+- [x] 增加 `low | medium | high | xhigh` 四档硬资源策略
+- [x] 完成 nano single、nano multi、mini + 免费 reviewer 的真实路径验证
+- [x] 增加 SQLite checkpoint、命名 thread 恢复与本次 trace 历史隔离
+- [x] 在 `report.md` 之外保存 `trace.json`、`sources.json`、`run.json` 审计产物
+- [x] 建立 Stage 02 可复现快照与创新边界说明
+- [x] 运行搜索 Agent 的 10 个离线回归测试
+- [ ] 安装上游完整 test group 并运行整个 monorepo 测试（后续按需进行）
 - [ ] 用户完成第 1 课口头自测和四个修改练习
 
 ## 环境记录

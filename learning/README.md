@@ -31,6 +31,7 @@
 - [实践课讲义：全真实联网搜索 Agent](practice-01-real-search-agent.md)
 - [阶段快照](stages/README.md)
 - [Stage 01：真实单 Agent 搜索闭环](stages/stage-01-real-search-loop.md)
+- [Stage 02：分级、多 Agent、可恢复研究闭环](stages/stage-02-adaptive-research.md)
 
 ## 先记住的一句话
 

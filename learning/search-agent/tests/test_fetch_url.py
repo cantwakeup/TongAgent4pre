@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -57,8 +58,13 @@ class FetchUrlTests(unittest.TestCase):
         result = fetch_url.invoke({"url": "https://example.com/private"})
 
         self.assertEqual(
-            result,
-            "Fetch failed with HTTP 403 for https://example.com/private. Try another source.",
+            json.loads(result),
+            {
+                "status": "error",
+                "url": "https://example.com/private",
+                "error": "HTTP 403",
+                "retry_with_another_source": True,
+            },
         )
 
 

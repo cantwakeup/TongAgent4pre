@@ -1,0 +1,84 @@
+"""Tests for shared tool budgets and the structured source ledger."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from unittest.mock import patch
+
+from agent_policy import EFFORT_POLICIES
+from search_agent import build_budgeted_tools
+
+
+class ResearchBudgetTests(unittest.TestCase):
+    """Verify hard limits, source IDs, and URL deduplication."""
+
+    def test_search_budget_is_enforced(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        search = next(item for item in tools if item.name == "web_search")
+        raw_result = json.dumps({"query": "test", "results": []})
+
+        with patch("search_agent.web_search") as raw_search:
+            raw_search.invoke.return_value = raw_result
+            first = json.loads(search.invoke({"query": "one"}))
+            second = json.loads(search.invoke({"query": "two"}))
+            third = json.loads(search.invoke({"query": "three"}))
+
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(second["status"], "success")
+        self.assertEqual(third["status"], "budget_exceeded")
+        self.assertEqual(budget.snapshot()["search_calls"], 2)
+
+    def test_successful_fetches_receive_stable_source_ids(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        fetch = next(item for item in tools if item.name == "fetch_url")
+
+        def result_for(call: dict[str, object]) -> str:
+            url = str(call["url"])
+            return json.dumps(
+                {
+                    "status": "success",
+                    "url": url,
+                    "title": f"Title for {url}",
+                    "content": "evidence",
+                    "content_chars": 800,
+                }
+            )
+
+        with patch("search_agent.fetch_url") as raw_fetch:
+            raw_fetch.invoke.side_effect = result_for
+            first = json.loads(fetch.invoke({"url": "https://example.com/a"}))
+            duplicate = json.loads(
+                fetch.invoke({"url": "https://example.com/a#section"})
+            )
+            second = json.loads(fetch.invoke({"url": "https://example.com/b"}))
+
+        self.assertEqual(first["source_id"], "S1")
+        self.assertEqual(duplicate["source_id"], "S1")
+        self.assertEqual(second["source_id"], "S2")
+        self.assertEqual(len(budget.snapshot()["successful_sources"]), 2)
+
+    def test_short_pages_do_not_count_as_evidence(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        fetch = next(item for item in tools if item.name == "fetch_url")
+        short_page = json.dumps(
+            {
+                "status": "success",
+                "url": "https://example.com/redirect",
+                "title": "Redirecting",
+                "content": "Go to the new documentation.",
+                "content_chars": 28,
+            }
+        )
+
+        with patch("search_agent.fetch_url") as raw_fetch:
+            raw_fetch.invoke.return_value = short_page
+            result = json.loads(fetch.invoke({"url": "https://example.com/redirect"}))
+
+        self.assertEqual(result["status"], "insufficient_content")
+        self.assertNotIn("source_id", result)
+        self.assertEqual(budget.snapshot()["successful_sources"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

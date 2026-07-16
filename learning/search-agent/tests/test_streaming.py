@@ -8,7 +8,12 @@ from collections.abc import Iterator
 from contextlib import redirect_stdout
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage, ToolMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    ToolMessage,
+    ToolMessageChunk,
+)
 
 from search_agent import _stream_agent
 
@@ -18,46 +23,58 @@ class _FakeAgent:
 
     def stream(self, *args: Any, **kwargs: Any) -> Iterator[tuple[str, Any]]:
         del args, kwargs
-        yield "messages", (
-            ToolMessageChunk(
-                content="SECRET PAGE BODY",
-                tool_call_id="call-1",
-                name="fetch_url",
-                id="tool-1",
-            ),
-            {"langgraph_node": "tools"},
-        )
-        yield "messages", (
-            AIMessageChunk(content="WRONG NODE BODY", id="ai-wrong"),
-            {"langgraph_node": "tools"},
-        )
-        yield "messages", (
-            AIMessageChunk(content="hello", id="ai-final"),
-            {"langgraph_node": "model"},
-        )
-        yield "values", {
-            "messages": [
-                AIMessage(
-                    content="",
-                    id="ai-call",
-                    tool_calls=[
-                        {
-                            "name": "fetch_url",
-                            "args": {"url": "https://example.com"},
-                            "id": "call-1",
-                            "type": "tool_call",
-                        }
-                    ],
-                ),
-                ToolMessage(
+        yield (
+            "messages",
+            (
+                ToolMessageChunk(
                     content="SECRET PAGE BODY",
                     tool_call_id="call-1",
                     name="fetch_url",
                     id="tool-1",
                 ),
-                AIMessage(content="hello", id="ai-final"),
-            ]
-        }
+                {"langgraph_node": "tools"},
+            ),
+        )
+        yield (
+            "messages",
+            (
+                AIMessageChunk(content="WRONG NODE BODY", id="ai-wrong"),
+                {"langgraph_node": "tools"},
+            ),
+        )
+        yield (
+            "messages",
+            (
+                AIMessageChunk(content="hello", id="ai-final"),
+                {"langgraph_node": "model"},
+            ),
+        )
+        yield (
+            "values",
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        id="ai-call",
+                        tool_calls=[
+                            {
+                                "name": "fetch_url",
+                                "args": {"url": "https://example.com"},
+                                "id": "call-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    ToolMessage(
+                        content="SECRET PAGE BODY",
+                        tool_call_id="call-1",
+                        name="fetch_url",
+                        id="tool-1",
+                    ),
+                    AIMessage(content="hello", id="ai-final"),
+                ]
+            },
+        )
 
 
 class StreamAgentTests(unittest.TestCase):
