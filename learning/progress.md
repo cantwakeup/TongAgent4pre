@@ -27,6 +27,17 @@
 - [x] 在 `report.md` 之外保存 `trace.json`、`sources.json`、`run.json` 审计产物
 - [x] 建立 Stage 02 可复现快照与创新边界说明
 - [x] 运行搜索 Agent 的 10 个离线回归测试
+- [x] 增加模型结构化研究计划与确定性 fallback
+- [x] 增加 `plan -> select -> research -> evaluate -> report` 外层状态图
+- [x] 增加 `SQ#` 子问题状态、依赖、尝试上限和结构覆盖度
+- [x] 将研究计划、事件和预算快照写入 SQLite checkpoint
+- [x] 验证关闭并重开 SQLite 后从中断的 research 节点继续
+- [x] 验证 Stage 02 message-only 状态形状可由新图兼容读取
+- [x] 新增 `plan.json` 与 `events.jsonl` 审计产物
+- [x] 完成 low/single/nano Stage 03A 真实路径验证
+- [x] 将离线回归扩展到 27 项，并通过 Ruff 检查
+- [x] 在 `run.json` 聚合当前 plan 可见模型消息的 token 用量
+- [x] 建立 Stage 03A 可复现快照与 PPT 讲解索引
 - [ ] 安装上游完整 test group 并运行整个 monorepo 测试（后续按需进行）
 - [ ] 用户完成第 1 课口头自测和四个修改练习
 

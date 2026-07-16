@@ -16,3 +16,4 @@
 
 - [`stage-01-real-search-loop.md`](stage-01-real-search-loop.md)：真实单 Agent 搜索闭环
 - [`stage-02-adaptive-research.md`](stage-02-adaptive-research.md)：结构化证据、持久化线程和分级多 Agent 研究
+- [`stage-03a-explicit-research-state.md`](stage-03a-explicit-research-state.md)：显式研究计划、子问题状态机、结构覆盖度与节点级恢复

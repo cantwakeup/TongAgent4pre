@@ -1,0 +1,67 @@
+{
+  "recorded_at": "2026-07-16",
+  "thread_id": "stage03a-smoke-v4",
+  "topic": "LangGraph 是什么，适合哪些类型的工作流？",
+  "scenario": "planner fallback plus CLI pending-node recovery",
+  "model": "gpt-5.4-nano",
+  "worker_model": "deepseek-v4-flash",
+  "effort": "low",
+  "topology": "single",
+  "planner": "deterministic-fallback:APIConnectionError",
+  "resumed_node": "research_agent",
+  "subquestions": 1,
+  "search_calls": 1,
+  "max_searches": 2,
+  "fetch_calls": 2,
+  "max_fetches": 3,
+  "successful_sources": [
+    {
+      "source_id": "S1",
+      "url": "https://langgraph.com.cn/index.html",
+      "title": "LangGraph - LangChain 框架",
+      "content_chars": 2518
+    },
+    {
+      "source_id": "S2",
+      "url": "https://www.langchain.com/langgraph",
+      "title": "LangGraph: Agent Orchestration Framework for Reliable AI Agents",
+      "content_chars": 5059
+    }
+  ],
+  "tool_calls": [
+    "get_research_plan",
+    "web_search",
+    "fetch_url",
+    "fetch_url",
+    "update_subquestion",
+    "write_file"
+  ],
+  "events": [
+    "plan_created",
+    "subquestion_selected",
+    "subquestion_updated",
+    "coverage_evaluated",
+    "report_requested",
+    "run_finished"
+  ],
+  "coverage": 1.0,
+  "plan_status": "completed",
+  "validation": "passed",
+  "validation_errors": [],
+  "api_usage": {
+    "model_calls": 7,
+    "input_tokens": 33287,
+    "output_tokens": 1843,
+    "total_tokens": 35130,
+    "cache_read_tokens": 26496,
+    "planner_call_included": false,
+    "estimated_cost_usd": null,
+    "usage_recomputed_from_checkpoint": true
+  },
+  "offline_tests": 27,
+  "notes": [
+    "The first restricted-network attempt created the fallback plan and stopped at research_agent.",
+    "The first authorized continuation received a transient HTTP 500 from the free nano backend.",
+    "The next continuation used the same checkpoint and completed without replanning."
+  ]
+}

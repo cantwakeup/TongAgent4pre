@@ -1,18 +1,20 @@
 # TongAgent 真实联网研究 Agent
 
-这是一个建立在 LangChain、LangGraph 和 Deep Agents 之上的可运行研究 Agent。它会真实搜索网页、抓取证据、生成带来源编号的报告，并把运行策略、工具轨迹、来源账本和 checkpoint 保存到本地。
+这是一个建立在 LangChain、LangGraph 和 Deep Agents 之上的可运行研究 Agent。它会先生成显式研究计划，再按子问题真实搜索网页、抓取证据、计算结构覆盖度并生成带来源编号的报告，同时保存计划状态、工具轨迹、来源账本和 checkpoint。
 
 ## 当前闭环
 
 ```text
 用户问题
   -> 资源策略（effort）与拓扑路由（mode）
-  -> single：主 Agent 直接搜索和读取
-     或 multi：主 Agent -> researcher -> 可选 reviewer
+  -> 结构化 research plan：SQ1 ... SQn
+  -> 外层图：select -> research -> evaluate -> loop
+  -> single：内层主 Agent 直接搜索和读取
+     或 multi：内层主 Agent -> researcher -> 可选 reviewer
   -> 结构化来源账本 [S1] [S2] ...
-  -> write_file 写入报告
+  -> 结构 coverage 合格后 write_file 写入报告
   -> 质量门槛验收
-  -> report.md + trace.json + sources.json + run.json + SQLite checkpoint
+  -> report.md + plan.json + events.jsonl + trace/sources/run + SQLite checkpoint
 ```
 
 Agent 没有 shell 工具。它只能访问公开 HTTP(S) 页面，并只能在 `output/` 虚拟根中写文件。
@@ -67,12 +69,12 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 
 `--effort low|medium|high|xhigh` 不只是更换模型，还会改变硬工具预算、证据门槛、页面长度、输出上限和 reviewer 要求：
 
-| effort | 默认主模型 | 搜索/抓取上限 | 最少成功来源 | multi reviewer |
-| --- | --- | ---: | ---: | --- |
-| `low` | `gpt-5.4-nano` | 2 / 3 | 2 | 否 |
-| `medium` | `gpt-5.4-nano` | 4 / 6 | 2 | 否 |
-| `high` | `gpt-5.4-mini` | 8 / 9 | 3 | 是 |
-| `xhigh` | `gpt-5.4-mini` | 12 / 14 | 4 | 是 |
+| effort | 默认主模型 | 最多子问题 | 搜索/抓取上限 | 最少成功来源 | multi reviewer |
+| --- | --- | ---: | ---: | ---: | --- |
+| `low` | `gpt-5.4-nano` | 1 | 2 / 3 | 2 | 否 |
+| `medium` | `gpt-5.4-nano` | 2 | 4 / 6 | 2 | 否 |
+| `high` | `gpt-5.4-mini` | 4 | 8 / 9 | 3 | 是 |
+| `xhigh` | `gpt-5.4-mini` | 5 | 12 / 14 | 4 | 是 |
 
 可用 `--model` 覆盖主模型，`--worker-model` 覆盖 reviewer；reviewer 默认使用免费的 `deepseek-v4-flash`。
 
@@ -102,7 +104,11 @@ SEARCH_AGENT_API_KEY=<private-api-key>
   "先解释 LangGraph checkpoint"
 ```
 
-用 `--checkpoint-db /path/to/research.sqlite` 可指定数据库。恢复线程时，模型能看到旧消息，但新生成的 `trace.json` 只记录本次运行事件。
+用 `--checkpoint-db /path/to/research.sqlite` 可指定数据库。恢复线程时，模型能看到旧消息；如果 `checkpoint.next` 表明图仍有待执行节点，CLI 会先用 `invoke(None)` 精确继续旧节点，再接收真正的新问题。预算计数、来源 ID 和事件也会从 checkpoint 恢复；新生成的 `trace.json` 仍只记录本次 CLI 进程新增的消息。
+
+当前恢复保证在外层子问题节点边界生效。内层 Agent 返回时，来源账本会和节点结果一起写入外层状态；如果进程恰好终止在网络工具内部，该工具节点仍可能重跑。未完成 plan 会恢复剩余硬预算；已完成 thread 的新 plan 会保留累计来源目录和连续 `[S#]` 编号，但搜索/抓取计数从零开始，避免新问题继承已经耗尽的旧额度。
+
+`covered` 是结构状态，不等于系统已自动理解证据语义。代码只允许当前子问题更新，并要求 `[S#]` 存在于成功来源账本、至少一个来自当前研究步骤；“页面是否真正支持该子问题”目前仍由模型判断，正文片段和 Claim-Evidence 校验属于下一阶段。
 
 ## 输出与验收
 
@@ -111,10 +117,12 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 | 文件 | 内容 |
 | --- | --- |
 | `output/report.md` | 最终研究报告 |
+| `output/plan.json` | 当前显式计划、子问题状态、结构覆盖度与预算 |
+| `output/events.jsonl` | 计划创建、选择、更新、评估与结束事件 |
 | `output/trace.json` | 本次主图工具调用，不含网页正文和密钥 |
 | `output/sources.json` | 搜索/抓取预算、成功来源和失败来源 |
-| `output/run.json` | 模型、拓扑、effort、thread、委派角色和验收结果 |
-| `output/checkpoints.sqlite` | 可恢复的 LangGraph 消息状态 |
+| `output/run.json` | 模型、拓扑、effort、thread、委派角色、基础 token 用量和验收结果 |
+| `output/checkpoints.sqlite` | 可恢复的消息、计划、事件与预算状态 |
 
 抓取成功不等于合格证据：少于 500 个可见字符的页面标记为 `insufficient_content`；URL fragment 会被去重；403/404、超时和安全拒绝会作为失败来源记录。主程序还会检查成功来源数、来源引用、`write_file`、researcher/reviewer 委派和 Sources URL。
 
@@ -124,7 +132,9 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-测试覆盖拓扑路由、四档策略、角色构建、工具硬预算、来源编号与去重、短页面拒绝、HTTP 403 恢复、流式正文隔离，以及 SQLite checkpoint 恢复。
+当前 27 项离线测试覆盖拓扑路由、四档策略、角色构建、工具硬预算、来源编号与去重、短页面拒绝、HTTP 403、流式正文隔离、planner fallback、计划历史、依赖级联阻塞、账本来源校验、结构覆盖度、尝试上限、message-only checkpoint 形状兼容、CLI `invoke(None)` 续跑、基础 token 聚合，以及 SQLite 关闭重开后的计划与预算恢复。
+
+`run.json.api_usage` 汇总当前 plan checkpoint 中 AI 消息的 provider-reported input/output/cache-read token。结构化 planner 调用尚未进入消息状态，multi 模式的嵌套 subagent 用量也可能不进入外层消息；供应商没有返回账单或价目表，所以当前明确记录 `planner_call_included=false` 和 `estimated_cost_usd=null`，不会用猜测价格冒充真实费用。
 
 ## 安全边界
 

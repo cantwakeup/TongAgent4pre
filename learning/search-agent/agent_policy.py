@@ -22,6 +22,7 @@ class EffortPolicy:
     max_results_per_search: int
     max_chars_per_page: int
     max_output_tokens: int
+    max_subquestions: int
     require_reviewer: bool
 
 
@@ -34,6 +35,7 @@ EFFORT_POLICIES: dict[EffortName, EffortPolicy] = {
         max_results_per_search=4,
         max_chars_per_page=8_000,
         max_output_tokens=3_000,
+        max_subquestions=1,
         require_reviewer=False,
     ),
     "medium": EffortPolicy(
@@ -44,6 +46,7 @@ EFFORT_POLICIES: dict[EffortName, EffortPolicy] = {
         max_results_per_search=5,
         max_chars_per_page=12_000,
         max_output_tokens=5_000,
+        max_subquestions=2,
         require_reviewer=False,
     ),
     "high": EffortPolicy(
@@ -54,6 +57,7 @@ EFFORT_POLICIES: dict[EffortName, EffortPolicy] = {
         max_results_per_search=6,
         max_chars_per_page=15_000,
         max_output_tokens=8_000,
+        max_subquestions=4,
         require_reviewer=True,
     ),
     "xhigh": EffortPolicy(
@@ -64,6 +68,7 @@ EFFORT_POLICIES: dict[EffortName, EffortPolicy] = {
         max_results_per_search=8,
         max_chars_per_page=20_000,
         max_output_tokens=12_000,
+        max_subquestions=5,
         require_reviewer=True,
     ),
 }
@@ -110,6 +115,7 @@ def policy_prompt(policy: EffortPolicy, topology: TopologyName) -> str:
 - effort: {policy.name}
 - topology: {topology}
 - at most {policy.max_searches} searches and {policy.max_fetches} page fetches across all agents
+- at most {policy.max_subquestions} explicit research subquestions
 - at least {policy.min_successful_sources} successfully fetched, relevant sources
 - cite factual claims with source IDs such as [S1]
 - list every cited source as `[S1] Page title — full URL` in the Sources section

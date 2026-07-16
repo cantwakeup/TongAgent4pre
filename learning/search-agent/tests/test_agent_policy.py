@@ -27,6 +27,7 @@ class AgentPolicyTests(unittest.TestCase):
         prompt = policy_prompt(EFFORT_POLICIES["xhigh"], "multi")
 
         self.assertIn("at most 12 searches", prompt)
+        self.assertIn("at most 5 explicit research subquestions", prompt)
         self.assertIn("at least 4 successfully fetched", prompt)
         self.assertIn("reviewer subagent", prompt)
 
