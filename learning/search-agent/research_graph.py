@@ -18,8 +18,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from evidence_graph import independent_evidence_source_ids
 from research_state import (
     BudgetState,
+    EvidenceStance,
     ResearchEvent,
     ResearchPlan,
     SubQuestion,
@@ -33,6 +35,7 @@ Planner = Callable[[str, int], ResearchPlan]
 BudgetSnapshot = Callable[[], dict[str, Any]]
 BudgetConfigure = Callable[[list[str]], None]
 BudgetActivate = Callable[[str | None], None]
+EvidenceRecord = Callable[..., dict[str, Any]]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
@@ -132,6 +135,8 @@ def create_research_plan(
                 "attempts": 0,
                 "max_attempts": max(1, max_attempts),
                 "evidence_source_ids": [],
+                "claim_ids": [],
+                "conflict_ids": [],
                 "note": "",
             }
         )
@@ -144,6 +149,7 @@ def create_research_plan(
     factory = plan_id_factory or (lambda: str(uuid4()))
     return {
         "plan_id": factory(),
+        "evidence_schema_version": 1,
         "question": normalized_topic,
         "objective": " ".join((objective or normalized_topic).split()),
         "planner": planner,
@@ -238,7 +244,11 @@ def calculate_plan_coverage(plan: ResearchPlan) -> float:
 def refresh_plan_status(plan: ResearchPlan) -> ResearchPlan:
     """Return a copied plan with code-derived coverage and aggregate status."""
     updated = deepcopy(plan)
+    updated.setdefault("evidence_schema_version", 0)
     subquestions = updated.get("subquestions", [])
+    for item in subquestions:
+        item.setdefault("claim_ids", [])
+        item.setdefault("conflict_ids", [])
     updated["coverage"] = calculate_plan_coverage(updated)
     statuses = {item["status"] for item in subquestions}
     if subquestions and statuses == {"covered"}:
@@ -257,6 +267,8 @@ def transition_subquestion(
     status: SubquestionStatus,
     *,
     evidence_source_ids: Sequence[str] = (),
+    claim_ids: Sequence[str] = (),
+    conflict_ids: Sequence[str] = (),
     note: str = "",
     increment_attempt: bool = False,
 ) -> ResearchPlan:
@@ -267,6 +279,8 @@ def transition_subquestion(
         subquestion_id: Stable `SQ#` identifier.
         status: Desired next status.
         evidence_source_ids: Evidence IDs associated with a covered item.
+        claim_ids: Canonical claim IDs associated with the item.
+        conflict_ids: Canonical conflict IDs associated with the item.
         note: Short result or blocking explanation.
         increment_attempt: Whether this transition begins a new attempt.
 
@@ -288,7 +302,7 @@ def transition_subquestion(
     allowed: dict[SubquestionStatus, set[SubquestionStatus]] = {
         "pending": {"researching", "blocked"},
         "researching": {"pending", "covered", "blocked"},
-        "covered": {"covered"},
+        "covered": {"covered", "blocked"},
         "blocked": {"blocked"},
     }
     if status not in allowed[current]:
@@ -303,8 +317,35 @@ def transition_subquestion(
     if invalid_evidence:
         msg = "Evidence source IDs must use the S# format"
         raise ValueError(msg)
+    claims = list(dict.fromkeys(claim_ids))
+    invalid_claims = [
+        claim_id
+        for claim_id in claims
+        if not isinstance(claim_id, str) or not re.fullmatch(r"C[1-9][0-9]*", claim_id)
+    ]
+    if invalid_claims:
+        msg = "Claim IDs must use the C# format"
+        raise ValueError(msg)
+    conflicts = list(dict.fromkeys(conflict_ids))
+    invalid_conflicts = [
+        conflict_id
+        for conflict_id in conflicts
+        if not isinstance(conflict_id, str)
+        or not re.fullmatch(r"X[1-9][0-9]*", conflict_id)
+    ]
+    if invalid_conflicts:
+        msg = "Conflict IDs must use the X# format"
+        raise ValueError(msg)
     if status == "covered" and not evidence and not target["evidence_source_ids"]:
         msg = "Covered subquestions require at least one evidence source ID"
+        raise ValueError(msg)
+    if (
+        status == "covered"
+        and int(updated.get("evidence_schema_version", 0)) >= 1
+        and not claims
+        and not target.get("claim_ids", [])
+    ):
+        msg = "Evidence schema v1 covered subquestions require a canonical claim ID"
         raise ValueError(msg)
     if status == "blocked" and not note.strip():
         msg = "Blocked subquestions require an explanatory note"
@@ -315,6 +356,14 @@ def transition_subquestion(
     if evidence:
         target["evidence_source_ids"] = list(
             dict.fromkeys([*target["evidence_source_ids"], *evidence])
+        )
+    if claims:
+        target["claim_ids"] = list(
+            dict.fromkeys([*target.get("claim_ids", []), *claims])
+        )
+    if conflicts:
+        target["conflict_ids"] = list(
+            dict.fromkeys([*target.get("conflict_ids", []), *conflicts])
         )
     if note.strip():
         target["note"] = " ".join(note.split())
@@ -387,6 +436,96 @@ def select_next_subquestion(plan: ResearchPlan) -> tuple[ResearchPlan, str | Non
     return updated, candidate["id"]
 
 
+def invalid_covered_subquestions(
+    plan: ResearchPlan, snapshot: dict[str, Any]
+) -> dict[str, list[str]]:
+    """Audit every covered SQ against the checkpointed claim graph."""
+    if int(plan.get("evidence_schema_version", 0)) < 1:
+        return {}
+    claims_by_id = {
+        str(item.get("claim_id", "")): item for item in snapshot.get("claims", [])
+    }
+    evidence_units = snapshot.get("evidence_units", [])
+    conflicts = snapshot.get("conflicts", [])
+    invalid: dict[str, list[str]] = {}
+    for item in plan.get("subquestions", []):
+        if item.get("status") != "covered":
+            continue
+        subquestion_id = str(item.get("id", ""))
+        claim_ids = list(dict.fromkeys(item.get("claim_ids", [])))
+        claim_id_set = set(claim_ids)
+        reasons: list[str] = []
+        if not claim_ids:
+            reasons.append("missing canonical claims")
+        valid_claim_ids = {
+            claim_id
+            for claim_id in claim_ids
+            if (
+                (claim := claims_by_id.get(claim_id)) is not None
+                and claim.get("subquestion_id") == subquestion_id
+                and claim.get("status") in {"supported", "contested"}
+                and claim.get("supporting_evidence_ids")
+            )
+        }
+        if valid_claim_ids != claim_id_set:
+            reasons.append("unknown, cross-SQ, or unsupported claims")
+        attached_units = [
+            unit
+            for unit in evidence_units
+            if str(unit.get("claim_id", "")) in claim_id_set
+        ]
+        derived_source_ids = {str(unit.get("source_id", "")) for unit in attached_units}
+        if set(item.get("evidence_source_ids", [])) != derived_source_ids:
+            reasons.append("source IDs do not match claim edges")
+        derived_conflict_ids = {
+            str(conflict.get("conflict_id", ""))
+            for conflict in conflicts
+            if str(conflict.get("claim_id", "")) in claim_id_set
+        }
+        if set(item.get("conflict_ids", [])) != derived_conflict_ids:
+            reasons.append("conflict IDs do not match contested claims")
+        if reasons:
+            invalid[subquestion_id] = reasons
+    subquestions = plan.get("subquestions", [])
+    if subquestions and all(item.get("status") == "covered" for item in subquestions):
+        plan_source_ids = {
+            str(source_id)
+            for item in subquestions
+            for source_id in item.get("evidence_source_ids", [])
+        }
+        plan_claim_ids = {
+            str(claim_id)
+            for item in subquestions
+            for claim_id in item.get("claim_ids", [])
+        }
+        independent_count = len(
+            independent_evidence_source_ids(
+                source_ids=plan_source_ids,
+                sources=snapshot.get("successful_sources", []),
+                evidence_units=evidence_units,
+                claim_ids=plan_claim_ids,
+            )
+        )
+        minimum_sources = int(snapshot.get("min_successful_sources", 0))
+        if independent_count < minimum_sources:
+            last_id = str(subquestions[-1].get("id", ""))
+            invalid.setdefault(last_id, []).append(
+                f"only {independent_count} of {minimum_sources} required independent sources"
+            )
+        required_searches = min(
+            int(snapshot.get("max_searches", 0)), max(1, len(subquestions))
+        )
+        successful_searches = int(
+            snapshot.get("successful_searches", snapshot.get("search_calls", 0))
+        )
+        if successful_searches < required_searches:
+            last_id = str(subquestions[-1].get("id", ""))
+            invalid.setdefault(last_id, []).append(
+                f"only {successful_searches} of {required_searches} required successful searches"
+            )
+    return invalid
+
+
 def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
     """Expose the canonical ID/title/URL mapping shared by every agent role."""
 
@@ -405,6 +544,11 @@ def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
                 "subquestion_usage": snapshot.get("subquestion_usage", {}).get(
                     active, {}
                 ),
+                "evidence_graph_counts": {
+                    "claims": len(snapshot.get("claims", [])),
+                    "evidence_units": len(snapshot.get("evidence_units", [])),
+                    "conflicts": len(snapshot.get("conflicts", [])),
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -413,7 +557,126 @@ def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
     return get_source_ledger
 
 
-def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool]:
+def build_evidence_graph_tools(
+    evidence_record: EvidenceRecord, budget_snapshot: BudgetSnapshot
+) -> list[BaseTool]:
+    """Build tools for exact-excerpt registration and graph inspection."""
+
+    @tool("record_evidence")
+    def record_evidence(
+        source_id: str,
+        claim: str,
+        quote: str,
+        stance: EvidenceStance = "supports",
+        claim_id: str = "",
+    ) -> str:
+        """Link an exact source excerpt to a code-assigned canonical claim.
+
+        The claim must be a self-contained report-ready proposition with a
+        subject and predicate, never a topic label or field name. Omit claim_id
+        to create it. Pass claim_id only when reusing an existing C# returned by
+        a successful earlier call; never invent a C#.
+        """
+        try:
+            result = evidence_record(
+                source_id=source_id,
+                claim=claim,
+                quote=quote,
+                stance=stance,
+                claim_id=claim_id,
+            )
+        except ValueError as exc:
+            result = {"status": "error", "error": str(exc)}
+        else:
+            result = {"status": "success", **result}
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @tool("get_evidence_graph")
+    def get_evidence_graph() -> str:
+        """Return canonical claims, exact excerpts, and unresolved conflicts."""
+        snapshot = budget_snapshot()
+        return json.dumps(
+            {
+                "evidence_graph_version": snapshot.get("evidence_graph_version", 0),
+                "claims": snapshot.get("claims", []),
+                "evidence_units": snapshot.get("evidence_units", []),
+                "conflicts": snapshot.get("conflicts", []),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    return [record_evidence, get_evidence_graph]
+
+
+def _has_current_researcher_delegation(
+    messages: Sequence[Any], subquestion_id: str
+) -> bool:
+    """Return whether the current SQ has a completed researcher task."""
+    start: int | None = None
+    for index, message in enumerate(messages):
+        message_id = (
+            message.get("id", "")
+            if isinstance(message, dict)
+            else getattr(message, "id", "") or ""
+        )
+        if str(message_id).startswith("research-step-"):
+            start = index
+    if start is None:
+        return False
+    pending_call_ids: set[str] = set()
+    expected_marker = f"[SQ:{subquestion_id}]"
+    for message in messages[start:]:
+        tool_calls = (
+            message.get("tool_calls", [])
+            if isinstance(message, dict)
+            else getattr(message, "tool_calls", []) or []
+        )
+        for call in tool_calls:
+            args = (
+                call.get("args", {})
+                if isinstance(call, dict)
+                else getattr(call, "args", {}) or {}
+            )
+            name = (
+                call.get("name", "")
+                if isinstance(call, dict)
+                else getattr(call, "name", "") or ""
+            )
+            call_id = (
+                call.get("id", "")
+                if isinstance(call, dict)
+                else getattr(call, "id", "") or ""
+            )
+            description = str(args.get("description", "")).lstrip()
+            if (
+                name == "task"
+                and args.get("subagent_type") == "researcher"
+                and description.startswith(expected_marker)
+                and call_id
+            ):
+                pending_call_ids.add(str(call_id))
+        tool_call_id = (
+            message.get("tool_call_id", "")
+            if isinstance(message, dict)
+            else getattr(message, "tool_call_id", "") or ""
+        )
+        if str(tool_call_id) not in pending_call_ids:
+            continue
+        status = (
+            message.get("status", "success")
+            if isinstance(message, dict)
+            else getattr(message, "status", "success") or "success"
+        )
+        if status == "success":
+            return True
+        pending_call_ids.discard(str(tool_call_id))
+    return False
+
+
+def build_research_state_tools(
+    budget_snapshot: BudgetSnapshot, *, require_researcher: bool = False
+) -> list[BaseTool]:
     """Build tools that expose and persist ledger-validated plan progress."""
 
     @tool("get_research_plan")
@@ -449,7 +712,24 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
                 },
                 ensure_ascii=False,
             )
-        ledger = budget_snapshot().get("successful_sources", [])
+        if require_researcher and not _has_current_researcher_delegation(
+            runtime.state.get("messages", []), str(active_subquestion_id)
+        ):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "Multi-agent research requires task(subagent_type='researcher') "
+                        "during the current research step before update_subquestion. "
+                        f"Prefix its description with [SQ:{active_subquestion_id}], "
+                        "wait for its successful result, then retry; do not claim "
+                        "that network tools are unavailable"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        snapshot = budget_snapshot()
+        ledger = snapshot.get("successful_sources", [])
         ledger_by_id = {str(item.get("source_id", "")): dict(item) for item in ledger}
         requested_ids = set(evidence_source_ids)
         unknown_ids = sorted(requested_ids - set(ledger_by_id))
@@ -464,36 +744,212 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
                 },
                 ensure_ascii=False,
             )
-        previous_ids = set(runtime.state.get("active_source_ids_before", []))
-        current_step_ids = set(ledger_by_id) - previous_ids
-        if requested_ids and not requested_ids.intersection(current_step_ids):
+        graph_required = int(plan.get("evidence_schema_version", 0)) >= 1
+        graph_claims = [
+            dict(item)
+            for item in snapshot.get("claims", [])
+            if item.get("subquestion_id") == active_subquestion_id
+        ]
+        eligible_claims = [
+            item
+            for item in graph_claims
+            if item.get("status") in {"supported", "contested"}
+        ]
+        active_claims = eligible_claims if status == "covered" else graph_claims
+        active_claim_ids = [str(item["claim_id"]) for item in active_claims]
+        active_claim_id_set = set(active_claim_ids)
+        active_conflicts = [
+            dict(item)
+            for item in snapshot.get("conflicts", [])
+            if item.get("claim_id") in active_claim_id_set
+        ]
+        active_conflict_ids = [str(item["conflict_id"]) for item in active_conflicts]
+        active_units = [
+            dict(item)
+            for item in snapshot.get("evidence_units", [])
+            if item.get("claim_id") in active_claim_id_set
+        ]
+        graph_source_ids = {str(item.get("source_id", "")) for item in active_units}
+        if graph_required and status == "covered" and not eligible_claims:
             return json.dumps(
                 {
                     "status": "error",
                     "error": (
-                        "Evidence IDs attached to an update must include at least "
-                        "one source fetched during the active research step"
+                        "Covered status requires at least one supported canonical "
+                        "claim for the active subquestion"
                     ),
                 },
                 ensure_ascii=False,
             )
-        if status == "covered" and not requested_ids.intersection(current_step_ids):
+        if graph_required and requested_ids != graph_source_ids:
             return json.dumps(
                 {
                     "status": "error",
                     "error": (
-                        "Covered status requires at least one successful source "
-                        "fetched during the active research step"
+                        "Evidence source IDs must exactly match the active "
+                        "claim-evidence graph: expected "
+                        + ", ".join(sorted(graph_source_ids))
                     ),
                 },
                 ensure_ascii=False,
             )
+        other_subquestions = [
+            item
+            for item in plan.get("subquestions", [])
+            if item.get("id") != subquestion_id
+        ]
+        would_finish_plan = status == "covered" and all(
+            item.get("status") == "covered" for item in other_subquestions
+        )
+        if graph_required and would_finish_plan:
+            candidate_source_ids = {
+                str(source_id)
+                for item in other_subquestions
+                for source_id in item.get("evidence_source_ids", [])
+            }.union(requested_ids)
+            candidate_claim_ids = {
+                str(claim_id)
+                for item in other_subquestions
+                for claim_id in item.get("claim_ids", [])
+            }.union(active_claim_id_set)
+            independent_source_ids = independent_evidence_source_ids(
+                source_ids=candidate_source_ids,
+                sources=ledger,
+                evidence_units=snapshot.get("evidence_units", []),
+                claim_ids=candidate_claim_ids,
+            )
+            minimum_sources = int(snapshot.get("min_successful_sources", 0))
+            if len(independent_source_ids) < minimum_sources:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "The final covered update requires at least "
+                            f"{minimum_sources} independent canonical sources; "
+                            f"currently {len(independent_source_ids)}. Continue "
+                            "researching and register a claim from another "
+                            "independent fetched page"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            required_searches = min(
+                int(snapshot.get("max_searches", 0)),
+                max(1, len(plan.get("subquestions", []))),
+            )
+            successful_searches = int(
+                snapshot.get("successful_searches", snapshot.get("search_calls", 0))
+            )
+            if successful_searches < required_searches:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "The final covered update requires at least "
+                            f"{required_searches} successful web searches; currently "
+                            f"{successful_searches}. Run a relevant web_search, "
+                            "then retry this update"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+        if graph_required and status == "blocked":
+            candidate_source_ids = {
+                str(source_id)
+                for item in other_subquestions
+                for source_id in item.get("evidence_source_ids", [])
+            }.union(graph_source_ids)
+            candidate_claim_ids = {
+                str(claim_id)
+                for item in other_subquestions
+                for claim_id in item.get("claim_ids", [])
+            }.union(str(item["claim_id"]) for item in eligible_claims)
+            independent_count = len(
+                independent_evidence_source_ids(
+                    source_ids=candidate_source_ids,
+                    sources=ledger,
+                    evidence_units=snapshot.get("evidence_units", []),
+                    claim_ids=candidate_claim_ids,
+                )
+            )
+            minimum_sources = int(snapshot.get("min_successful_sources", 0))
+            required_searches = min(
+                int(snapshot.get("max_searches", 0)),
+                max(1, len(plan.get("subquestions", []))),
+            )
+            successful_searches = int(
+                snapshot.get("successful_searches", snapshot.get("search_calls", 0))
+            )
+            active_limits = snapshot.get("subquestion_limits", {}).get(
+                active_subquestion_id, {}
+            )
+            active_usage = snapshot.get("subquestion_usage", {}).get(
+                active_subquestion_id, {}
+            )
+            remaining_fetches = max(
+                0,
+                int(active_limits.get("max_fetches", snapshot.get("max_fetches", 0)))
+                - int(active_usage.get("fetch_calls", snapshot.get("fetch_calls", 0))),
+            )
+            remaining_searches = max(
+                0,
+                int(active_limits.get("max_searches", snapshot.get("max_searches", 0)))
+                - int(
+                    active_usage.get("search_calls", snapshot.get("search_calls", 0))
+                ),
+            )
+            source_gap_recoverable = (
+                independent_count < minimum_sources and remaining_fetches > 0
+            )
+            search_gap_recoverable = (
+                successful_searches < required_searches and remaining_searches > 0
+            )
+            if source_gap_recoverable or search_gap_recoverable:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Blocked status is premature: the active SQ still has "
+                            "recoverable policy gaps and reserved budget remains. "
+                            "Continue web_search/fetch_url/record_evidence, or stop "
+                            "without updating so the bounded outer retry can resume"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+        if not graph_required:
+            previous_ids = set(runtime.state.get("active_source_ids_before", []))
+            current_step_ids = set(ledger_by_id) - previous_ids
+            if requested_ids and not requested_ids.intersection(current_step_ids):
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Evidence IDs attached to an update must include at least "
+                            "one source fetched during the active research step"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            if status == "covered" and not requested_ids.intersection(current_step_ids):
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Covered status requires at least one successful source "
+                            "fetched during the active research step"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         try:
             updated = transition_subquestion(
                 plan,
                 subquestion_id,
                 status,
                 evidence_source_ids=evidence_source_ids,
+                claim_ids=active_claim_ids,
+                conflict_ids=active_conflict_ids,
                 note=note,
             )
         except ValueError as exc:
@@ -506,7 +962,12 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
             "subquestion_updated",
             plan_id=updated["plan_id"],
             subquestion_id=subquestion_id,
-            details={"status": status, "evidence_source_ids": evidence_source_ids},
+            details={
+                "status": status,
+                "evidence_source_ids": evidence_source_ids,
+                "claim_ids": active_claim_ids,
+                "conflict_ids": active_conflict_ids,
+            },
         )
         content = json.dumps(
             {
@@ -514,6 +975,8 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
                 "subquestion_id": subquestion_id,
                 "new_status": status,
                 "coverage": updated["coverage"],
+                "canonical_claims": active_claims,
+                "canonical_conflicts": active_conflicts,
                 "canonical_sources": [
                     ledger_by_id[source_id]
                     for source_id in evidence_source_ids
@@ -546,6 +1009,7 @@ def build_research_graph(
     max_subquestions: int,
     max_research_cycles: int,
     interrupt_before: list[str] | None = None,
+    require_researcher: bool = False,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
@@ -559,6 +1023,7 @@ def build_research_graph(
         max_subquestions: Hard plan breadth limit.
         max_research_cycles: Loop limit protecting against stalled model behavior.
         interrupt_before: Optional node interrupts used by recovery tests.
+        require_researcher: Force one researcher task call per active SQ.
 
     Returns:
         Compiled checkpointable research graph.
@@ -601,6 +1066,7 @@ def build_research_graph(
             "research_events": events,
             "active_subquestion_id": None,
             "active_source_ids_before": [],
+            "active_evidence_ids_before": [],
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "selecting",
             "research_cycles": 0,
@@ -609,7 +1075,19 @@ def build_research_graph(
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
         previous_plan = state["research_plan"]
-        plan, active = select_next_subquestion(state["research_plan"])
+        audited_plan = deepcopy(previous_plan)
+        preselection_budget = budget_snapshot()
+        rejected_covered = invalid_covered_subquestions(
+            audited_plan, preselection_budget
+        )
+        for subquestion_id, reasons in rejected_covered.items():
+            audited_plan = transition_subquestion(
+                audited_plan,
+                subquestion_id,
+                "blocked",
+                note="Covered state rejected: " + "; ".join(reasons),
+            )
+        plan, active = select_next_subquestion(audited_plan)
         if budget_activate is not None:
             budget_activate(active)
         budget = budget_snapshot()
@@ -618,6 +1096,17 @@ def build_research_graph(
             item["id"]: item["status"] for item in previous_plan["subquestions"]
         }
         for item in plan["subquestions"]:
+            if (
+                item["status"] == "blocked"
+                and previous_statuses.get(item["id"]) == "covered"
+            ):
+                events = append_research_event(
+                    events,
+                    "covered_state_rejected",
+                    plan_id=plan["plan_id"],
+                    subquestion_id=item["id"],
+                    details={"note": item["note"]},
+                )
             if (
                 item["status"] == "blocked"
                 and previous_statuses.get(item["id"]) == "pending"
@@ -641,11 +1130,16 @@ def build_research_graph(
         )
         sources = budget.get("successful_sources", [])
         source_ids = [str(item.get("source_id", "")) for item in sources]
+        evidence_ids = [
+            str(item.get("evidence_id", ""))
+            for item in budget.get("evidence_units", [])
+        ]
         return {
             "research_plan": plan,
             "research_events": events,
             "active_subquestion_id": active,
             "active_source_ids_before": source_ids,
+            "active_evidence_ids_before": evidence_ids,
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
         }
@@ -663,13 +1157,23 @@ def build_research_graph(
         budget = budget_snapshot()
         limits = budget.get("subquestion_limits", {}).get(active_id, {})
         usage = budget.get("subquestion_usage", {}).get(active_id, {})
+        delegation_instruction = (
+            "MULTI MODE: your very next tool call MUST be task with "
+            "subagent_type='researcher' and its description MUST start exactly "
+            f"with '[SQ:{active_id}]'. Give it this full active SQ and require "
+            "web_search, fetch_url, record_evidence, and canonical C/E/S IDs in "
+            "its return. Do not call update_subquestion or claim network tools are "
+            "unavailable before that task returns.\n\n"
+            if require_researcher
+            else ""
+        )
         content = f"""[RESEARCH STEP]
 Root question: {state["research_plan"]["question"]}
 Active subquestion: {active["id"]} — {active["question"]}
 Rationale: {active["rationale"] or "Required for plan coverage."}
 Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ensure_ascii=False)}
 
-Research only this active subquestion. Read the explicit plan with get_research_plan when useful. Use get_source_ledger after fetching and copy only its canonical [S#]/title/URL mappings. Gather successfully fetched evidence, then call update_subquestion with status=covered and the relevant canonical IDs. Search snippets never receive source IDs. If it cannot be answered within the reserved SQ budget, mark it blocked with a concrete reason and use an empty evidence list unless this step fetched a canonical source. Do not write the final report during this step."""
+{delegation_instruction}Research only this active subquestion. Read the explicit plan with get_research_plan when useful. After each successful fetch, call record_evidence for every factual proposition you may report, copying an exact 12-800 character excerpt from that fetched page. The claim argument must itself be a self-contained report-ready sentence with subject and predicate, never a label such as "official name" or "contact email"; quote is the separate exact page excerpt that supports it. OMIT claim_id when creating a new claim: the tool assigns C#. Pass claim_id only to add evidence to a C# already returned by a successful record_evidence call; never invent C#. If a tool call fails, read its error, correct the arguments, and retry within budget. Then call get_evidence_graph and pass update_subquestion exactly the [S#] IDs linked to this SQ's canonical [C#] claims. The final covered update also enforces the policy's minimum web-search and independent-source counts; if it reports either minimum is unmet, continue researching and retry instead of blocking. A source alone cannot cover an SQ. Search snippets never receive source IDs or evidence units. If no supported claim can be registered within the reserved budget, mark the SQ blocked. Do not write the final report during this step."""
         message_id = (
             f"research-step-{state['research_plan']['plan_id']}-{active['id']}-"
             f"{active['attempts']}"
@@ -691,6 +1195,12 @@ Research only this active subquestion. Read the explicit plan with get_research_
         new_ids = [
             source_id for source_id in current_ids if source_id not in previous_ids
         ]
+        previous_evidence_ids = set(state.get("active_evidence_ids_before", []))
+        new_evidence_ids = [
+            str(item.get("evidence_id", ""))
+            for item in budget.get("evidence_units", [])
+            if str(item.get("evidence_id", "")) not in previous_evidence_ids
+        ]
         if active_id:
             active = next(
                 item for item in plan["subquestions"] if item["id"] == active_id
@@ -710,6 +1220,15 @@ Research only this active subquestion. Read the explicit plan with get_research_
                         "pending",
                         note="No new successful evidence; retry is allowed.",
                     )
+        for subquestion_id, reasons in invalid_covered_subquestions(
+            plan, budget
+        ).items():
+            plan = transition_subquestion(
+                plan,
+                subquestion_id,
+                "blocked",
+                note="Covered state rejected: " + "; ".join(reasons),
+            )
         plan = refresh_plan_status(plan)
         cycles = int(state.get("research_cycles", 0)) + 1
         events = append_research_event(
@@ -721,6 +1240,7 @@ Research only this active subquestion. Read the explicit plan with get_research_
                 "coverage": plan["coverage"],
                 "plan_status": plan["status"],
                 "new_source_ids": new_ids,
+                "new_evidence_ids": new_evidence_ids,
                 "cycle": cycles,
             },
         )
@@ -771,14 +1291,26 @@ Research only this active subquestion. Read the explicit plan with get_research_
         ledger_json = json.dumps(
             budget.get("successful_sources", []), ensure_ascii=False, indent=2
         )
+        evidence_graph_json = json.dumps(
+            {
+                "claims": budget.get("claims", []),
+                "evidence_units": budget.get("evidence_units", []),
+                "conflicts": budget.get("conflicts", []),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         content = f"""[FINAL SYNTHESIS]
-You MUST call write_file to create the final `/report.md` for the root question using the accumulated fetched evidence and the explicit plan below. The canonical source ledger below is authoritative: every [S#], title, and URL in prose and Sources must match it exactly. Search snippets and failed fetches are not evidence. Include a short answer, key findings, caveats, unresolved or blocked subquestions, and a Sources section with full URLs. If the plan is partial, still write an honest partial report explaining the evidence gap. Do not claim that blocked work was completed.
+You MUST call write_file to create the final `/report.md` for the root question using only the canonical evidence graph below. Use exactly these four H2 section headings in this order with Sources last: `## Short Answer`, `## Key Findings`, `## Conflicts and Caveats`, and `## Sources`; do not add other headings. Every non-empty finding line must contain exactly one canonical `claim.text` copied byte-for-byte from the graph plus its `[C#]` and linked `[S#]`; copy `claim.text`, NOT the evidence quote. The only valid shape is `- <exact claim.text> [C#][S#]`: add no prefix, suffix, emphasis, or local paraphrase. Every canonical claim_id attached to a covered SQ in PLAN MUST appear at least once, even when two claim texts look redundant. Put contested claims only in Conflicts and Caveats and cite both supporting and contradicting sources. A generic process or evidence-quality caveat in that section must contain no `[C#]` or `[S#]`; never attach a supported claim ID to locally written caveat text. Never present contradicted-only claims as facts. Every Sources line MUST have exactly this shape: `- [S#] <exact canonical title> — <canonical URL>`. If there are no reportable claims, leave Short Answer and Key Findings empty and explain the limitation only under Conflicts and Caveats. Search snippets and failed fetches are not evidence. If the plan is partial, write an honest partial report without claiming blocked work was completed.
 
 PLAN:
 {plan_json}
 
 CANONICAL SOURCE LEDGER:
-{ledger_json}"""
+{ledger_json}
+
+CANONICAL EVIDENCE GRAPH:
+{evidence_graph_json}"""
         return {
             "messages": [
                 HumanMessage(

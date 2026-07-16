@@ -46,11 +46,23 @@
 - [x] 将 plan 总预算确定性切成每个 SQ 的保留额度，并支持 checkpoint 恢复
 - [x] 增加 DuckDuckGo 低相关/失败时的 Bing 自动回退与搜索质量元数据
 - [x] 增加同 host 完整证据锚定下的 300–499 字符 `limited` 短页门槛
-- [x] 向 parent、single agent 和 researcher 暴露 canonical Source Ledger
+- [x] 向 parent、single agent 和 researcher 暴露 canonical Source Ledger；multi 仅 researcher 拥有 `record_evidence`
 - [x] 拒绝未知、旧 plan 和逐行 ID/标题/URL 错配的 `[S#]`
 - [x] 将离线回归扩展到 39 项，并通过 Ruff 与格式检查
 - [x] 完成 BIGAI medium/multi/nano 真实复跑：coverage 1.0、3 条 canonical 来源、验收通过
 - [x] 建立 Stage 03B 搜索与证据控制说明
+- [x] 增加 schema v1 `Claim [C#] -> Evidence [E#] -> Source [S#]` 图和 `unresolved Conflict [X#]`
+- [x] 让模型提交 exact quote，由代码对进程内规范化网页正文执行严格子串校验并保存 quote/hash
+- [x] 保存同 URL 的全部 `content_revisions` 与修订级质量元数据，旧 Evidence 始终绑定原抓取 hash
+- [x] 增加 claim-backed covered 闭包、最终 `successful_searches`/plan Evidence revision 独立来源门槛、当前 step 正确 SQ 且成功返回的 researcher 委派门槛，以及任一 active SQ 的 premature blocked 防护
+- [x] 区分搜索预算尝试与成功搜索；DuckDuckGo/Bing provider 都异常时消耗预算但不增加 `successful_searches`
+- [x] 将最终报告限制为四个 H2、逐行 exact `claim.text [C#][S#]`、严格 canonical Sources，拒绝 H1/额外 heading 和 Sources 伪装事实
+- [x] 新增 `evidence.json`，并将全量离线回归扩展到 77 项且全部通过
+- [x] 完成 BIGAI 无模型真实抓取 smoke：`about` 为 full，430 字符 TongProgram 页在同 host 锚定后为 limited
+- [x] 完成 low/single/nano 真实验收：coverage 1.0、2 个独立来源、2 个 canonical Claims
+- [x] 完成窄范围 BIGAI medium/multi/nano release 验收：`stage03c-final-multi-20260717-release-net2`，coverage 1.0、2 次成功搜索、2 C/2 E、parent 无 `record_evidence`
+- [x] 用完整宽范围 BIGAI medium/multi 验证诚实 partial：coverage 0.5，不把 limited TongProgram 联系页扩张成整组计划事实
+- [x] 建立 Stage 03C 正文证据图与严格报告说明
 
 ## 环境记录
 

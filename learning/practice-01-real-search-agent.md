@@ -132,7 +132,7 @@ output/trace.json
 - 网页提示注入只能降低风险，不能靠一句 system prompt 完全解决。
 - Deep Agents 默认 harness 和多轮网页正文会消耗较多输入 token，后续需要缓存、去重、截断和分阶段总结。
 
-下一版适合加入：来源去重和评分、逐条 claim-citation 映射、搜索/写作 subagent 分工，以及免费模型承担无工具总结阶段。
+后续 Stage 03C 已加入正文 exact-quote 校验和逐条 Claim-Evidence-Source 映射；仍适合继续增加来源可信度评分、更强的语义支持审查，以及免费模型承担无工具总结阶段。
 
 ## 9. 流式观察
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph import MessagesState
@@ -22,6 +23,7 @@ from research_graph import (
     build_source_ledger_tool,
     calculate_plan_coverage,
     create_research_plan,
+    refresh_plan_status,
     select_next_subquestion,
     transition_subquestion,
 )
@@ -48,16 +50,63 @@ class _FakeLedger:
 
     def __init__(self) -> None:
         self.sources: list[dict[str, Any]] = []
+        self.claims: list[dict[str, Any]] = []
+        self.evidence_units: list[dict[str, Any]] = []
+        self.conflicts: list[dict[str, Any]] = []
 
-    def add_source(self) -> str:
+    def add_source(
+        self,
+        subquestion_id: str = "SQ1",
+        *,
+        with_graph: bool = True,
+        content_hash: str | None = None,
+    ) -> str:
         """Add one unique successful source and return its ID."""
         source_id = f"S{len(self.sources) + 1}"
+        claim_id = f"C{len(self.claims) + 1}"
+        evidence_id = f"E{len(self.evidence_units) + 1}"
+        canonical_hash = content_hash or f"{len(self.sources) + 1:064x}"
         self.sources.append(
             {
                 "source_id": source_id,
                 "url": f"https://example.com/{source_id}",
                 "title": source_id,
                 "content_chars": 800,
+                "content_sha256": canonical_hash,
+                "latest_content_sha256": canonical_hash,
+                "content_revisions": [
+                    {
+                        "content_sha256": canonical_hash,
+                        "title": source_id,
+                        "content_chars": 800,
+                        "evidence_quality": "full",
+                        "quality_reason": "",
+                    }
+                ],
+                "evidence_quality": "full",
+            }
+        )
+        if not with_graph:
+            return source_id
+        self.claims.append(
+            {
+                "claim_id": claim_id,
+                "subquestion_id": subquestion_id,
+                "text": f"Claim for {subquestion_id}",
+                "status": "supported",
+                "supporting_evidence_ids": [evidence_id],
+                "contradicting_evidence_ids": [],
+                "source_ids": [source_id],
+            }
+        )
+        self.evidence_units.append(
+            {
+                "evidence_id": evidence_id,
+                "claim_id": claim_id,
+                "subquestion_id": subquestion_id,
+                "source_id": source_id,
+                "stance": "supports",
+                "source_content_sha256": canonical_hash,
             }
         )
         return source_id
@@ -67,20 +116,35 @@ class _FakeLedger:
         return {
             "effort": "test",
             "search_calls": len(self.sources),
+            "successful_searches": len(self.sources),
             "max_searches": 10,
             "fetch_calls": len(self.sources),
             "max_fetches": 10,
             "min_successful_sources": 1,
             "successful_sources": list(self.sources),
             "failed_sources": [],
+            "evidence_graph_version": 1,
+            "claims": list(self.claims),
+            "evidence_units": list(self.evidence_units),
+            "conflicts": list(self.conflicts),
         }
 
     def restore(self, snapshot: dict[str, Any]) -> None:
         """Restore successful sources as a fresh process would."""
         self.sources = [dict(item) for item in snapshot["successful_sources"]]
+        self.claims = [dict(item) for item in snapshot.get("claims", [])]
+        self.evidence_units = [
+            dict(item) for item in snapshot.get("evidence_units", [])
+        ]
+        self.conflicts = [dict(item) for item in snapshot.get("conflicts", [])]
 
 
-def _fake_research_agent(ledger: _FakeLedger, *, produce_evidence: bool = True) -> Any:
+def _fake_research_agent(
+    ledger: _FakeLedger,
+    *,
+    produce_evidence: bool = True,
+    claim_evidence: bool = True,
+) -> Any:
     """Compile a model-free subgraph compatible with the production workflow."""
 
     def reply(state: TongAgentState) -> dict[str, Any]:
@@ -101,14 +165,24 @@ def _fake_research_agent(ledger: _FakeLedger, *, produce_evidence: bool = True) 
                     )
                 ]
             }
-        source_id = ledger.add_source()
-        plan = transition_subquestion(
-            state["research_plan"],
-            str(active),
-            "covered",
-            evidence_source_ids=[source_id],
-            note="covered by fake evidence",
-        )
+        source_id = ledger.add_source(str(active), with_graph=claim_evidence)
+        claim_ids = [str(ledger.claims[-1]["claim_id"])] if claim_evidence else []
+        if claim_evidence:
+            plan = transition_subquestion(
+                state["research_plan"],
+                str(active),
+                "covered",
+                evidence_source_ids=[source_id],
+                claim_ids=claim_ids,
+                note="covered by fake evidence",
+            )
+        else:
+            plan = deepcopy(state["research_plan"])
+            target = next(item for item in plan["subquestions"] if item["id"] == active)
+            target["status"] = "covered"
+            target["evidence_source_ids"] = [source_id]
+            target["note"] = "source-only state injected without transition helper"
+            plan = refresh_plan_status(plan)
         return {
             "messages": [AIMessage(content=f"covered {active}", id=f"fake-{active}")],
             "research_plan": plan,
@@ -154,9 +228,15 @@ class ResearchPlanTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "evidence source"):
             transition_subquestion(plan, "SQ1", "covered")
+        with self.assertRaisesRegex(ValueError, "canonical claim"):
+            transition_subquestion(plan, "SQ1", "covered", evidence_source_ids=["S1"])
 
         covered = transition_subquestion(
-            plan, "SQ1", "covered", evidence_source_ids=["S1"]
+            plan,
+            "SQ1",
+            "covered",
+            evidence_source_ids=["S1"],
+            claim_ids=["C1"],
         )
         with self.assertRaisesRegex(ValueError, "covered -> researching"):
             transition_subquestion(covered, "SQ1", "researching")
@@ -171,7 +251,11 @@ class ResearchPlanTests(unittest.TestCase):
     def test_coverage_and_selection_skip_completed_work(self) -> None:
         plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
         plan = transition_subquestion(
-            plan, "SQ1", "covered", evidence_source_ids=["S1"]
+            plan,
+            "SQ1",
+            "covered",
+            evidence_source_ids=["S1"],
+            claim_ids=["C1"],
         )
 
         selected, active = select_next_subquestion(plan)
@@ -198,7 +282,20 @@ class ResearchPlanTests(unittest.TestCase):
         )
         self.assertIn("SQ1", selected["subquestions"][1]["note"])
 
-    def test_state_tool_requires_active_current_step_ledger_evidence(self) -> None:
+    def test_stage03b_plan_migrates_without_inventing_claims(self) -> None:
+        legacy = _fixed_plan("legacy topic", 2)
+        del legacy["evidence_schema_version"]
+        for item in legacy["subquestions"]:
+            del item["claim_ids"]
+            del item["conflict_ids"]
+
+        migrated = refresh_plan_status(legacy)
+
+        self.assertEqual(migrated["evidence_schema_version"], 0)
+        self.assertEqual(migrated["subquestions"][0]["claim_ids"], [])
+        self.assertEqual(migrated["subquestions"][0]["conflict_ids"], [])
+
+    def test_state_tool_requires_active_ledger_claim_graph(self) -> None:
         ledger = _FakeLedger()
         plan, active = select_next_subquestion(_fixed_plan("topic", 2))
         runtime = ToolRuntime(
@@ -207,6 +304,7 @@ class ResearchPlanTests(unittest.TestCase):
                 "research_events": [],
                 "active_subquestion_id": active,
                 "active_source_ids_before": [],
+                "active_evidence_ids_before": [],
             },
             context=None,
             config={},
@@ -235,7 +333,7 @@ class ResearchPlanTests(unittest.TestCase):
         self.assertIn("not present", json.loads(unknown)["error"])
         self.assertIn("Only the active", json.loads(wrong_item)["error"])
 
-        source_id = ledger.add_source()
+        source_id = ledger.add_source("SQ1")
         accepted = update_tool.func(
             subquestion_id="SQ1",
             status="covered",
@@ -261,6 +359,7 @@ class ResearchPlanTests(unittest.TestCase):
                 "research_events": [],
                 "active_subquestion_id": active,
                 "active_source_ids_before": [source_id],
+                "active_evidence_ids_before": ["E1"],
             },
             context=None,
             config={},
@@ -275,7 +374,7 @@ class ResearchPlanTests(unittest.TestCase):
             note="stale source",
             runtime=stale_runtime,
         )
-        self.assertIn("active research step", json.loads(stale)["error"])
+        self.assertEqual(stale.update["research_plan"]["coverage"], 0.5)
         stale_blocked = update_tool.func(
             subquestion_id="SQ1",
             status="blocked",
@@ -283,7 +382,292 @@ class ResearchPlanTests(unittest.TestCase):
             note="blocked with stale evidence",
             runtime=stale_runtime,
         )
-        self.assertIn("active research step", json.loads(stale_blocked)["error"])
+        self.assertIn("Blocked status is premature", json.loads(stale_blocked)["error"])
+
+    def test_final_covered_update_requires_policy_source_minimum(self) -> None:
+        ledger = _FakeLedger()
+        plan = create_research_plan(
+            "topic",
+            [DraftSubquestion(question="One atomic question")],
+            plan_id_factory=lambda: "plan-one",
+        )
+        plan, active = select_next_subquestion(plan)
+        search_state = {"calls": 1, "successful": 0}
+
+        def snapshot() -> dict[str, Any]:
+            value = ledger.snapshot()
+            value["min_successful_sources"] = 2
+            value["search_calls"] = search_state["calls"]
+            value["successful_searches"] = search_state["successful"]
+            return value
+
+        update_tool = build_research_state_tools(snapshot)[1]
+        runtime = ToolRuntime(
+            state={
+                "research_plan": plan,
+                "research_events": [],
+                "active_subquestion_id": active,
+                "active_source_ids_before": [],
+                "active_evidence_ids_before": [],
+            },
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id="source-minimum",
+            store=None,
+        )
+        first = ledger.add_source("SQ1")
+
+        insufficient = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[first],
+            note="only one source",
+            runtime=runtime,
+        )
+
+        self.assertIn("requires at least 2", json.loads(insufficient)["error"])
+        premature_block = update_tool.func(
+            subquestion_id="SQ1",
+            status="blocked",
+            evidence_source_ids=[first],
+            note="give up despite remaining budget",
+            runtime=runtime,
+        )
+        self.assertIn(
+            "Blocked status is premature", json.loads(premature_block)["error"]
+        )
+        second = ledger.add_source("SQ1")
+        missing_search = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[first, second],
+            note="two independent sources",
+            runtime=runtime,
+        )
+        self.assertIn(
+            "requires at least 1 successful web searches",
+            json.loads(missing_search)["error"],
+        )
+        search_state["successful"] = 1
+        accepted = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[first, second],
+            note="two independent sources and one search",
+            runtime=runtime,
+        )
+        self.assertEqual(accepted.update["research_plan"]["coverage"], 1.0)
+
+    def test_final_source_minimum_uses_evidence_revision_not_latest_alias(
+        self,
+    ) -> None:
+        ledger = _FakeLedger()
+        plan = create_research_plan(
+            "topic",
+            [DraftSubquestion(question="One atomic question")],
+            plan_id_factory=lambda: "plan-revision-independence",
+        )
+        plan, active = select_next_subquestion(plan)
+        shared_hash = "a" * 64
+        first = ledger.add_source("SQ1", content_hash=shared_hash)
+        second = ledger.add_source("SQ1", content_hash=shared_hash)
+        ledger.sources[1]["latest_content_sha256"] = "b" * 64
+        ledger.sources[1]["duplicate_of_source_id"] = None
+
+        def snapshot() -> dict[str, Any]:
+            value = ledger.snapshot()
+            value["min_successful_sources"] = 2
+            value["successful_searches"] = 1
+            return value
+
+        update_tool = build_research_state_tools(snapshot)[1]
+        runtime = ToolRuntime(
+            state={
+                "research_plan": plan,
+                "research_events": [],
+                "active_subquestion_id": active,
+                "active_source_ids_before": [],
+                "active_evidence_ids_before": [],
+            },
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id="revision-source-minimum",
+            store=None,
+        )
+
+        result = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[first, second],
+            note="latest aliases differ but cited revisions are exact copies",
+            runtime=runtime,
+        )
+
+        self.assertIn("requires at least 2", json.loads(result)["error"])
+
+    def test_nonfinal_blocked_update_rejects_recoverable_policy_gaps(self) -> None:
+        ledger = _FakeLedger()
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+        update_tool = build_research_state_tools(ledger.snapshot)[1]
+        runtime = ToolRuntime(
+            state={
+                "research_plan": plan,
+                "research_events": [],
+                "active_subquestion_id": active,
+                "active_source_ids_before": [],
+                "active_evidence_ids_before": [],
+                "messages": [],
+            },
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id="premature-nonfinal-block",
+            store=None,
+        )
+
+        result = update_tool.func(
+            subquestion_id="SQ1",
+            status="blocked",
+            evidence_source_ids=[],
+            note="gave up before using the reserved budget",
+            runtime=runtime,
+        )
+
+        self.assertIn("Blocked status is premature", json.loads(result)["error"])
+
+    def test_multi_state_tool_requires_current_researcher_task(self) -> None:
+        ledger = _FakeLedger()
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+        source_id = ledger.add_source("SQ1")
+        update_tool = build_research_state_tools(
+            ledger.snapshot, require_researcher=True
+        )[1]
+        base_messages = [
+            HumanMessage(content="research", id="research-step-plan-fixed-SQ1-1")
+        ]
+
+        def runtime(messages: list[Any]) -> ToolRuntime:
+            return ToolRuntime(
+                state={
+                    "messages": messages,
+                    "research_plan": plan,
+                    "research_events": [],
+                    "active_subquestion_id": active,
+                    "active_source_ids_before": [],
+                    "active_evidence_ids_before": [],
+                },
+                context=None,
+                config={},
+                stream_writer=lambda _value: None,
+                tool_call_id="delegation-gate",
+                store=None,
+            )
+
+        rejected = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="no delegation",
+            runtime=runtime(base_messages),
+        )
+        self.assertIn("requires task", json.loads(rejected)["error"])
+        delegated = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "task",
+                    "args": {
+                        "subagent_type": "researcher",
+                        "description": "[SQ:SQ1] research the active subquestion",
+                    },
+                    "id": "task-call",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        unfinished = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="task has not returned",
+            runtime=runtime([*base_messages, delegated]),
+        )
+        self.assertIn("requires task", json.loads(unfinished)["error"])
+        failed = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="task failed",
+            runtime=runtime(
+                [
+                    *base_messages,
+                    delegated,
+                    ToolMessage(
+                        content="researcher failed",
+                        tool_call_id="task-call",
+                        status="error",
+                    ),
+                ]
+            ),
+        )
+        self.assertIn("requires task", json.loads(failed)["error"])
+        wrong_subquestion = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "task",
+                    "args": {
+                        "subagent_type": "researcher",
+                        "description": "[SQ:SQ2] research another subquestion",
+                    },
+                    "id": "wrong-sq-task",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        wrong_sq = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="delegated the wrong SQ",
+            runtime=runtime(
+                [
+                    *base_messages,
+                    wrong_subquestion,
+                    ToolMessage(content="done", tool_call_id="wrong-sq-task"),
+                ]
+            ),
+        )
+        self.assertIn("requires task", json.loads(wrong_sq)["error"])
+        no_current_step = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="delegation is not inside a research step",
+            runtime=runtime(
+                [
+                    delegated,
+                    ToolMessage(content="research complete", tool_call_id="task-call"),
+                ]
+            ),
+        )
+        self.assertIn("requires task", json.loads(no_current_step)["error"])
+        accepted = update_tool.func(
+            subquestion_id="SQ1",
+            status="covered",
+            evidence_source_ids=[source_id],
+            note="delegated",
+            runtime=runtime(
+                [
+                    *base_messages,
+                    delegated,
+                    ToolMessage(content="research complete", tool_call_id="task-call"),
+                ]
+            ),
+        )
+        self.assertEqual(accepted.update["research_plan"]["coverage"], 0.5)
 
 
 class ResearchGraphTests(unittest.TestCase):
@@ -373,6 +757,70 @@ class ResearchGraphTests(unittest.TestCase):
         self.assertEqual(result["research_cycles"], 2)
         self.assertIn(
             "subquestion_dependency_blocked",
+            [item["event"] for item in result["research_events"]],
+        )
+
+    def test_evaluate_rejects_source_only_covered_state(self) -> None:
+        ledger = _FakeLedger()
+        graph = build_research_graph(
+            research_agent=_fake_research_agent(ledger, claim_evidence=False),
+            planner=_fixed_plan,
+            budget_snapshot=ledger.snapshot,
+            checkpointer=None,
+            max_subquestions=2,
+            max_research_cycles=4,
+        )
+
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content="topic", id="source-only-user")],
+                "research_topic": "topic",
+            }
+        )
+
+        self.assertEqual(result["research_plan"]["status"], "partial")
+        self.assertEqual(
+            [item["status"] for item in result["research_plan"]["subquestions"]],
+            ["blocked", "blocked"],
+        )
+        self.assertIn(
+            "Covered state rejected", result["research_plan"]["subquestions"][0]["note"]
+        )
+
+    def test_resume_rejects_source_only_covered_before_unlocking_dependency(
+        self,
+    ) -> None:
+        ledger = _FakeLedger()
+        source_id = ledger.add_source("SQ1", with_graph=False)
+        plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
+        injected = deepcopy(plan)
+        injected["subquestions"][0]["status"] = "covered"
+        injected["subquestions"][0]["evidence_source_ids"] = [source_id]
+        injected = refresh_plan_status(injected)
+        graph = build_research_graph(
+            research_agent=_fake_research_agent(ledger),
+            planner=_fixed_plan,
+            budget_snapshot=ledger.snapshot,
+            checkpointer=None,
+            max_subquestions=2,
+            max_research_cycles=4,
+        )
+
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content="topic", id="resume-source-only")],
+                "research_topic": "topic",
+                "research_plan": injected,
+            }
+        )
+
+        self.assertEqual(len(ledger.sources), 1)
+        self.assertEqual(
+            [item["status"] for item in result["research_plan"]["subquestions"]],
+            ["blocked", "blocked"],
+        )
+        self.assertIn(
+            "covered_state_rejected",
             [item["event"] for item in result["research_events"]],
         )
 

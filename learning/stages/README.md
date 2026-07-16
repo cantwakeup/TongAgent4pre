@@ -18,3 +18,4 @@
 - [`stage-02-adaptive-research.md`](stage-02-adaptive-research.md)：结构化证据、持久化线程和分级多 Agent 研究
 - [`stage-03a-explicit-research-state.md`](stage-03a-explicit-research-state.md)：显式研究计划、子问题状态机、结构覆盖度与节点级恢复
 - [`stage-03b-search-evidence-controls.md`](stage-03b-search-evidence-controls.md)：每 SQ 保留预算、搜索引擎回退、自适应短页证据和 canonical 来源绑定
+- [`stage-03c-evidence-graph.md`](stage-03c-evidence-graph.md)：exact quote 校验、Claim-Evidence-Source 图、显式冲突和严格报告映射

@@ -16,7 +16,7 @@ class ResearchBudgetTests(unittest.TestCase):
     def test_search_budget_is_enforced(self) -> None:
         tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
         search = next(item for item in tools if item.name == "web_search")
-        raw_result = json.dumps({"query": "test", "results": []})
+        raw_result = json.dumps({"status": "success", "query": "test", "results": []})
 
         with patch("search_agent.web_search") as raw_search:
             raw_search.invoke.return_value = raw_result
@@ -28,6 +28,41 @@ class ResearchBudgetTests(unittest.TestCase):
         self.assertEqual(second["status"], "success")
         self.assertEqual(third["status"], "budget_exceeded")
         self.assertEqual(budget.snapshot()["search_calls"], 2)
+        self.assertEqual(budget.snapshot()["successful_searches"], 2)
+
+    def test_failed_search_consumes_budget_but_not_success_requirement(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        search = next(item for item in tools if item.name == "web_search")
+
+        with patch("search_agent.web_search") as raw_search:
+            raw_search.invoke.side_effect = ValueError("malformed search response")
+            result = json.loads(search.invoke({"query": "broken"}))
+
+        snapshot = budget.snapshot()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(snapshot["search_calls"], 1)
+        self.assertEqual(snapshot["successful_searches"], 0)
+
+    def test_search_provider_error_payload_does_not_count_as_success(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        search = next(item for item in tools if item.name == "web_search")
+        raw_result = json.dumps(
+            {
+                "status": "error",
+                "query": "broken",
+                "results": [],
+                "error": "all_search_engines_failed",
+            }
+        )
+
+        with patch("search_agent.web_search") as raw_search:
+            raw_search.invoke.return_value = raw_result
+            result = json.loads(search.invoke({"query": "broken"}))
+
+        snapshot = budget.snapshot()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(snapshot["search_calls"], 1)
+        self.assertEqual(snapshot["successful_searches"], 0)
 
     def test_plan_budget_is_partitioned_between_subquestions(self) -> None:
         _, budget = build_budgeted_tools(EFFORT_POLICIES["medium"])
@@ -90,6 +125,64 @@ class ResearchBudgetTests(unittest.TestCase):
         self.assertEqual(duplicate["source_id"], "S1")
         self.assertEqual(second["source_id"], "S2")
         self.assertEqual(len(budget.snapshot()["successful_sources"]), 2)
+
+    def test_duplicate_aliases_follow_latest_content_revisions(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["medium"])
+        fetch = next(item for item in tools if item.name == "fetch_url")
+        content_a = "A" * 800
+        content_b = "B" * 800
+        responses = [
+            {
+                "status": "success",
+                "url": "https://one.example/page",
+                "title": "One A",
+                "content": content_a,
+                "content_chars": len(content_a),
+            },
+            {
+                "status": "success",
+                "url": "https://two.example/page",
+                "title": "Two A",
+                "content": content_a,
+                "content_chars": len(content_a),
+            },
+            {
+                "status": "success",
+                "url": "https://one.example/page",
+                "title": "One B",
+                "content": content_b,
+                "content_chars": len(content_b),
+            },
+            {
+                "status": "success",
+                "url": "https://two.example/page",
+                "title": "Two B",
+                "content": content_b,
+                "content_chars": len(content_b),
+            },
+        ]
+
+        with patch("search_agent.fetch_url") as raw_fetch:
+            raw_fetch.invoke.side_effect = [json.dumps(item) for item in responses]
+            fetch.invoke({"url": responses[0]["url"]})
+            fetch.invoke({"url": responses[1]["url"]})
+            first_snapshot = budget.snapshot()
+            fetch.invoke({"url": responses[2]["url"]})
+            drifted_snapshot = budget.snapshot()
+            fetch.invoke({"url": responses[3]["url"]})
+            final_snapshot = budget.snapshot()
+
+        self.assertEqual(
+            first_snapshot["successful_sources"][1]["duplicate_of_source_id"],
+            "S1",
+        )
+        self.assertIsNone(
+            drifted_snapshot["successful_sources"][1]["duplicate_of_source_id"]
+        )
+        self.assertEqual(
+            final_snapshot["successful_sources"][1]["duplicate_of_source_id"],
+            "S1",
+        )
 
     def test_short_pages_do_not_count_as_evidence(self) -> None:
         tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
@@ -236,6 +329,41 @@ class ResearchBudgetTests(unittest.TestCase):
         self.assertFalse(restored.reserve_search())
         restored.activate_subquestion("SQ2")
         self.assertTrue(restored.reserve_search())
+
+    def test_restored_source_sequence_does_not_collide_with_catalog_gaps(self) -> None:
+        _, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        budget.restore(
+            {
+                "successful_sources": [
+                    {
+                        "source_id": "S1",
+                        "url": "https://example.com/one",
+                        "title": "One",
+                        "content_chars": 800,
+                    },
+                    {
+                        "source_id": "S3",
+                        "url": "https://example.com/three",
+                        "title": "Three",
+                        "content_chars": 800,
+                    },
+                ]
+            }
+        )
+
+        source_id = budget.record_fetch(
+            {
+                "status": "success",
+                "url": "https://example.com/four",
+                "title": "Four",
+                "content": "x" * 800,
+                "content_chars": 800,
+                "evidence_quality": "full",
+            }
+        )
+
+        self.assertEqual(source_id, "S4")
+        self.assertEqual(budget.snapshot()["next_source_sequence"], 5)
 
 
 if __name__ == "__main__":

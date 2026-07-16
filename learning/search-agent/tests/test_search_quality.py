@@ -56,6 +56,9 @@ class SearchQualityTests(unittest.TestCase):
             result = json.loads(web_search.invoke({"query": query, "max_results": 5}))
 
         backup.assert_called_once()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["engine_status"]["duckduckgo"], "success")
+        self.assertEqual(result["engine_status"]["bing"], "success")
         self.assertEqual(result["fallback_reason"], "duckduckgo_low_relevance")
         self.assertEqual(result["results"][0]["engine"], "bing")
         self.assertEqual(
@@ -86,6 +89,7 @@ class SearchQualityTests(unittest.TestCase):
             result = json.loads(web_search.invoke({"query": query, "max_results": 5}))
 
         backup.assert_not_called()
+        self.assertEqual(result["status"], "success")
         self.assertIsNone(result["fallback_reason"])
         self.assertEqual(result["engines"], ["duckduckgo"])
         self.assertEqual(result["relevant_results"], 2)
@@ -100,6 +104,11 @@ class SearchQualityTests(unittest.TestCase):
             )
 
         self.assertEqual(result["fallback_reason"], "duckduckgo_error")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "all_search_engines_failed")
+        self.assertEqual(
+            result["engine_status"], {"duckduckgo": "error", "bing": "error"}
+        )
         self.assertEqual(result["engines"], [])
         self.assertEqual(result["results"], [])
         self.assertEqual(result["search_quality"], "low_relevance")

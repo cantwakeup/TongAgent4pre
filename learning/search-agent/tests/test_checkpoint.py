@@ -147,6 +147,7 @@ class CheckpointTests(unittest.TestCase):
                 ["Establish the facts"],
                 plan_id_factory=lambda: "plan-cli-resume",
             )
+            pending["evidence_schema_version"] = 0
             pending, _ = select_next_subquestion(pending)
             completed = transition_subquestion(
                 pending,
