@@ -1,0 +1,12 @@
+[project]
+name = "deepagents-learning-search-agent"
+version = "0.1.0"
+description = "A minimal real web research agent built while studying Deep Agents."
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "deepagents",
+    "langchain-openai>=1.1.0,<2.0.0",
+]
+
+[tool.uv.sources]
+deepagents = { path = "../../libs/deepagents", editable = true }
