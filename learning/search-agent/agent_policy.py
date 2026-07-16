@@ -114,11 +114,11 @@ def policy_prompt(policy: EffortPolicy, topology: TopologyName) -> str:
     return f"""Active TongAgent policy:
 - effort: {policy.name}
 - topology: {topology}
-- at most {policy.max_searches} searches and {policy.max_fetches} page fetches across all agents
+- at most {policy.max_searches} searches and {policy.max_fetches} page fetches across all agents, partitioned into reserved per-subquestion slices
 - at most {policy.max_subquestions} explicit research subquestions
 - at least {policy.min_successful_sources} successfully fetched, relevant sources
 - cite factual claims with source IDs such as [S1]
 - list every cited source as `[S1] Page title — full URL` in the Sources section
 - {review_rule}
 
-Tool budgets are enforced in code. If a budget is exhausted, finish with the best supported answer and disclose the limitation."""
+Tool budgets are enforced in code. Use get_source_ledger to inspect the active SQ slice and canonical source mapping. If a budget is exhausted, finish with the best supported answer and disclose the limitation."""

@@ -8,10 +8,12 @@
 用户问题
   -> 资源策略（effort）与拓扑路由（mode）
   -> 结构化 research plan：SQ1 ... SQn
+  -> 将搜索/抓取预算切成每个 SQ 的保留额度
   -> 外层图：select -> research -> evaluate -> loop
   -> single：内层主 Agent 直接搜索和读取
      或 multi：内层主 Agent -> researcher -> 可选 reviewer
-  -> 结构化来源账本 [S1] [S2] ...
+  -> DDG 低相关或失败时自动查询 Bing
+  -> canonical 来源账本 [S1] [S2] ...
   -> 结构 coverage 合格后 write_file 写入报告
   -> 质量门槛验收
   -> report.md + plan.json + events.jsonl + trace/sources/run + SQLite checkpoint
@@ -110,6 +112,10 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 
 `covered` 是结构状态，不等于系统已自动理解证据语义。代码只允许当前子问题更新，并要求 `[S#]` 存在于成功来源账本、至少一个来自当前研究步骤；“页面是否真正支持该子问题”目前仍由模型判断，正文片段和 Claim-Evidence 校验属于下一阶段。
 
+每个 plan 创建后，代码会按 SQ 数量确定性切分搜索和抓取额度。例如 medium 的两个 SQ 各自保留 `2 search / 3 fetch`，SQ1 不能消费 SQ2 的份额；checkpoint 会同时恢复当前 SQ、各 SQ 上限和已经使用的次数。进入最终报告阶段后不再激活任何 SQ，因此网络工具不能继续消耗研究预算。
+
+搜索结果会携带 `engine` 与 `relevance_score`。当 DuckDuckGo 失败、为空，或相关结果少于两条时，代码自动查询 Bing，并在结果中记录 `fallback_reason`、`search_quality` 和 `relevant_results`。相关性分数只用于发现明显噪声和触发备用引擎，不等于语义相关性证明。
+
 ## 输出与验收
 
 每次运行生成：
@@ -124,7 +130,9 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 | `output/run.json` | 模型、拓扑、effort、thread、委派角色、基础 token 用量和验收结果 |
 | `output/checkpoints.sqlite` | 可恢复的消息、计划、事件与预算状态 |
 
-抓取成功不等于合格证据：少于 500 个可见字符的页面标记为 `insufficient_content`；URL fragment 会被去重；403/404、超时和安全拒绝会作为失败来源记录。主程序还会检查成功来源数、来源引用、`write_file`、researcher/reviewer 委派和 Sources URL。
+抓取成功不等于合格证据：少于 300 个可见字符的页面标记为 `insufficient_content`；300–499 字符的短页只有在同一 host 已存在至少一条 500 字符以上的完整证据时，才以 `evidence_quality=limited` 入账；500 字符以上为 `full`。URL fragment 会被去重，403/404、超时和安全拒绝会作为失败来源记录。
+
+所有角色都可以通过 `get_source_ledger` 读取 canonical `[S#]`、标题和 URL。`update_subquestion` 拒绝不存在于账本的 ID，并要求挂载的证据至少有一条来自当前研究步骤。最终验收还会拒绝未知 ID、未挂载到当前 plan 的旧来源，以及没有在同一来源行严格绑定 canonical ID、标题、URL 的本地重编号或错配。
 
 ## 离线回归
 
@@ -132,7 +140,7 @@ SEARCH_AGENT_API_KEY=<private-api-key>
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-当前 27 项离线测试覆盖拓扑路由、四档策略、角色构建、工具硬预算、来源编号与去重、短页面拒绝、HTTP 403、流式正文隔离、planner fallback、计划历史、依赖级联阻塞、账本来源校验、结构覆盖度、尝试上限、message-only checkpoint 形状兼容、CLI `invoke(None)` 续跑、基础 token 聚合，以及 SQLite 关闭重开后的计划与预算恢复。
+当前 39 项离线测试覆盖拓扑路由、四档策略、角色构建、工具硬预算、每 SQ 预算切片与 checkpoint 恢复、无 active SQ 时的网络拒绝、来源编号与去重、同域完整证据锚定短页、未锚定短页拒绝、DDG 低相关触发 Bing、双搜索引擎失败降级、中文实体噪声识别、canonical ledger 工具、逐行 ID/标题/URL 绑定、HTTP 403、流式正文隔离、planner fallback、计划历史、依赖级联阻塞、账本来源校验、结构覆盖度、尝试上限、message-only checkpoint 形状兼容、CLI `invoke(None)` 续跑、基础 token 聚合，以及 SQLite 关闭重开后的计划与预算恢复。
 
 `run.json.api_usage` 汇总当前 plan checkpoint 中 AI 消息的 provider-reported input/output/cache-read token。结构化 planner 调用尚未进入消息状态，multi 模式的嵌套 subagent 用量也可能不进入外层消息；供应商没有返回账单或价目表，所以当前明确记录 `planner_call_included=false` 和 `estimated_cost_usd=null`，不会用猜测价格冒充真实费用。
 

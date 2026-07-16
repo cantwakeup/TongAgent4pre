@@ -57,6 +57,9 @@ class BudgetState(TypedDict, total=False):
     min_successful_sources: int
     successful_sources: list[dict[str, Any]]
     failed_sources: list[dict[str, Any]]
+    active_subquestion_id: str | None
+    subquestion_limits: dict[str, dict[str, int]]
+    subquestion_usage: dict[str, dict[str, int]]
 
 
 class ResearchEvent(TypedDict, total=False):

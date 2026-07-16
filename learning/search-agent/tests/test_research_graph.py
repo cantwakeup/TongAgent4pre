@@ -19,6 +19,7 @@ from research_graph import (
     build_model_planner,
     build_research_graph,
     build_research_state_tools,
+    build_source_ledger_tool,
     calculate_plan_coverage,
     create_research_plan,
     select_next_subquestion,
@@ -243,6 +244,16 @@ class ResearchPlanTests(unittest.TestCase):
             runtime=runtime,
         )
         self.assertEqual(accepted.update["research_plan"]["coverage"], 0.5)
+        accepted_payload = json.loads(accepted.update["messages"][0].content)
+        self.assertEqual(
+            accepted_payload["canonical_sources"][0]["url"],
+            "https://example.com/S1",
+        )
+
+        ledger_payload = json.loads(
+            build_source_ledger_tool(ledger.snapshot).invoke({})
+        )
+        self.assertEqual(ledger_payload["successful_sources"][0]["source_id"], "S1")
 
         stale_runtime = ToolRuntime(
             state={
@@ -265,6 +276,14 @@ class ResearchPlanTests(unittest.TestCase):
             runtime=stale_runtime,
         )
         self.assertIn("active research step", json.loads(stale)["error"])
+        stale_blocked = update_tool.func(
+            subquestion_id="SQ1",
+            status="blocked",
+            evidence_source_ids=[source_id],
+            note="blocked with stale evidence",
+            runtime=stale_runtime,
+        )
+        self.assertIn("active research step", json.loads(stale_blocked)["error"])
 
 
 class ResearchGraphTests(unittest.TestCase):
@@ -302,6 +321,31 @@ class ResearchGraphTests(unittest.TestCase):
         self.assertEqual(event_types[0], "plan_created")
         self.assertEqual(event_types[-1], "run_finished")
         self.assertEqual(event_types.count("subquestion_selected"), 2)
+
+    def test_graph_configures_and_activates_subquestion_budget_scopes(self) -> None:
+        ledger = _FakeLedger()
+        configured: list[list[str]] = []
+        activated: list[str | None] = []
+        graph = build_research_graph(
+            research_agent=_fake_research_agent(ledger),
+            planner=_fixed_plan,
+            budget_snapshot=ledger.snapshot,
+            budget_configure=lambda ids: configured.append(list(ids)),
+            budget_activate=activated.append,
+            checkpointer=None,
+            max_subquestions=2,
+            max_research_cycles=4,
+        )
+
+        graph.invoke(
+            {
+                "messages": [HumanMessage(content="topic", id="budget-scope-user")],
+                "research_topic": "topic",
+            }
+        )
+
+        self.assertEqual(configured, [["SQ1", "SQ2"]])
+        self.assertEqual(activated, [None, "SQ1", "SQ2", None])
 
     def test_attempt_cap_blocks_stalled_work_without_infinite_loop(self) -> None:
         ledger = _FakeLedger()

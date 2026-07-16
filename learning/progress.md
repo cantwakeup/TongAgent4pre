@@ -41,6 +41,17 @@
 - [ ] 安装上游完整 test group 并运行整个 monorepo 测试（后续按需进行）
 - [ ] 用户完成第 1 课口头自测和四个修改练习
 
+## 2026-07-17
+
+- [x] 将 plan 总预算确定性切成每个 SQ 的保留额度，并支持 checkpoint 恢复
+- [x] 增加 DuckDuckGo 低相关/失败时的 Bing 自动回退与搜索质量元数据
+- [x] 增加同 host 完整证据锚定下的 300–499 字符 `limited` 短页门槛
+- [x] 向 parent、single agent 和 researcher 暴露 canonical Source Ledger
+- [x] 拒绝未知、旧 plan 和逐行 ID/标题/URL 错配的 `[S#]`
+- [x] 将离线回归扩展到 39 项，并通过 Ruff 与格式检查
+- [x] 完成 BIGAI medium/multi/nano 真实复跑：coverage 1.0、3 条 canonical 来源、验收通过
+- [x] 建立 Stage 03B 搜索与证据控制说明
+
 ## 环境记录
 
 - 系统 Python：3.13.0，满足项目 `>=3.11,<4.0`

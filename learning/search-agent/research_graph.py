@@ -31,6 +31,8 @@ from telemetry import append_research_event
 
 Planner = Callable[[str, int], ResearchPlan]
 BudgetSnapshot = Callable[[], dict[str, Any]]
+BudgetConfigure = Callable[[list[str]], None]
+BudgetActivate = Callable[[str | None], None]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
@@ -385,6 +387,32 @@ def select_next_subquestion(plan: ResearchPlan) -> tuple[ResearchPlan, str | Non
     return updated, candidate["id"]
 
 
+def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
+    """Expose the canonical ID/title/URL mapping shared by every agent role."""
+
+    @tool("get_source_ledger")
+    def get_source_ledger() -> str:
+        """Return fetched sources, evidence quality, and the active SQ budget."""
+        snapshot = budget_snapshot()
+        active = snapshot.get("active_subquestion_id")
+        return json.dumps(
+            {
+                "successful_sources": snapshot.get("successful_sources", []),
+                "active_subquestion_id": active,
+                "subquestion_limits": snapshot.get("subquestion_limits", {}).get(
+                    active, {}
+                ),
+                "subquestion_usage": snapshot.get("subquestion_usage", {}).get(
+                    active, {}
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    return get_source_ledger
+
+
 def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool]:
     """Build tools that expose and persist ledger-validated plan progress."""
 
@@ -421,37 +449,45 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
                 },
                 ensure_ascii=False,
             )
-        if status == "covered":
-            ledger_ids = {
-                str(item.get("source_id", ""))
-                for item in budget_snapshot().get("successful_sources", [])
-            }
-            requested_ids = set(evidence_source_ids)
-            unknown_ids = sorted(requested_ids - ledger_ids)
-            if unknown_ids:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "error": (
-                            "Evidence IDs are not present in the successful-source "
-                            f"ledger: {', '.join(unknown_ids)}"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-            previous_ids = set(runtime.state.get("active_source_ids_before", []))
-            current_step_ids = ledger_ids - previous_ids
-            if not requested_ids.intersection(current_step_ids):
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "error": (
-                            "Covered status requires at least one successful source "
-                            "fetched during the active research step"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
+        ledger = budget_snapshot().get("successful_sources", [])
+        ledger_by_id = {str(item.get("source_id", "")): dict(item) for item in ledger}
+        requested_ids = set(evidence_source_ids)
+        unknown_ids = sorted(requested_ids - set(ledger_by_id))
+        if unknown_ids:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "Evidence IDs are not present in the successful-source "
+                        f"ledger: {', '.join(unknown_ids)}"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        previous_ids = set(runtime.state.get("active_source_ids_before", []))
+        current_step_ids = set(ledger_by_id) - previous_ids
+        if requested_ids and not requested_ids.intersection(current_step_ids):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "Evidence IDs attached to an update must include at least "
+                        "one source fetched during the active research step"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if status == "covered" and not requested_ids.intersection(current_step_ids):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "Covered status requires at least one successful source "
+                        "fetched during the active research step"
+                    ),
+                },
+                ensure_ascii=False,
+            )
         try:
             updated = transition_subquestion(
                 plan,
@@ -478,6 +514,11 @@ def build_research_state_tools(budget_snapshot: BudgetSnapshot) -> list[BaseTool
                 "subquestion_id": subquestion_id,
                 "new_status": status,
                 "coverage": updated["coverage"],
+                "canonical_sources": [
+                    ledger_by_id[source_id]
+                    for source_id in evidence_source_ids
+                    if source_id in ledger_by_id
+                ],
             },
             ensure_ascii=False,
         )
@@ -499,6 +540,8 @@ def build_research_graph(
     research_agent: Any,
     planner: Planner,
     budget_snapshot: BudgetSnapshot,
+    budget_configure: BudgetConfigure | None = None,
+    budget_activate: BudgetActivate | None = None,
     checkpointer: Any | None,
     max_subquestions: int,
     max_research_cycles: int,
@@ -510,6 +553,8 @@ def build_research_graph(
         research_agent: Uncheckpointed Deep Agent subgraph or compatible node.
         planner: Injectable structured planner.
         budget_snapshot: Callable returning the latest serializable ledger.
+        budget_configure: Optional callback that partitions the plan budget.
+        budget_activate: Optional callback that selects the active SQ budget.
         checkpointer: Checkpointer owned exclusively by the outer graph.
         max_subquestions: Hard plan breadth limit.
         max_research_cycles: Loop limit protecting against stalled model behavior.
@@ -545,13 +590,18 @@ def build_research_graph(
                     "subquestions": len(plan["subquestions"]),
                 },
             )
+        if budget_configure is not None:
+            budget_configure([item["id"] for item in plan["subquestions"]])
+        if budget_activate is not None:
+            budget_activate(None)
+        budget = budget_snapshot()
         return {
             "research_plan": plan,
             "research_plan_history": history,
             "research_events": events,
             "active_subquestion_id": None,
             "active_source_ids_before": [],
-            "budget_state": cast("BudgetState", budget_snapshot()),
+            "budget_state": cast("BudgetState", budget),
             "workflow_phase": "selecting",
             "research_cycles": 0,
             "max_research_cycles": max_research_cycles,
@@ -560,6 +610,9 @@ def build_research_graph(
     def select_node(state: TongAgentState) -> dict[str, Any]:
         previous_plan = state["research_plan"]
         plan, active = select_next_subquestion(state["research_plan"])
+        if budget_activate is not None:
+            budget_activate(active)
+        budget = budget_snapshot()
         events = list(state.get("research_events", []))
         previous_statuses = {
             item["id"]: item["status"] for item in previous_plan["subquestions"]
@@ -581,15 +634,19 @@ def build_research_graph(
             "subquestion_selected" if active else "plan_research_complete",
             plan_id=plan["plan_id"],
             subquestion_id=active or "",
-            details={"coverage": plan["coverage"]},
+            details={
+                "coverage": plan["coverage"],
+                "budget_limits": budget.get("subquestion_limits", {}).get(active, {}),
+            },
         )
-        sources = budget_snapshot().get("successful_sources", [])
+        sources = budget.get("successful_sources", [])
         source_ids = [str(item.get("source_id", "")) for item in sources]
         return {
             "research_plan": plan,
             "research_events": events,
             "active_subquestion_id": active,
             "active_source_ids_before": source_ids,
+            "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
         }
 
@@ -603,12 +660,16 @@ def build_research_graph(
             for item in state["research_plan"]["subquestions"]
             if item["id"] == active_id
         )
+        budget = budget_snapshot()
+        limits = budget.get("subquestion_limits", {}).get(active_id, {})
+        usage = budget.get("subquestion_usage", {}).get(active_id, {})
         content = f"""[RESEARCH STEP]
 Root question: {state["research_plan"]["question"]}
 Active subquestion: {active["id"]} — {active["question"]}
 Rationale: {active["rationale"] or "Required for plan coverage."}
+Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ensure_ascii=False)}
 
-Research only this active subquestion. Read the explicit plan with get_research_plan when useful. Gather successfully fetched evidence, then call update_subquestion with status=covered and the relevant [S#] IDs. If it cannot be answered within the active budget, mark it blocked with a concrete reason. Do not write the final report during this step."""
+Research only this active subquestion. Read the explicit plan with get_research_plan when useful. Use get_source_ledger after fetching and copy only its canonical [S#]/title/URL mappings. Gather successfully fetched evidence, then call update_subquestion with status=covered and the relevant canonical IDs. Search snippets never receive source IDs. If it cannot be answered within the reserved SQ budget, mark it blocked with a concrete reason and use an empty evidence list unless this step fetched a canonical source. Do not write the final report during this step."""
         message_id = (
             f"research-step-{state['research_plan']['plan_id']}-{active['id']}-"
             f"{active['attempts']}"
@@ -684,6 +745,8 @@ Research only this active subquestion. Read the explicit plan with get_research_
         return "research" if unfinished and within_limit else "report"
 
     def prepare_report_node(state: TongAgentState) -> dict[str, Any]:
+        if budget_activate is not None:
+            budget_activate(None)
         plan = deepcopy(state["research_plan"])
         if int(state.get("research_cycles", 0)) >= int(
             state.get("max_research_cycles", max_research_cycles)
@@ -704,10 +767,18 @@ Research only this active subquestion. Read the explicit plan with get_research_
             details={"coverage": plan["coverage"], "status": plan["status"]},
         )
         plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
+        budget = budget_snapshot()
+        ledger_json = json.dumps(
+            budget.get("successful_sources", []), ensure_ascii=False, indent=2
+        )
         content = f"""[FINAL SYNTHESIS]
-You MUST call write_file to create the final `/report.md` for the root question using the accumulated fetched evidence and the explicit plan below. Include a short answer, key findings, caveats, unresolved or blocked subquestions, and a Sources section with full URLs. If the plan is partial, still write an honest partial report explaining the evidence gap. Do not claim that blocked work was completed.
+You MUST call write_file to create the final `/report.md` for the root question using the accumulated fetched evidence and the explicit plan below. The canonical source ledger below is authoritative: every [S#], title, and URL in prose and Sources must match it exactly. Search snippets and failed fetches are not evidence. Include a short answer, key findings, caveats, unresolved or blocked subquestions, and a Sources section with full URLs. If the plan is partial, still write an honest partial report explaining the evidence gap. Do not claim that blocked work was completed.
 
-{plan_json}"""
+PLAN:
+{plan_json}
+
+CANONICAL SOURCE LEDGER:
+{ledger_json}"""
         return {
             "messages": [
                 HumanMessage(
@@ -717,6 +788,7 @@ You MUST call write_file to create the final `/report.md` for the root question 
             ],
             "research_plan": plan,
             "research_events": events,
+            "budget_state": cast("BudgetState", budget),
             "workflow_phase": "reporting",
         }
 

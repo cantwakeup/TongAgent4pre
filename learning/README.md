@@ -33,6 +33,7 @@
 - [Stage 01：真实单 Agent 搜索闭环](stages/stage-01-real-search-loop.md)
 - [Stage 02：分级、多 Agent、可恢复研究闭环](stages/stage-02-adaptive-research.md)
 - [Stage 03A：显式研究计划与可恢复状态图](stages/stage-03a-explicit-research-state.md)
+- [Stage 03B：搜索质量与证据控制强化](stages/stage-03b-search-evidence-controls.md)
 
 ## 先记住的一句话
 

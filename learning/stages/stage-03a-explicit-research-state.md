@@ -103,7 +103,7 @@ evidence_source_ids / note
 
 `covered` 必须由当前 active 子问题提交，携带成功来源账本中真实存在的 `[S#]`，并且至少一个 ID 来自当前研究步骤；`blocked` 必须保存原因。依赖项 blocked 时，下游会级联 blocked，已 covered 的工作不会再次被选择。
 
-这里的 coverage 明确定义为“结构覆盖率”：代码能证明每个 SQ 是否走完合法状态转换、是否引用了本步骤真实抓取的来源 ID，但尚不能自动证明网页正文在语义上支持该问题。后者需要 Stage 03B 的 Evidence Graph 和 Claim-Evidence 映射。
+这里的 coverage 明确定义为“结构覆盖率”：代码能证明每个 SQ 是否走完合法状态转换、是否引用了本步骤真实抓取的来源 ID，但尚不能自动证明网页正文在语义上支持该问题。后者需要后续 Evidence Graph 和 Claim-Evidence 映射。
 
 ## 5. 分级计划宽度
 
@@ -131,7 +131,7 @@ evidence_source_ids / note
 - 预算按 plan 计数，来源目录按 thread 累积：新 plan 的 search/fetch 从零开始，但新来源继续使用下一个 `[S#]`，不会与历史消息碰撞。
 - 只含 messages 的旧 checkpoint 状态形状会补齐新字段，不丢失历史消息；当前测试不宣称覆盖所有历史 Stage 02 二进制 fixture。
 
-边界：当前保证的是子问题节点级恢复。若进程恰好死在一次网络工具内部，该工具节点可能重跑；Stage 03B/03C 再处理工具级幂等、重试和原子证据写入。
+边界：当前保证的是子问题节点级恢复。若进程恰好死在一次网络工具内部，该工具节点可能重跑；后续阶段再处理工具级幂等、重试和原子证据写入。
 
 ## 7. 审计产物
 
@@ -249,7 +249,7 @@ plan_created
 - `run.json` 已聚合 checkpointed AI messages 的 token，但 planner、部分 nested subagent、逐节点时延和真实账单费用仍没有完整 span。
 - 输出目录仍是 last-run artifact，不支持同目录并发运行隔离。
 
-下一阶段 `stage-03b` 应建立 Evidence Graph：正文片段、内容去重、来源可信度、Claim-Evidence-URL 映射和显式冲突对象。只有这些证据状态稳定后，Stage 03C 的动态升级控制器才有可靠输入。
+本快照当时建议下一阶段直接建立 Evidence Graph。后续 BIGAI 真实运行先暴露出 SQ 预算饥饿、搜索回退、官方短页和来源编号错配四项更基础的问题，因此实际 [`stage-03b`](stage-03b-search-evidence-controls.md) 先完成这些控制层加固；正文片段、内容去重、来源可信度、Claim-Evidence-URL 映射和显式冲突对象顺延到后续阶段。
 
 ## 12. PPT 建议页
 
