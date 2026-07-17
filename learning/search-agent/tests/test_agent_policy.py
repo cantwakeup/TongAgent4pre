@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agent_policy import EFFORT_POLICIES, policy_prompt, resolve_topology
-from search_agent import _build_subagents
+from search_agent import _build_subagents, build_agent
 
 
 class AgentPolicyTests(unittest.TestCase):
@@ -60,6 +62,53 @@ class AgentPolicyTests(unittest.TestCase):
         self.assertEqual(single, [])
         self.assertEqual([agent["name"] for agent in medium], ["researcher"])
         self.assertEqual([agent["name"] for agent in high], ["researcher", "reviewer"])
+
+    def test_report_agent_has_no_research_or_evidence_tools(self) -> None:
+        research_inner = MagicMock(name="research-inner")
+        report_inner = MagicMock(name="report-inner")
+        outer = MagicMock(name="outer")
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.dict(
+                "os.environ",
+                {
+                    "SEARCH_AGENT_API_KEY": "test-key",
+                    "SEARCH_AGENT_BASE_URL": "https://api.example/v1",
+                },
+            ),
+            patch("search_agent.ChatOpenAI", return_value=MagicMock()),
+            patch("search_agent._disable_general_purpose_subagent"),
+            patch(
+                "search_agent.create_deep_agent",
+                side_effect=[research_inner, report_inner],
+            ) as create_deep_agent,
+            patch("search_agent.build_model_planner", return_value=MagicMock()),
+            patch(
+                "search_agent.build_research_graph", return_value=outer
+            ) as build_graph,
+        ):
+            bundle = build_agent(
+                output_dir=Path(temp_dir),
+                model_name="test-model",
+                effort="low",
+                mode="single",
+                strategy="adaptive",
+                topic="topic",
+            )
+
+        self.assertIs(bundle.agent, outer)
+        self.assertEqual(create_deep_agent.call_count, 2)
+        research_tool_names = {
+            tool.name for tool in create_deep_agent.call_args_list[0].kwargs["tools"]
+        }
+        self.assertIn("get_source_ledger", research_tool_names)
+        self.assertIn("get_evidence_graph", research_tool_names)
+        self.assertEqual(create_deep_agent.call_args_list[1].kwargs["tools"], [])
+        self.assertIs(
+            build_graph.call_args.kwargs["report_agent"],
+            report_inner,
+        )
+        self.assertEqual(build_graph.call_args.kwargs["max_research_cycles"], 6)
 
 
 if __name__ == "__main__":

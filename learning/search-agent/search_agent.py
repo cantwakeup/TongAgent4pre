@@ -11,6 +11,8 @@ import socket
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock
@@ -20,7 +22,13 @@ from uuid import uuid4
 
 import httpx
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -42,12 +50,14 @@ from agent_policy import (
     EffortPolicy,
     ModeName,
     TopologyName,
+    policy_fingerprint,
     policy_prompt,
     resolve_topology,
 )
 from evidence_graph import (
     EVIDENCE_GRAPH_VERSION,
     EvidenceGraphStore,
+    allowed_report_caveat_lines,
     independent_evidence_source_ids,
     report_claim_mapping_errors,
     text_sha256,
@@ -61,7 +71,13 @@ from research_graph import (
     build_source_ledger_tool,
     invalid_covered_subquestions,
 )
-from research_state import EvidenceStance, ResearchEvent, ResearchPlan, TongAgentState
+from research_state import (
+    EvidenceStance,
+    ResearchEvent,
+    ResearchPlan,
+    ResearchStrategy,
+    TongAgentState,
+)
 from telemetry import write_event_log, write_plan_snapshot
 
 
@@ -190,8 +206,10 @@ def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
     score = 0
 
     for domain in re.findall(r"\bsite:([^\s]+)", query, flags=re.IGNORECASE):
+        # Search operators sometimes include a path; host matching must not.
+        domain_host = domain.split("/", 1)[0].rstrip(".")
         if _normalized_host(str(result.get("url", ""))).endswith(
-            domain.casefold().removeprefix("www.")
+            domain_host.casefold().removeprefix("www.")
         ):
             score += 100
 
@@ -495,8 +513,10 @@ class ResearchBudget:
     """Thread-safe shared budget and structured source ledger for one run."""
 
     policy: EffortPolicy
+    strategy: ResearchStrategy = "fixed"
     search_calls: int = 0
     successful_searches: int = 0
+    relevant_searches: int = 0
     fetch_calls: int = 0
     sources: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
@@ -504,6 +524,10 @@ class ResearchBudget:
     active_subquestion_id: str | None = None
     subquestion_limits: dict[str, dict[str, int]] = field(default_factory=dict)
     subquestion_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    applied_grant_ids: list[str] = field(default_factory=list)
+    applied_grants: list[dict[str, Any]] = field(default_factory=list)
+    tool_attempts: list[dict[str, Any]] = field(default_factory=list)
+    next_tool_attempt_sequence: int = 1
     evidence_graph: EvidenceGraphStore = field(default_factory=EvidenceGraphStore)
     _lock: Any = field(default_factory=Lock, repr=False)
 
@@ -521,8 +545,20 @@ class ResearchBudget:
         with self._lock:
             if set(unique_ids) == set(self.subquestion_limits):
                 return
-            search_limits = self._allocate(self.policy.max_searches, len(unique_ids))
-            fetch_limits = self._allocate(self.policy.max_fetches, len(unique_ids))
+            if self.strategy == "adaptive":
+                if len(unique_ids) > min(
+                    self.policy.max_searches, self.policy.max_fetches
+                ):
+                    msg = "Adaptive baseline cannot reserve one search/fetch per SQ"
+                    raise ValueError(msg)
+                # Reserve one usable slice for every SQ before exposing the pool.
+                search_limits = [1 for _ in unique_ids]
+                fetch_limits = [1 for _ in unique_ids]
+            else:
+                search_limits = self._allocate(
+                    self.policy.max_searches, len(unique_ids)
+                )
+                fetch_limits = self._allocate(self.policy.max_fetches, len(unique_ids))
             self.subquestion_limits = {
                 subquestion_id: {
                     "max_searches": int(search_limits[index]),
@@ -534,11 +570,133 @@ class ResearchBudget:
                 subquestion_id: {
                     "search_calls": 0,
                     "successful_searches": 0,
+                    "relevant_searches": 0,
                     "fetch_calls": 0,
                 }
                 for subquestion_id in unique_ids
             }
             self.active_subquestion_id = None
+
+    def _granted_totals(self) -> tuple[int, int]:
+        searches = sum(
+            int(item.get("max_searches", 0))
+            for item in self.subquestion_limits.values()
+        )
+        fetches = sum(
+            int(item.get("max_fetches", 0)) for item in self.subquestion_limits.values()
+        )
+        return searches, fetches
+
+    def _reserve_totals(self) -> tuple[int, int]:
+        granted_searches, granted_fetches = self._granted_totals()
+        return (
+            max(0, self.policy.max_searches - granted_searches),
+            max(0, self.policy.max_fetches - granted_fetches),
+        )
+
+    def grant_subquestion(
+        self,
+        decision_id: str,
+        subquestion_id: str,
+        *,
+        search_delta: int = 1,
+        fetch_delta: int = 1,
+    ) -> dict[str, Any]:
+        """Idempotently release part of the hard reserve to one active SQ."""
+        with self._lock:
+            if self.strategy != "adaptive":
+                msg = "Budget grants require strategy=adaptive"
+                raise ValueError(msg)
+            if not decision_id:
+                msg = "Budget grant decision_id must be non-empty"
+                raise ValueError(msg)
+            if subquestion_id not in self.subquestion_limits:
+                msg = f"Unknown budget scope: {subquestion_id}"
+                raise ValueError(msg)
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (search_delta, fetch_delta)
+            ):
+                msg = "Budget grant deltas must be integers"
+                raise ValueError(msg)
+            before_limits = dict(self.subquestion_limits[subquestion_id])
+            granted_searches, granted_fetches = self._granted_totals()
+            reserve_searches, reserve_fetches = self._reserve_totals()
+            if decision_id in self.applied_grant_ids:
+                original = next(
+                    (
+                        item
+                        for item in self.applied_grants
+                        if item.get("decision_id") == decision_id
+                    ),
+                    None,
+                )
+                if original is None:
+                    msg = "Applied grant ID has no durable grant record"
+                    raise ValueError(msg)
+                if original.get("subquestion_id") != subquestion_id:
+                    msg = "Idempotent grant replay changed subquestion scope"
+                    raise ValueError(msg)
+                return {
+                    **deepcopy(original),
+                    "applied": False,
+                    "idempotent_replay": True,
+                    "reserve": {
+                        "searches": reserve_searches,
+                        "fetches": reserve_fetches,
+                    },
+                }
+            add_searches = min(1, max(0, search_delta), reserve_searches)
+            add_fetches = min(1, max(0, fetch_delta), reserve_fetches)
+            if add_searches == 0 and add_fetches == 0:
+                return {
+                    "decision_id": decision_id,
+                    "applied": False,
+                    "idempotent_replay": False,
+                    "before": before_limits,
+                    "after": dict(before_limits),
+                    "added": {"searches": 0, "fetches": 0},
+                    "reserve": {
+                        "searches": reserve_searches,
+                        "fetches": reserve_fetches,
+                    },
+                }
+            limits = self.subquestion_limits[subquestion_id]
+            limits["max_searches"] = int(limits.get("max_searches", 0)) + add_searches
+            limits["max_fetches"] = int(limits.get("max_fetches", 0)) + add_fetches
+            before_budget = {
+                "granted_searches": granted_searches,
+                "granted_fetches": granted_fetches,
+                "reserve_searches": reserve_searches,
+                "reserve_fetches": reserve_fetches,
+            }
+            remaining_searches, remaining_fetches = self._reserve_totals()
+            after_budget = {
+                "granted_searches": granted_searches + add_searches,
+                "granted_fetches": granted_fetches + add_fetches,
+                "reserve_searches": remaining_searches,
+                "reserve_fetches": remaining_fetches,
+            }
+            grant_record = {
+                "decision_id": decision_id,
+                "subquestion_id": subquestion_id,
+                "before": before_limits,
+                "after": dict(limits),
+                "added": {"searches": add_searches, "fetches": add_fetches},
+                "budget_before": before_budget,
+                "budget_after": after_budget,
+            }
+            self.applied_grant_ids.append(decision_id)
+            self.applied_grants.append(deepcopy(grant_record))
+            return {
+                **grant_record,
+                "applied": True,
+                "idempotent_replay": False,
+                "reserve": {
+                    "searches": remaining_searches,
+                    "fetches": remaining_fetches,
+                },
+            }
 
     def activate_subquestion(self, subquestion_id: str | None) -> None:
         """Select the scope whose reserved tool allowance may be consumed."""
@@ -591,15 +749,88 @@ class ResearchBudget:
             self._record_scope_call("fetch")
             return True
 
-    def record_search_success(self) -> None:
-        """Record a completed search separately from a budget-consuming attempt."""
+    def record_search_success(self, *, relevant: bool = True) -> None:
+        """Record a result-bearing search and separately track lexical relevance."""
         with self._lock:
             self.successful_searches += 1
+            if relevant:
+                self.relevant_searches += 1
             if self.subquestion_limits and self.active_subquestion_id is not None:
                 usage = self.subquestion_usage[self.active_subquestion_id]
                 usage["successful_searches"] = (
                     int(usage.get("successful_searches", 0)) + 1
                 )
+                if relevant:
+                    usage["relevant_searches"] = (
+                        int(usage.get("relevant_searches", 0)) + 1
+                    )
+
+    @staticmethod
+    def _classify_attempt(
+        tool_name: str, payload: dict[str, Any]
+    ) -> tuple[str, str, bool]:
+        status = str(payload.get("status", "error"))
+        error = str(payload.get("error", ""))
+        if status == "success":
+            if tool_name == "web_search":
+                if not payload.get("results"):
+                    return "empty_results", "content", True
+                if int(payload.get("relevant_results", 0)) <= 0:
+                    return "low_relevance", "content", True
+            return "success", "none", False
+        if status == "budget_exceeded":
+            return "budget_exceeded", "budget", False
+        if status == "rejected":
+            return "rejected", "safety", False
+        if status == "insufficient_content":
+            return "insufficient_content", "content", True
+        normalized_error = error.casefold()
+        if any(
+            marker in normalized_error
+            for marker in (
+                "timeout",
+                "connect",
+                "network",
+                "requesterror",
+                "readerror",
+            )
+        ):
+            failure_class = "network"
+        elif tool_name == "web_search" or "provider" in normalized_error:
+            failure_class = "provider"
+        elif error.startswith("HTTP "):
+            failure_class = "http"
+        elif "content type" in normalized_error or "redirect" in normalized_error:
+            failure_class = "content"
+        else:
+            failure_class = "unknown"
+        retryable = bool(payload.get("retry_with_another_source", True))
+        return status or "error", failure_class, retryable
+
+    def record_tool_attempt(
+        self, *, tool_name: str, target: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Append one structured, ordered attempt to the serializable ledger."""
+        with self._lock:
+            outcome, failure_class, retryable = self._classify_attempt(
+                tool_name, payload
+            )
+            sequence = self.next_tool_attempt_sequence
+            attempt = {
+                "attempt_id": f"A{sequence}",
+                "sequence": sequence,
+                "subquestion_id": self.active_subquestion_id or "",
+                "tool": tool_name,
+                "target": target,
+                "outcome": outcome,
+                "failure_class": failure_class,
+                "retryable": retryable,
+                "status": str(payload.get("status", "error")),
+                "error": str(payload.get("error", "")),
+            }
+            self.tool_attempts.append(attempt)
+            self.next_tool_attempt_sequence += 1
+            return dict(attempt)
 
     def budget_denial(self, tool: str) -> dict[str, Any]:
         """Describe whether the plan or active SQ exhausted the requested tool."""
@@ -787,10 +1018,14 @@ class ResearchBudget:
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable run ledger without downloaded page bodies."""
         with self._lock:
+            granted_searches, granted_fetches = self._granted_totals()
+            reserve_searches, reserve_fetches = self._reserve_totals()
             return {
                 "effort": self.policy.name,
+                "strategy": self.strategy,
                 "search_calls": self.search_calls,
                 "successful_searches": self.successful_searches,
+                "relevant_searches": self.relevant_searches,
                 "max_searches": self.policy.max_searches,
                 "fetch_calls": self.fetch_calls,
                 "max_fetches": self.policy.max_fetches,
@@ -805,18 +1040,325 @@ class ResearchBudget:
                 "subquestion_usage": {
                     key: dict(value) for key, value in self.subquestion_usage.items()
                 },
+                "granted_searches": granted_searches,
+                "granted_fetches": granted_fetches,
+                "reserve_searches": reserve_searches,
+                "reserve_fetches": reserve_fetches,
+                "applied_grant_ids": list(self.applied_grant_ids),
+                "applied_grants": deepcopy(self.applied_grants),
+                "next_tool_attempt_sequence": self.next_tool_attempt_sequence,
+                "tool_attempts": deepcopy(self.tool_attempts),
                 **self.evidence_graph.snapshot(),
             }
 
-    def restore(self, snapshot: dict[str, Any], *, reset_usage: bool = False) -> None:
+    def _validate_strict_budget_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Reject checkpoint counters that could weaken the configured hard cap."""
+
+        def nonnegative(value: Any, label: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                msg = f"Checkpoint {label} is not an integer"
+                raise ValueError(msg)
+            normalized = value
+            if normalized < 0:
+                msg = f"Checkpoint {label} must be non-negative"
+                raise ValueError(msg)
+            return normalized
+
+        search_calls = nonnegative(snapshot.get("search_calls", 0), "search_calls")
+        successful_searches = nonnegative(
+            snapshot.get("successful_searches", search_calls),
+            "successful_searches",
+        )
+        relevant_searches = nonnegative(
+            snapshot.get("relevant_searches", successful_searches),
+            "relevant_searches",
+        )
+        fetch_calls = nonnegative(snapshot.get("fetch_calls", 0), "fetch_calls")
+        if search_calls > self.policy.max_searches:
+            msg = "Checkpoint search usage exceeds the hard policy"
+            raise ValueError(msg)
+        if fetch_calls > self.policy.max_fetches:
+            msg = "Checkpoint fetch usage exceeds the hard policy"
+            raise ValueError(msg)
+        if successful_searches > search_calls:
+            msg = "Checkpoint successful searches exceed search calls"
+            raise ValueError(msg)
+        if relevant_searches > successful_searches:
+            msg = "Checkpoint relevant searches exceed successful searches"
+            raise ValueError(msg)
+
+        raw_limits = snapshot.get("subquestion_limits", {})
+        raw_usage = snapshot.get("subquestion_usage", {})
+        if not isinstance(raw_limits, dict) or not isinstance(raw_usage, dict):
+            msg = "Checkpoint subquestion budgets must be mappings"
+            raise ValueError(msg)
+        if set(raw_limits) != set(raw_usage):
+            msg = "Checkpoint subquestion budget scopes do not match"
+            raise ValueError(msg)
+
+        scoped_search_calls = 0
+        scoped_successful_searches = 0
+        scoped_relevant_searches = 0
+        scoped_fetch_calls = 0
+        granted_searches = 0
+        granted_fetches = 0
+        normalized_limits: dict[str, dict[str, int]] = {}
+        for subquestion_id, raw_limit in raw_limits.items():
+            if not isinstance(raw_limit, dict):
+                msg = f"Checkpoint limits are invalid for {subquestion_id}"
+                raise ValueError(msg)
+            raw_scope_usage = raw_usage[subquestion_id]
+            if not isinstance(raw_scope_usage, dict):
+                msg = f"Checkpoint usage is invalid for {subquestion_id}"
+                raise ValueError(msg)
+            search_limit = nonnegative(
+                raw_limit.get("max_searches", 0),
+                f"search grant for {subquestion_id}",
+            )
+            fetch_limit = nonnegative(
+                raw_limit.get("max_fetches", 0),
+                f"fetch grant for {subquestion_id}",
+            )
+            scoped_search = nonnegative(
+                raw_scope_usage.get("search_calls", 0),
+                f"search usage for {subquestion_id}",
+            )
+            scoped_successful = nonnegative(
+                raw_scope_usage.get("successful_searches", scoped_search),
+                f"successful searches for {subquestion_id}",
+            )
+            scoped_relevant = nonnegative(
+                raw_scope_usage.get("relevant_searches", scoped_successful),
+                f"relevant searches for {subquestion_id}",
+            )
+            scoped_fetch = nonnegative(
+                raw_scope_usage.get("fetch_calls", 0),
+                f"fetch usage for {subquestion_id}",
+            )
+            if scoped_search > search_limit:
+                msg = f"Checkpoint search usage exceeds grant for {subquestion_id}"
+                raise ValueError(msg)
+            if scoped_fetch > fetch_limit:
+                msg = f"Checkpoint fetch usage exceeds grant for {subquestion_id}"
+                raise ValueError(msg)
+            if scoped_successful > scoped_search:
+                msg = (
+                    "Checkpoint successful searches exceed search usage for "
+                    f"{subquestion_id}"
+                )
+                raise ValueError(msg)
+            if scoped_relevant > scoped_successful:
+                msg = (
+                    "Checkpoint relevant searches exceed successful searches for "
+                    f"{subquestion_id}"
+                )
+                raise ValueError(msg)
+            granted_searches += search_limit
+            granted_fetches += fetch_limit
+            normalized_limits[str(subquestion_id)] = {
+                "max_searches": search_limit,
+                "max_fetches": fetch_limit,
+            }
+            scoped_search_calls += scoped_search
+            scoped_successful_searches += scoped_successful
+            scoped_relevant_searches += scoped_relevant
+            scoped_fetch_calls += scoped_fetch
+
+        if granted_searches > self.policy.max_searches:
+            msg = "Checkpoint subquestion search grants exceed the hard policy"
+            raise ValueError(msg)
+        if granted_fetches > self.policy.max_fetches:
+            msg = "Checkpoint subquestion fetch grants exceed the hard policy"
+            raise ValueError(msg)
+        if raw_limits and (
+            scoped_search_calls != search_calls
+            or scoped_successful_searches != successful_searches
+            or scoped_relevant_searches != relevant_searches
+            or scoped_fetch_calls != fetch_calls
+        ):
+            msg = "Checkpoint global and subquestion usage counters do not match"
+            raise ValueError(msg)
+        active = snapshot.get("active_subquestion_id")
+        if active is not None and active not in raw_limits:
+            msg = f"Checkpoint has an unknown active budget scope: {active}"
+            raise ValueError(msg)
+        grant_ids = [str(item) for item in snapshot.get("applied_grant_ids", [])]
+        if any(not item for item in grant_ids) or len(grant_ids) != len(set(grant_ids)):
+            msg = "Checkpoint adaptive grant IDs must be non-empty and unique"
+            raise ValueError(msg)
+        if self.strategy == "adaptive":
+            baseline_per_dimension = len(raw_limits)
+            if any(
+                int(raw_limit.get(dimension, 0)) < 1
+                for raw_limit in raw_limits.values()
+                for dimension in ("max_searches", "max_fetches")
+            ):
+                msg = "Checkpoint adaptive SQ grants fell below the baseline"
+                raise ValueError(msg)
+            extra_searches = granted_searches - baseline_per_dimension
+            extra_fetches = granted_fetches - baseline_per_dimension
+            grant_count = len(grant_ids)
+            if (
+                extra_searches < 0
+                or extra_fetches < 0
+                or max(extra_searches, extra_fetches) > grant_count
+                or grant_count > extra_searches + extra_fetches
+            ):
+                msg = "Checkpoint adaptive grants do not match one-step grant history"
+                raise ValueError(msg)
+            raw_grants = snapshot.get("applied_grants", [])
+            if not isinstance(raw_grants, list) or any(
+                not isinstance(item, dict) for item in raw_grants
+            ):
+                msg = "Checkpoint adaptive grant records must be a list of mappings"
+                raise ValueError(msg)
+            record_ids = [str(item.get("decision_id", "")) for item in raw_grants]
+            if record_ids != grant_ids:
+                msg = "Checkpoint adaptive grant records do not match grant IDs"
+                raise ValueError(msg)
+
+            def grant_pair(
+                value: Any, label: str, first_key: str, second_key: str
+            ) -> dict[str, int]:
+                if not isinstance(value, dict):
+                    msg = f"Checkpoint {label} must be a mapping"
+                    raise ValueError(msg)
+                return {
+                    first_key: nonnegative(value.get(first_key, -1), label),
+                    second_key: nonnegative(value.get(second_key, -1), label),
+                }
+
+            expected_limits = {
+                subquestion_id: {"max_searches": 1, "max_fetches": 1}
+                for subquestion_id in normalized_limits
+            }
+            expected_budget = {
+                "granted_searches": len(expected_limits),
+                "granted_fetches": len(expected_limits),
+                "reserve_searches": self.policy.max_searches - len(expected_limits),
+                "reserve_fetches": self.policy.max_fetches - len(expected_limits),
+            }
+            for index, grant in enumerate(raw_grants, start=1):
+                subquestion_id = str(grant.get("subquestion_id", ""))
+                if subquestion_id not in expected_limits:
+                    msg = f"Checkpoint grant {index} has an unknown SQ scope"
+                    raise ValueError(msg)
+                added = grant_pair(
+                    grant.get("added"),
+                    f"grant {index} delta",
+                    "searches",
+                    "fetches",
+                )
+                if (
+                    added["searches"] not in {0, 1}
+                    or added["fetches"] not in {0, 1}
+                    or added["searches"] + added["fetches"] == 0
+                ):
+                    msg = f"Checkpoint grant {index} is not a one-step release"
+                    raise ValueError(msg)
+                before = grant_pair(
+                    grant.get("before"),
+                    f"grant {index} SQ before",
+                    "max_searches",
+                    "max_fetches",
+                )
+                after = grant_pair(
+                    grant.get("after"),
+                    f"grant {index} SQ after",
+                    "max_searches",
+                    "max_fetches",
+                )
+                if before != expected_limits[subquestion_id]:
+                    msg = f"Checkpoint grant {index} SQ transition is not continuous"
+                    raise ValueError(msg)
+                expected_after = {
+                    "max_searches": before["max_searches"] + added["searches"],
+                    "max_fetches": before["max_fetches"] + added["fetches"],
+                }
+                if after != expected_after:
+                    msg = f"Checkpoint grant {index} SQ delta is inconsistent"
+                    raise ValueError(msg)
+                budget_before = grant_pair(
+                    grant.get("budget_before"),
+                    f"grant {index} budget before",
+                    "granted_searches",
+                    "granted_fetches",
+                )
+                reserve_before = grant_pair(
+                    grant.get("budget_before"),
+                    f"grant {index} reserve before",
+                    "reserve_searches",
+                    "reserve_fetches",
+                )
+                parsed_before_budget = {**budget_before, **reserve_before}
+                if parsed_before_budget != expected_budget:
+                    msg = (
+                        f"Checkpoint grant {index} budget transition is not continuous"
+                    )
+                    raise ValueError(msg)
+                expected_after_budget = {
+                    "granted_searches": expected_budget["granted_searches"]
+                    + added["searches"],
+                    "granted_fetches": expected_budget["granted_fetches"]
+                    + added["fetches"],
+                    "reserve_searches": expected_budget["reserve_searches"]
+                    - added["searches"],
+                    "reserve_fetches": expected_budget["reserve_fetches"]
+                    - added["fetches"],
+                }
+                budget_after = grant_pair(
+                    grant.get("budget_after"),
+                    f"grant {index} budget after",
+                    "granted_searches",
+                    "granted_fetches",
+                )
+                reserve_after = grant_pair(
+                    grant.get("budget_after"),
+                    f"grant {index} reserve after",
+                    "reserve_searches",
+                    "reserve_fetches",
+                )
+                if {**budget_after, **reserve_after} != expected_after_budget:
+                    msg = f"Checkpoint grant {index} budget delta is inconsistent"
+                    raise ValueError(msg)
+                expected_limits[subquestion_id] = expected_after
+                expected_budget = expected_after_budget
+            if normalized_limits != expected_limits:
+                msg = "Checkpoint final SQ limits do not match adaptive grant records"
+                raise ValueError(msg)
+
+    def restore(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        reset_usage: bool = False,
+        strict_policy: bool = False,
+    ) -> None:
         """Restore a checkpointed ledger while keeping the active policy limits.
 
         Args:
             snapshot: JSON-serializable state written by `snapshot`.
             reset_usage: Preserve the thread source catalog but start a fresh
                 plan-level tool budget.
+            strict_policy: Reject effort/strategy drift for a pending plan.
         """
         with self._lock:
+            if strict_policy:
+                saved_effort = str(snapshot.get("effort", self.policy.name))
+                saved_strategy = str(snapshot.get("strategy", "fixed"))
+                if saved_effort != self.policy.name:
+                    msg = (
+                        "Pending checkpoint effort does not match this run: "
+                        f"saved={saved_effort} requested={self.policy.name}"
+                    )
+                    raise ValueError(msg)
+                if saved_strategy != self.strategy:
+                    msg = (
+                        "Pending checkpoint strategy does not match this run: "
+                        f"saved={saved_strategy} requested={self.strategy}"
+                    )
+                    raise ValueError(msg)
+                self._validate_strict_budget_snapshot(snapshot)
             self.search_calls = (
                 0
                 if reset_usage
@@ -832,6 +1374,19 @@ class ResearchBudget:
                         )
                     ),
                     self.search_calls,
+                )
+            )
+            self.relevant_searches = (
+                0
+                if reset_usage
+                else min(
+                    int(
+                        snapshot.get(
+                            "relevant_searches",
+                            snapshot.get("successful_searches", 0),
+                        )
+                    ),
+                    self.successful_searches,
                 )
             )
             self.fetch_calls = (
@@ -880,10 +1435,68 @@ class ResearchBudget:
                                 "successful_searches", value.get("search_calls", 0)
                             )
                         ),
+                        "relevant_searches": int(
+                            value.get(
+                                "relevant_searches",
+                                value.get("successful_searches", 0),
+                            )
+                        ),
                     }
                     for key, value in snapshot.get("subquestion_usage", {}).items()
                 }
             )
+            self.applied_grant_ids = (
+                []
+                if reset_usage
+                else [str(item) for item in snapshot.get("applied_grant_ids", [])]
+            )
+            self.applied_grants = (
+                [] if reset_usage else deepcopy(snapshot.get("applied_grants", []))
+            )
+            self.tool_attempts = (
+                [] if reset_usage else deepcopy(snapshot.get("tool_attempts", []))
+            )
+            inferred_next_attempt = (
+                max(
+                    [int(item.get("sequence", 0)) for item in self.tool_attempts],
+                    default=0,
+                )
+                + 1
+            )
+            self.next_tool_attempt_sequence = (
+                1
+                if reset_usage
+                else max(
+                    inferred_next_attempt,
+                    int(
+                        snapshot.get(
+                            "next_tool_attempt_sequence", inferred_next_attempt
+                        )
+                    ),
+                )
+            )
+            if strict_policy and not reset_usage:
+                granted_searches, granted_fetches = self._granted_totals()
+                if granted_searches > self.policy.max_searches:
+                    msg = "Checkpoint subquestion search grants exceed the hard policy"
+                    raise ValueError(msg)
+                if granted_fetches > self.policy.max_fetches:
+                    msg = "Checkpoint subquestion fetch grants exceed the hard policy"
+                    raise ValueError(msg)
+                for subquestion_id, usage in self.subquestion_usage.items():
+                    limits = self.subquestion_limits.get(subquestion_id, {})
+                    if int(usage.get("search_calls", 0)) > int(
+                        limits.get("max_searches", 0)
+                    ):
+                        msg = f"Checkpoint search usage exceeds grant for {subquestion_id}"
+                        raise ValueError(msg)
+                    if int(usage.get("fetch_calls", 0)) > int(
+                        limits.get("max_fetches", 0)
+                    ):
+                        msg = (
+                            f"Checkpoint fetch usage exceeds grant for {subquestion_id}"
+                        )
+                        raise ValueError(msg)
             if reset_usage:
                 self.evidence_graph.reset()
             else:
@@ -894,59 +1507,74 @@ class ResearchBudget:
         with self._lock:
             self.search_calls = 0
             self.successful_searches = 0
+            self.relevant_searches = 0
             self.fetch_calls = 0
             self.failures = []
             self.active_subquestion_id = None
             self.subquestion_limits = {}
             self.subquestion_usage = {}
+            self.applied_grant_ids = []
+            self.applied_grants = []
+            self.tool_attempts = []
+            self.next_tool_attempt_sequence = 1
             self.evidence_graph.reset()
 
 
-def build_budgeted_tools(policy: EffortPolicy) -> tuple[list[BaseTool], ResearchBudget]:
+def build_budgeted_tools(
+    policy: EffortPolicy, *, strategy: ResearchStrategy = "fixed"
+) -> tuple[list[BaseTool], ResearchBudget]:
     """Wrap network tools with one hard budget shared by parent and subagents."""
-    budget = ResearchBudget(policy)
+    budget = ResearchBudget(policy, strategy=strategy)
 
     @tool("web_search")
     def limited_web_search(query: str, max_results: int = 5) -> str:
         """Search the public web within the active run budget."""
         if not budget.reserve_search():
-            return json.dumps(
-                {
-                    "status": "budget_exceeded",
-                    "tool": "web_search",
-                    "query": query,
-                    **budget.budget_denial("search"),
-                },
-                ensure_ascii=False,
+            payload = {
+                "status": "budget_exceeded",
+                "tool": "web_search",
+                "query": query,
+                **budget.budget_denial("search"),
+            }
+            budget.record_tool_attempt(
+                tool_name="web_search", target=query, payload=payload
             )
-        result_limit = min(max_results, policy.max_results_per_search)
+            return json.dumps(payload, ensure_ascii=False)
+        result_limit = min(max_results, budget.policy.max_results_per_search)
         try:
             payload = json.loads(
                 web_search.invoke({"query": query, "max_results": result_limit})
             )
-            if payload.get("status") == "success":
-                budget.record_search_success()
+            if payload.get("status") == "success" and payload.get("results"):
+                budget.record_search_success(
+                    relevant=int(payload.get("relevant_results", 0)) > 0
+                )
             else:
-                payload.setdefault("status", "error")
-                payload.setdefault("error", "search_provider_error")
+                if payload.get("status") != "success":
+                    payload.setdefault("status", "error")
+                    payload.setdefault("error", "search_provider_error")
         except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
             payload = {"status": "error", "query": query, "error": type(exc).__name__}
+        budget.record_tool_attempt(
+            tool_name="web_search", target=query, payload=payload
+        )
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @tool("fetch_url")
     def limited_fetch_url(url: str, max_chars: int = 12_000) -> str:
         """Fetch one public page within the active run budget and assign a source ID."""
         if not budget.reserve_fetch():
-            return json.dumps(
-                {
-                    "status": "budget_exceeded",
-                    "tool": "fetch_url",
-                    "url": url,
-                    **budget.budget_denial("fetch"),
-                },
-                ensure_ascii=False,
+            payload = {
+                "status": "budget_exceeded",
+                "tool": "fetch_url",
+                "url": url,
+                **budget.budget_denial("fetch"),
+            }
+            budget.record_tool_attempt(
+                tool_name="fetch_url", target=url, payload=payload
             )
-        char_limit = min(max_chars, policy.max_chars_per_page)
+            return json.dumps(payload, ensure_ascii=False)
+        char_limit = min(max_chars, budget.policy.max_chars_per_page)
         payload = json.loads(fetch_url.invoke({"url": url, "max_chars": char_limit}))
         if payload.get("status") == "success":
             content_chars = int(payload.get("content_chars", 0))
@@ -973,6 +1601,7 @@ def build_budgeted_tools(policy: EffortPolicy) -> tuple[list[BaseTool], Research
         source_id = budget.record_fetch(payload)
         if source_id is not None:
             payload["source_id"] = source_id
+        budget.record_tool_attempt(tool_name="fetch_url", target=url, payload=payload)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     return [limited_web_search, limited_fetch_url], budget
@@ -1006,6 +1635,9 @@ class AgentBundle:
     policy: EffortPolicy
     mode: ModeName
     topology: TopologyName
+    strategy: ResearchStrategy = "fixed"
+    config_fingerprint: str = ""
+    max_escalations: int = 0
 
 
 _REGISTERED_HARNESS_KEYS: set[str] = set()
@@ -1102,11 +1734,14 @@ def build_agent(
     worker_model_name: str = "deepseek-v4-flash",
     effort: EffortName = "medium",
     mode: ModeName = "auto",
+    strategy: ResearchStrategy = "fixed",
+    max_escalations: int = 2,
     topic: str = "",
     checkpointer: Any | None = None,
 ) -> AgentBundle:
     """Build a policy-controlled OpenAI-compatible research agent."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "report.md"
     _load_local_env(Path(__file__).resolve().parent / ".env")
     api_key = os.environ.get("SEARCH_AGENT_API_KEY")
     base_url = os.environ.get("SEARCH_AGENT_BASE_URL")
@@ -1115,7 +1750,20 @@ def build_agent(
         raise RuntimeError(msg)
     policy = EFFORT_POLICIES[effort]
     topology = resolve_topology(mode, effort, topic)
-    network_tools, budget = build_budgeted_tools(policy)
+    if max_escalations < 0:
+        msg = "max_escalations must be non-negative"
+        raise ValueError(msg)
+    effective_max_escalations = max_escalations if strategy == "adaptive" else 0
+    fingerprint = policy_fingerprint(
+        strategy=strategy,
+        effort=effort,
+        requested_mode=mode,
+        resolved_topology=topology,
+        model_name=model_name,
+        worker_model_name=worker_model_name,
+        max_escalations=effective_max_escalations,
+    )
+    network_tools, budget = build_budgeted_tools(policy, strategy=strategy)
     state_tools = build_research_state_tools(
         budget.snapshot, require_researcher=topology == "multi"
     )
@@ -1161,6 +1809,14 @@ def build_agent(
         if topology == "multi"
         else "Work directly on each active subquestion without delegating. Update its explicit status before continuing."
     )
+    adaptive_prompt = (
+        "Stage 03D adaptive control is active. The effort policy is a hard ceiling, "
+        "while the deterministic outer controller releases reserved search/fetch "
+        "capacity only after an evidence gap is observed. Never claim that a budget "
+        "expanded until get_source_ledger shows a larger active SQ grant."
+        if strategy == "adaptive"
+        else "Stage 03D adaptive control is disabled; use the fixed SQ allocations."
+    )
     parent_evidence_tools = (
         evidence_tools
         if topology == "single"
@@ -1172,37 +1828,84 @@ def build_agent(
         *parent_evidence_tools,
         *(network_tools if topology == "single" else []),
     ]
-    inner_agent = create_deep_agent(
+    research_inner_agent = create_deep_agent(
         model=model,
         tools=main_tools,
-        system_prompt=f"{SYSTEM_PROMPT}\n\n{policy_prompt(policy, topology)}\n\n{topology_prompt}",
+        system_prompt=(
+            f"{SYSTEM_PROMPT}\n\n{policy_prompt(policy, topology)}\n\n"
+            f"{adaptive_prompt}\n\n{topology_prompt}"
+        ),
         subagents=subagents,
         backend=backend,
         state_schema=TongAgentState,
         checkpointer=False,
         name="learning-search-agent",
     )
+    report_subagents = [item for item in subagents if item.get("name") == "reviewer"]
+    report_inner_agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt=(
+            "You are TongAgent's synthesis-only report writer. Use only the "
+            "canonical PLAN, SOURCE LEDGER, and EVIDENCE GRAPH embedded in the "
+            "latest [FINAL SYNTHESIS] message. You have no authority to research, "
+            "fetch, inspect hidden evidence state, or introduce new facts. If a "
+            "reviewer subagent is available, obtain its review before the final "
+            "write and apply material corrections. Finish by successfully writing "
+            "exactly /report.md with write_file."
+        ),
+        subagents=report_subagents,
+        backend=backend,
+        state_schema=TongAgentState,
+        checkpointer=False,
+        name="learning-search-report-agent",
+    )
     max_subquestions = policy.max_subquestions
     agent = build_research_graph(
-        research_agent=inner_agent,
+        research_agent=research_inner_agent,
+        report_agent=report_inner_agent,
         planner=build_model_planner(model),
         budget_snapshot=budget.snapshot,
         budget_configure=budget.configure_subquestions,
         budget_activate=budget.activate_subquestion,
+        budget_grant=budget.grant_subquestion,
+        report_read=lambda: (report_path.read_text() if report_path.is_file() else ""),
+        report_clear=lambda: report_path.unlink(missing_ok=True),
         checkpointer=checkpointer,
         max_subquestions=max_subquestions,
-        max_research_cycles=max_subquestions * 2,
+        max_research_cycles=max_subquestions * (2 + 2 * effective_max_escalations),
         require_researcher=topology == "multi",
+        strategy=strategy,
+        config_fingerprint=fingerprint,
+        hard_effort=effort,
+        pinned_model=model_name,
+        pinned_topology=topology,
+        max_escalations=effective_max_escalations,
     )
     return AgentBundle(
-        agent=agent, budget=budget, policy=policy, mode=mode, topology=topology
+        agent=agent,
+        budget=budget,
+        policy=policy,
+        mode=mode,
+        topology=topology,
+        strategy=strategy,
+        config_fingerprint=fingerprint,
+        max_escalations=effective_max_escalations,
     )
 
 
 def _build_tool_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
     """Build a compact, secret-free trace from the completed message history."""
     events: list[dict[str, Any]] = []
+    phase = "unknown"
     for message in messages:
+        if isinstance(message, HumanMessage):
+            message_id = message.id or ""
+            if message_id.startswith("research-step-"):
+                phase = "research"
+            elif message_id.startswith("report-step-"):
+                phase = "report"
+            continue
         if isinstance(message, AIMessage):
             for call in message.tool_calls:
                 args = dict(call.get("args", {}))
@@ -1215,6 +1918,7 @@ def _build_tool_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                         "name": call["name"],
                         "id": call["id"],
                         "args": args,
+                        "phase": phase,
                     }
                 )
         elif isinstance(message, ToolMessage):
@@ -1224,9 +1928,66 @@ def _build_tool_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                     "name": message.name,
                     "tool_call_id": message.tool_call_id,
                     "content_chars": len(str(message.content)),
+                    "status": message.status or "success",
+                    "phase": phase,
                 }
             )
     return events
+
+
+def _successful_final_report_write_position(
+    trace: list[dict[str, Any]],
+) -> int | None:
+    """Return the final report write-call position only when that write succeeded."""
+    write_positions = [
+        index
+        for index, event in enumerate(trace)
+        if event.get("event") == "tool_call"
+        and event.get("name") == "write_file"
+        and event.get("phase") == "report"
+        and event.get("args", {}).get("file_path") == "/report.md"
+    ]
+    if not write_positions:
+        return None
+    final_write_position = write_positions[-1]
+    final_write_id = str(trace[final_write_position].get("id", ""))
+    succeeded = any(
+        index > final_write_position
+        and event.get("event") == "tool_result"
+        and event.get("name") == "write_file"
+        and event.get("phase") == "report"
+        and str(event.get("tool_call_id", "")) == final_write_id
+        and event.get("status", "success") == "success"
+        and int(event.get("content_chars", 0)) > 0
+        for index, event in enumerate(trace)
+    )
+    return final_write_position if succeeded else None
+
+
+def _successful_delegation_before_final_write(
+    trace: list[dict[str, Any]], subagent_type: str
+) -> bool:
+    """Require a successful report-phase task result before a successful write."""
+    final_write_position = _successful_final_report_write_position(trace)
+    if final_write_position is None:
+        return False
+    eligible_call_ids = {
+        str(event.get("id", ""))
+        for index, event in enumerate(trace)
+        if index < final_write_position
+        and event.get("event") == "tool_call"
+        and event.get("name") == "task"
+        and event.get("phase") == "report"
+        and event.get("args", {}).get("subagent_type") == subagent_type
+    }
+    return any(
+        index < final_write_position
+        and event.get("event") == "tool_result"
+        and str(event.get("tool_call_id", "")) in eligible_call_ids
+        and event.get("status", "success") == "success"
+        and int(event.get("content_chars", 0)) > 0
+        for index, event in enumerate(trace)
+    )
 
 
 def _messages_since_checkpoint(
@@ -1450,6 +2211,422 @@ def _stream_agent(
     return last_state
 
 
+def _restore_checkpointed_report(report_path: Path, result: dict[str, Any]) -> bool:
+    """Materialize a checkpointed report when this run has a fresh backend root."""
+    if report_path.is_file():
+        return False
+    report_markdown = result.get("report_markdown")
+    if not isinstance(report_markdown, str) or not report_markdown:
+        return False
+    report_path.write_text(report_markdown)
+    return True
+
+
+def _pending_budget_scope_errors(
+    plan: ResearchPlan, ledger: dict[str, Any]
+) -> list[str]:
+    """Reject pending checkpoints whose budget scopes do not match the plan."""
+    expected_ids = [str(item.get("id", "")) for item in plan.get("subquestions", [])]
+    errors: list[str] = []
+    if any(not item for item in expected_ids) or len(expected_ids) != len(
+        set(expected_ids)
+    ):
+        errors.append("Pending research plan has invalid subquestion IDs")
+        return errors
+    raw_limits = ledger.get("subquestion_limits", {})
+    raw_usage = ledger.get("subquestion_usage", {})
+    if not isinstance(raw_limits, dict) or not isinstance(raw_usage, dict):
+        return ["Pending budget subquestion scopes are not mappings"]
+    expected = set(expected_ids)
+    if set(raw_limits) != expected or set(raw_usage) != expected:
+        errors.append("Pending budget scopes do not match the research plan")
+    active = ledger.get("active_subquestion_id")
+    if active is not None and active not in expected:
+        errors.append(
+            "Pending active budget scope does not belong to the research plan"
+        )
+    return errors
+
+
+def _adaptive_audit_errors(
+    *,
+    adaptive_control: dict[str, Any],
+    ledger: dict[str, Any],
+    config_fingerprint: str,
+    model_name: str,
+    topology: TopologyName,
+    max_escalations: int,
+    require_decision_history: bool = True,
+) -> list[str]:
+    """Validate controller history against the budget mutations it authorized."""
+    errors: list[str] = []
+    if not adaptive_control:
+        return ["Adaptive strategy finished without checkpointed controller state"]
+
+    raw_decisions = adaptive_control.get("decision_history", [])
+    if not isinstance(raw_decisions, list):
+        errors.append("Adaptive controller decision history is not a list")
+        decisions: list[dict[str, Any]] = []
+    else:
+        decisions = []
+        for index, item in enumerate(raw_decisions, start=1):
+            if not isinstance(item, dict):
+                errors.append(f"Adaptive controller decision {index} is not a mapping")
+                continue
+            decisions.append(item)
+    decision_ids = [str(item.get("decision_id", "")) for item in decisions]
+    expand_decisions = [
+        item for item in decisions if item.get("action") == "expand_budget"
+    ]
+    expand_decision_ids = [
+        str(item.get("decision_id", "")) for item in expand_decisions
+    ]
+    applied_grant_ids = [str(item) for item in ledger.get("applied_grant_ids", [])]
+
+    def audit_int(value: Any, label: str, *, nonnegative: bool = True) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"Adaptive {label} is not an integer")
+            return None
+        normalized = value
+        if nonnegative and normalized < 0:
+            errors.append(f"Adaptive {label} must be non-negative")
+            return None
+        return normalized
+
+    escalation_count = audit_int(
+        adaptive_control.get("escalation_count", 0), "escalation count"
+    )
+    saved_max_escalations = audit_int(
+        adaptive_control.get("max_escalations", -1),
+        "controller escalation ceiling",
+    )
+    max_searches = audit_int(ledger.get("max_searches", -1), "search hard ceiling")
+    max_fetches = audit_int(ledger.get("max_fetches", -1), "fetch hard ceiling")
+
+    raw_limits = ledger.get("subquestion_limits", {})
+    limits: dict[str, dict[str, int]] = {}
+    if not isinstance(raw_limits, dict):
+        errors.append("Adaptive budget subquestion limits are not a mapping")
+    else:
+        for subquestion_id, raw_limit in raw_limits.items():
+            if not isinstance(raw_limit, dict):
+                errors.append(
+                    f"Adaptive budget limits for {subquestion_id} are not a mapping"
+                )
+                continue
+            search_limit = audit_int(
+                raw_limit.get("max_searches", -1),
+                f"search grant for {subquestion_id}",
+            )
+            fetch_limit = audit_int(
+                raw_limit.get("max_fetches", -1),
+                f"fetch grant for {subquestion_id}",
+            )
+            if search_limit is not None and fetch_limit is not None:
+                limits[str(subquestion_id)] = {
+                    "max_searches": search_limit,
+                    "max_fetches": fetch_limit,
+                }
+
+    actual_granted_searches = sum(item["max_searches"] for item in limits.values())
+    actual_granted_fetches = sum(item["max_fetches"] for item in limits.values())
+    ledger_budget: dict[str, int | None] = {
+        "granted_searches": audit_int(
+            ledger.get("granted_searches", -1), "ledger granted searches"
+        ),
+        "granted_fetches": audit_int(
+            ledger.get("granted_fetches", -1), "ledger granted fetches"
+        ),
+        "reserve_searches": audit_int(
+            ledger.get("reserve_searches", -1), "ledger reserve searches"
+        ),
+        "reserve_fetches": audit_int(
+            ledger.get("reserve_fetches", -1), "ledger reserve fetches"
+        ),
+    }
+    if ledger_budget["granted_searches"] != actual_granted_searches:
+        errors.append("Adaptive ledger granted search total does not match SQ limits")
+    if ledger_budget["granted_fetches"] != actual_granted_fetches:
+        errors.append("Adaptive ledger granted fetch total does not match SQ limits")
+    if max_searches is not None and ledger_budget["reserve_searches"] != max(
+        0, max_searches - actual_granted_searches
+    ):
+        errors.append("Adaptive ledger search reserve does not match the hard ceiling")
+    if max_fetches is not None and ledger_budget["reserve_fetches"] != max(
+        0, max_fetches - actual_granted_fetches
+    ):
+        errors.append("Adaptive ledger fetch reserve does not match the hard ceiling")
+
+    if adaptive_control.get("strategy") != "adaptive":
+        errors.append("Adaptive controller did not preserve the adaptive strategy")
+    if adaptive_control.get("config_fingerprint") != config_fingerprint:
+        errors.append("Adaptive controller policy fingerprint does not match this run")
+    if adaptive_control.get("pinned_model") != model_name:
+        errors.append("Adaptive controller did not preserve the pinned model")
+    if adaptive_control.get("pinned_topology") != topology:
+        errors.append("Adaptive controller did not preserve the pinned topology")
+    if saved_max_escalations != max_escalations:
+        errors.append("Adaptive controller escalation ceiling does not match this run")
+    if require_decision_history and not decisions:
+        errors.append("Adaptive controller finished without a decision history")
+    if any(not decision_id for decision_id in decision_ids):
+        errors.append("Adaptive controller contains an empty decision ID")
+    if len(decision_ids) != len(set(decision_ids)):
+        errors.append("Adaptive controller contains duplicate decision IDs")
+    if any(not grant_id for grant_id in applied_grant_ids):
+        errors.append("Adaptive budget contains an empty grant ID")
+    if len(applied_grant_ids) != len(set(applied_grant_ids)):
+        errors.append("Adaptive budget contains duplicate grant IDs")
+    if escalation_count is not None and escalation_count != len(expand_decisions):
+        errors.append("Adaptive escalation count does not match decision history")
+    if escalation_count is not None and escalation_count > max_escalations:
+        errors.append("Adaptive controller exceeded the configured escalation ceiling")
+    if applied_grant_ids != expand_decision_ids:
+        errors.append(
+            "Adaptive budget grant IDs do not match controller expansion decisions"
+        )
+
+    budget_fields = (
+        "granted_searches",
+        "granted_fetches",
+        "reserve_searches",
+        "reserve_fetches",
+    )
+
+    def decision_budget(
+        decision: dict[str, Any], side: str, index: int
+    ) -> dict[str, int] | None:
+        raw_budget = decision.get(side)
+        if not isinstance(raw_budget, dict):
+            errors.append(
+                f"Adaptive decision {index} has no valid {side.replace('_', ' ')}"
+            )
+            return None
+        parsed: dict[str, int] = {}
+        for field_name in budget_fields:
+            value = audit_int(
+                raw_budget.get(field_name, -1),
+                f"decision {index} {side} {field_name}",
+            )
+            if value is None:
+                return None
+            parsed[field_name] = value
+        return parsed
+
+    expected_limits = {
+        subquestion_id: {"max_searches": 1, "max_fetches": 1}
+        for subquestion_id in limits
+    }
+    previous_after: dict[str, int] | None = None
+    allowed_actions = {
+        "continue",
+        "expand_budget",
+        "stop_subquestion",
+        "finish_success",
+        "finish_partial",
+        "fail_closed",
+    }
+    expansion_counts_by_subquestion: dict[str, int] = {}
+    for index, decision in enumerate(decisions, start=1):
+        if (
+            audit_int(decision.get("sequence", -1), f"decision {index} sequence")
+            != index
+        ):
+            errors.append("Adaptive controller decision sequence is not contiguous")
+        action = str(decision.get("action", ""))
+        if action not in allowed_actions:
+            errors.append(f"Adaptive decision {index} has an unknown action")
+        before = decision_budget(decision, "budget_before", index)
+        after = decision_budget(decision, "budget_after", index)
+        if before is None or after is None:
+            continue
+        if previous_after is None:
+            baseline_searches = len(limits)
+            baseline_fetches = len(limits)
+            expected_initial = {
+                "granted_searches": baseline_searches,
+                "granted_fetches": baseline_fetches,
+                "reserve_searches": (
+                    max(0, max_searches - baseline_searches)
+                    if max_searches is not None
+                    else before["reserve_searches"]
+                ),
+                "reserve_fetches": (
+                    max(0, max_fetches - baseline_fetches)
+                    if max_fetches is not None
+                    else before["reserve_fetches"]
+                ),
+            }
+            if before != expected_initial:
+                errors.append(
+                    "Adaptive first decision does not start from the one-per-SQ baseline"
+                )
+        elif before != previous_after:
+            errors.append("Adaptive decision budget transitions are not continuous")
+
+        if max_searches is not None:
+            for snapshot in (before, after):
+                if (
+                    snapshot["granted_searches"] + snapshot["reserve_searches"]
+                    != max_searches
+                ):
+                    errors.append(
+                        f"Adaptive decision {index} violates the search hard ceiling"
+                    )
+        if max_fetches is not None:
+            for snapshot in (before, after):
+                if (
+                    snapshot["granted_fetches"] + snapshot["reserve_fetches"]
+                    != max_fetches
+                ):
+                    errors.append(
+                        f"Adaptive decision {index} violates the fetch hard ceiling"
+                    )
+
+        search_delta = after["granted_searches"] - before["granted_searches"]
+        fetch_delta = after["granted_fetches"] - before["granted_fetches"]
+        search_reserve_delta = after["reserve_searches"] - before["reserve_searches"]
+        fetch_reserve_delta = after["reserve_fetches"] - before["reserve_fetches"]
+        subquestion_id = str(decision.get("subquestion_id", ""))
+        if action == "expand_budget":
+            valid_step = (
+                search_delta in {0, 1}
+                and fetch_delta in {0, 1}
+                and search_delta + fetch_delta > 0
+                and search_reserve_delta == -search_delta
+                and fetch_reserve_delta == -fetch_delta
+                and subquestion_id in expected_limits
+            )
+            if not valid_step:
+                errors.append(
+                    f"Adaptive expansion decision {index} is not a one-step SQ grant"
+                )
+            else:
+                expected_limits[subquestion_id]["max_searches"] += search_delta
+                expected_limits[subquestion_id]["max_fetches"] += fetch_delta
+                expansion_counts_by_subquestion[subquestion_id] = (
+                    expansion_counts_by_subquestion.get(subquestion_id, 0) + 1
+                )
+        elif any(
+            delta != 0
+            for delta in (
+                search_delta,
+                fetch_delta,
+                search_reserve_delta,
+                fetch_reserve_delta,
+            )
+        ):
+            errors.append(
+                f"Adaptive non-expansion decision {index} changed the grant ledger"
+            )
+        previous_after = after
+
+    if limits != expected_limits:
+        errors.append("Adaptive final SQ grants do not match controller transitions")
+    expected_final_budget = previous_after or {
+        "granted_searches": len(limits),
+        "granted_fetches": len(limits),
+        "reserve_searches": (
+            max(0, max_searches - len(limits)) if max_searches is not None else 0
+        ),
+        "reserve_fetches": (
+            max(0, max_fetches - len(limits)) if max_fetches is not None else 0
+        ),
+    }
+    if any(
+        ledger_budget[field_name] != expected_final_budget[field_name]
+        for field_name in budget_fields
+    ):
+        errors.append("Adaptive final ledger does not match the last control decision")
+
+    raw_by_subquestion = adaptive_control.get("escalations_by_subquestion", {})
+    normalized_by_subquestion: dict[str, int] = {}
+    if not isinstance(raw_by_subquestion, dict):
+        errors.append("Adaptive per-SQ escalation counts are not a mapping")
+    else:
+        for subquestion_id, raw_count in raw_by_subquestion.items():
+            count = audit_int(raw_count, f"escalation count for {subquestion_id}")
+            if count is not None:
+                normalized_by_subquestion[str(subquestion_id)] = count
+        if normalized_by_subquestion != expansion_counts_by_subquestion:
+            errors.append(
+                "Adaptive per-SQ escalation counts do not match decision history"
+            )
+    if "applied_grants" in ledger:
+        raw_grant_records = ledger.get("applied_grants")
+        if not isinstance(raw_grant_records, list) or any(
+            not isinstance(item, dict) for item in raw_grant_records
+        ):
+            errors.append("Adaptive durable grant records are not a list of mappings")
+        else:
+            record_ids = [
+                str(item.get("decision_id", "")) for item in raw_grant_records
+            ]
+            if record_ids != applied_grant_ids:
+                errors.append("Adaptive durable grant records do not match grant IDs")
+            decisions_by_id = {
+                str(item.get("decision_id", "")): item for item in expand_decisions
+            }
+            for index, record in enumerate(raw_grant_records, start=1):
+                decision_id = str(record.get("decision_id", ""))
+                decision = decisions_by_id.get(decision_id)
+                if decision is None:
+                    errors.append(
+                        f"Adaptive durable grant record {index} has no expansion decision"
+                    )
+                    continue
+                if record.get("subquestion_id") != decision.get("subquestion_id"):
+                    errors.append(
+                        f"Adaptive durable grant record {index} changed SQ scope"
+                    )
+                added = record.get("added")
+                if not isinstance(added, dict):
+                    errors.append(
+                        f"Adaptive durable grant record {index} has no valid delta"
+                    )
+                else:
+                    search_added = audit_int(
+                        added.get("searches", -1),
+                        f"durable grant record {index} search delta",
+                    )
+                    fetch_added = audit_int(
+                        added.get("fetches", -1),
+                        f"durable grant record {index} fetch delta",
+                    )
+                    if (
+                        search_added is not None
+                        and fetch_added is not None
+                        and (
+                            search_added not in {0, 1}
+                            or fetch_added not in {0, 1}
+                            or search_added + fetch_added == 0
+                        )
+                    ):
+                        errors.append(
+                            f"Adaptive durable grant record {index} is not one-step"
+                        )
+                for side in ("budget_before", "budget_after"):
+                    record_budget = record.get(side)
+                    decision_side = decision.get(side)
+                    if not isinstance(record_budget, dict) or not isinstance(
+                        decision_side, dict
+                    ):
+                        errors.append(
+                            f"Adaptive durable grant record {index} has no valid {side}"
+                        )
+                        continue
+                    for field_name in budget_fields:
+                        if record_budget.get(field_name) != decision_side.get(
+                            field_name
+                        ):
+                            errors.append(
+                                "Adaptive durable grant record "
+                                f"{index} does not match decision {side}"
+                            )
+                            break
+    return errors
+
+
 def _execute_cli(
     args: argparse.Namespace,
     *,
@@ -1461,18 +2638,26 @@ def _execute_cli(
     """Execute all requested turns, validate this run, and save audit artifacts."""
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "report.md"
+    strategy: ResearchStrategy = getattr(args, "strategy", "fixed")
+    max_escalations = int(getattr(args, "max_escalations", 2))
     model_name = args.model or (
         "gpt-5.4-mini" if args.effort in {"high", "xhigh"} else "gpt-5.4-nano"
     )
-    bundle = build_agent(
-        output_dir=output_dir,
-        model_name=model_name,
-        worker_model_name=args.worker_model,
-        effort=args.effort,
-        mode=args.mode,
-        topic=args.topic,
-        checkpointer=checkpointer,
-    )
+
+    def build_for_topic(topic: str) -> AgentBundle:
+        return build_agent(
+            output_dir=output_dir,
+            model_name=model_name,
+            worker_model_name=args.worker_model,
+            effort=args.effort,
+            mode=args.mode,
+            strategy=strategy,
+            max_escalations=max_escalations,
+            topic=topic,
+            checkpointer=checkpointer,
+        )
+
+    bundle = build_for_topic(args.topic)
     config = {"configurable": {"thread_id": thread_id}}
     checkpoint = bundle.agent.get_state(config)
     previous_messages = (
@@ -1483,10 +2668,59 @@ def _execute_cli(
         checkpoint.values.get("research_plan") if checkpoint.values else None
     )
     resume_pending = bool(checkpoint.next)
+    if resume_pending and previous_plan and args.mode == "auto":
+        active_question = str(previous_plan.get("question", ""))
+        if resolve_topology("auto", args.effort, active_question) != bundle.topology:
+            bundle = build_for_topic(active_question)
+            checkpoint = bundle.agent.get_state(config)
+    saved_control = (
+        checkpoint.values.get("adaptive_control") if checkpoint.values else None
+    )
+    if resume_pending and saved_control:
+        saved_fingerprint = str(saved_control.get("config_fingerprint", ""))
+        if (
+            saved_fingerprint
+            and bundle.config_fingerprint
+            and saved_fingerprint != bundle.config_fingerprint
+        ):
+            msg = (
+                "Pending checkpoint policy mismatch; resume with the original "
+                "strategy, effort, mode, models, and max-escalations"
+            )
+            raise RuntimeError(msg)
+    if resume_pending and not saved_control and strategy != "fixed":
+        msg = "Legacy pending checkpoints may only resume with strategy=fixed"
+        raise RuntimeError(msg)
     if checkpoint.values and checkpoint.values.get("budget_state"):
         bundle.budget.restore(
-            checkpoint.values["budget_state"], reset_usage=not resume_pending
+            checkpoint.values["budget_state"],
+            reset_usage=not resume_pending,
+            strict_policy=resume_pending,
         )
+    if resume_pending and previous_plan:
+        scope_errors = _pending_budget_scope_errors(
+            previous_plan, bundle.budget.snapshot()
+        )
+        if scope_errors:
+            msg = "Pending checkpoint budget scope audit failed: " + "; ".join(
+                scope_errors
+            )
+            raise RuntimeError(msg)
+    if resume_pending and strategy == "adaptive" and saved_control:
+        resume_audit_errors = _adaptive_audit_errors(
+            adaptive_control=dict(saved_control),
+            ledger=bundle.budget.snapshot(),
+            config_fingerprint=bundle.config_fingerprint,
+            model_name=model_name,
+            topology=bundle.topology,
+            max_escalations=bundle.max_escalations,
+            require_decision_history=False,
+        )
+        if resume_audit_errors:
+            msg = "Pending adaptive checkpoint audit failed: " + "; ".join(
+                resume_audit_errors
+            )
+            raise RuntimeError(msg)
     if resume_pending and previous_plan:
         bundle.budget.configure_subquestions(
             [item["id"] for item in previous_plan["subquestions"]]
@@ -1496,7 +2730,9 @@ def _execute_cli(
         )
     print(
         f"policy: model={model_name} worker_model={args.worker_model} mode={args.mode} topology={bundle.topology} "
-        f"effort={bundle.policy.name} thread={thread_id} resumed_messages={len(previous_message_ids)} "
+        f"effort={bundle.policy.name} strategy={bundle.strategy} "
+        f"max_escalations={bundle.max_escalations} thread={thread_id} "
+        f"resumed_messages={len(previous_message_ids)} "
         f"resumed_plan={bool(previous_plan)} pending_nodes={list(checkpoint.next)}"
     )
 
@@ -1514,7 +2750,18 @@ def _execute_cli(
             label = "RESUME" if topic is None else f"TURN: {topic}"
             print(f"\n=== {index}/{len(turns)} {label} ===")
         if topic is not None:
-            if index > 1:
+            rebuilt_for_topic = False
+            if (
+                args.mode == "auto"
+                and resolve_topology("auto", args.effort, topic) != bundle.topology
+            ):
+                previous_budget = bundle.budget.snapshot()
+                rebuilt_bundle = build_for_topic(topic)
+                rebuilt_bundle.budget.restore(previous_budget, reset_usage=True)
+                bundle = rebuilt_bundle
+                rebuilt_for_topic = True
+                print(f"auto topology for new plan: {bundle.topology}")
+            if index > 1 and not rebuilt_for_topic:
                 bundle.budget.start_new_plan()
             report_path.unlink(missing_ok=True)
         if args.no_stream:
@@ -1530,6 +2777,8 @@ def _execute_cli(
                 seen_message_ids=seen_message_ids,
             )
 
+    _restore_checkpointed_report(report_path, result)
+
     current_messages = _messages_since_checkpoint(
         result["messages"], previous_message_ids
     )
@@ -1544,15 +2793,13 @@ def _execute_cli(
     sources = ledger["successful_sources"]
     research_plan: ResearchPlan | None = result.get("research_plan")
     research_events: list[ResearchEvent] = result.get("research_events", [])
+    adaptive_control = dict(result.get("adaptive_control", {}))
     plan_messages = (
         _messages_for_plan(result["messages"], research_plan["plan_id"])
         if research_plan
         else current_messages
     )
     plan_trace = _build_tool_trace(plan_messages)
-    plan_called_tools = [
-        event["name"] for event in plan_trace if event["event"] == "tool_call"
-    ]
     plan_delegated_agents = [
         event["args"].get("subagent_type")
         for event in plan_trace
@@ -1564,6 +2811,17 @@ def _execute_cli(
     if source_section_canonicalized:
         report_path.write_text(report)
     validation_errors: list[str] = []
+    if bundle.strategy == "adaptive":
+        validation_errors.extend(
+            _adaptive_audit_errors(
+                adaptive_control=adaptive_control,
+                ledger=ledger,
+                config_fingerprint=bundle.config_fingerprint,
+                model_name=model_name,
+                topology=bundle.topology,
+                max_escalations=bundle.max_escalations,
+            )
+        )
     if research_plan is None:
         validation_errors.append("The run finished without a durable research plan")
     elif research_plan["status"] != "completed":
@@ -1679,9 +2937,9 @@ def _execute_cli(
                 "The active plan attaches claims to the wrong subquestion: "
                 + ", ".join(sorted(set(wrong_sq_claims)))
             )
-    if "write_file" not in plan_called_tools:
+    if _successful_final_report_write_position(plan_trace) is None:
         validation_errors.append(
-            "The agent did not use write_file to create the report"
+            "The agent did not successfully complete a report-phase write to /report.md"
         )
     if bundle.topology == "multi" and "researcher" not in plan_delegated_agents:
         validation_errors.append(
@@ -1690,9 +2948,12 @@ def _execute_cli(
     if (
         bundle.topology == "multi"
         and bundle.policy.require_reviewer
-        and "reviewer" not in plan_delegated_agents
+        and not _successful_delegation_before_final_write(plan_trace, "reviewer")
     ):
-        validation_errors.append("This effort tier requires a reviewer delegation")
+        validation_errors.append(
+            "This effort tier requires a successful report-phase reviewer "
+            "delegation before the final write"
+        )
     if report and ("http" not in report or "Sources" not in report):
         validation_errors.append("The report does not contain a valid Sources section")
     finding_source_ids = (
@@ -1759,6 +3020,15 @@ def _execute_cli(
             plan_claim_ids=plan_claim_ids,
             claims=graph_claims,
             evidence_units=ledger.get("evidence_units", []),
+            allowed_caveat_lines=allowed_report_caveat_lines(
+                research_plan,
+                integrity_failure=bool(evidence_graph_errors)
+                or bool(
+                    adaptive_control.get("decision_history")
+                    and adaptive_control["decision_history"][-1].get("action")
+                    == "fail_closed"
+                ),
+            ),
         )
         claim_error_labels = {
             "unknown_claim_ids": "unknown report claim IDs",
@@ -1777,6 +3047,7 @@ def _execute_cli(
             "invalid_section_lines": "report prose outside the required sections",
             "multiple_claim_lines": "report lines containing multiple canonical claims",
             "invalid_sources_section_lines": "malformed canonical source lines",
+            "unauthorized_caveat_lines": "unauthorized citation-free caveat lines",
         }
         for key, label in claim_error_labels.items():
             values = claim_mapping_errors[key]
@@ -1822,6 +3093,10 @@ def _execute_cli(
             budget=ledger,
         )
     write_event_log(events_path, research_events)
+    control_path = output_dir / "control.json"
+    control_path.write_text(
+        json.dumps(adaptive_control, ensure_ascii=False, indent=2) + "\n"
+    )
     run_path = output_dir / "run.json"
     run_data = {
         "model": model_name,
@@ -1829,7 +3104,10 @@ def _execute_cli(
         "requested_mode": args.mode,
         "resolved_topology": bundle.topology,
         "effort": bundle.policy.name,
+        "strategy": bundle.strategy,
+        "max_escalations": bundle.max_escalations,
         "thread_id": thread_id,
+        "output_dir": str(output_dir),
         "checkpoint_db": str(checkpoint_path),
         "resumed_messages": len(previous_message_ids),
         "turns": len(turns),
@@ -1843,6 +3121,21 @@ def _execute_cli(
             "cost_note": "The provider did not expose billing data or a price table.",
         },
         "budget": ledger,
+        "adaptive_control": {
+            "enabled": bundle.strategy == "adaptive",
+            "schema_version": adaptive_control.get("schema_version"),
+            "hard_effort": adaptive_control.get("hard_effort", bundle.policy.name),
+            "pinned_model": adaptive_control.get("pinned_model", model_name),
+            "pinned_topology": adaptive_control.get("pinned_topology", bundle.topology),
+            "escalation_count": int(adaptive_control.get("escalation_count", 0)),
+            "max_escalations": int(
+                adaptive_control.get("max_escalations", bundle.max_escalations)
+            ),
+            "stop_reason": adaptive_control.get("stop_reason", ""),
+            "decisions": adaptive_control.get("decision_history", []),
+            "last_assessment": adaptive_control.get("last_assessment", {}),
+            "control_path": str(control_path),
+        },
         "research": {
             "plan_id": research_plan["plan_id"] if research_plan else None,
             "status": research_plan["status"] if research_plan else "missing",
@@ -1878,8 +3171,9 @@ def _execute_cli(
         print(f"evidence: {evidence_path}")
         print(f"plan: {plan_path}")
         print(f"events: {events_path}")
+        print(f"control: {control_path}")
         print(f"run: {run_path}")
-        msg = "Run validation failed; inspect output/run.json"
+        msg = f"Run validation failed; inspect {run_path}"
         raise RuntimeError(msg)
 
     print("\n=== VERIFIED TOOL CALLS ===")
@@ -1889,6 +3183,7 @@ def _execute_cli(
     print(f"evidence: {evidence_path}")
     print(f"plan: {plan_path}")
     print(f"events: {events_path}")
+    print(f"control: {control_path}")
     print(f"run: {run_path}")
     print(f"report: {report_path}")
     print(
@@ -1900,6 +3195,17 @@ def _execute_cli(
     if args.print_report:
         print("\n=== REPORT CONTENT ===")
         print(report)
+
+
+def _create_run_output_dir(base_output_dir: Path, thread_id: str) -> Path:
+    """Create an isolated artifact/backend root for one CLI invocation."""
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", thread_id).strip("-._")
+    safe_prefix = (normalized or "thread")[:48]
+    thread_hash = sha256(thread_id.encode()).hexdigest()[:8]
+    run_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid4().hex[:8]}"
+    run_dir = base_output_dir / "runs" / f"{safe_prefix}-{thread_hash}" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
 
 def main() -> None:
@@ -1923,6 +3229,18 @@ def main() -> None:
     parser.add_argument("--mode", choices=("single", "multi", "auto"), default="auto")
     parser.add_argument(
         "--effort", choices=("low", "medium", "high", "xhigh"), default="medium"
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("fixed", "adaptive"),
+        default="fixed",
+        help="Use fixed SQ slices or evidence-gap-driven reserve releases",
+    )
+    parser.add_argument(
+        "--max-escalations",
+        type=int,
+        default=2,
+        help="Maximum adaptive reserve releases for one research plan",
     )
     parser.add_argument(
         "--thread-id",
@@ -1952,14 +3270,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    output_dir = Path(__file__).resolve().parent / "output"
+    output_base_dir = Path(__file__).resolve().parent / "output"
     checkpoint_path = (
         Path(args.checkpoint_db).expanduser().resolve()
         if args.checkpoint_db
-        else output_dir / "checkpoints.sqlite"
+        else output_base_dir / "checkpoints.sqlite"
     )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     thread_id = args.thread_id or str(uuid4())
+    output_dir = _create_run_output_dir(output_base_dir, thread_id)
     with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
         _execute_cli(
             args,

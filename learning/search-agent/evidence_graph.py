@@ -35,11 +35,44 @@ REQUIRED_REPORT_SECTIONS = (
     CONFLICT_SECTION,
     "sources",
 )
+INTEGRITY_FAILURE_CAVEAT = (
+    "- Evidence integrity validation failed; no canonical facts are reported."
+)
+NO_CANONICAL_CLAIM_CAVEAT = "- No canonical claim passed the evidence gate."
 
 
 def normalize_evidence_text(value: str) -> str:
     """Collapse whitespace so copied excerpts survive HTML line boundaries."""
     return " ".join(value.split())
+
+
+def allowed_report_caveat_lines(
+    plan: dict[str, Any], *, integrity_failure: bool = False
+) -> set[str]:
+    """Return the only citation-free caveat lines valid for this plan state."""
+    if integrity_failure:
+        return {INTEGRITY_FAILURE_CAVEAT}
+    allowed: set[str] = set()
+    unsupported_ids = [
+        str(item.get("id", ""))
+        for item in plan.get("subquestions", [])
+        if item.get("status") != "covered" and item.get("id")
+    ]
+    if plan.get("status") != "completed":
+        if unsupported_ids:
+            allowed.add(
+                "- Research coverage is partial; unsupported subquestions: "
+                + ", ".join(unsupported_ids)
+                + "."
+            )
+        else:
+            allowed.add(
+                "- Research coverage is partial; at least one subquestion remains "
+                "unsupported."
+            )
+    if not any(item.get("claim_ids") for item in plan.get("subquestions", [])):
+        allowed.add(NO_CANONICAL_CLAIM_CAVEAT)
+    return allowed
 
 
 def text_sha256(value: str) -> str:
@@ -571,6 +604,7 @@ def report_claim_mapping_errors(
     plan_claim_ids: set[str],
     claims: list[dict[str, Any]],
     evidence_units: list[dict[str, Any]],
+    allowed_caveat_lines: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Validate constrained report lines against canonical claim-source edges."""
     lines = report.splitlines()
@@ -589,6 +623,8 @@ def report_claim_mapping_errors(
     invalid_section_lines: list[str] = []
     multiple_claim_lines: list[str] = []
     invalid_sources_section_lines: list[str] = []
+    unauthorized_caveat_lines: list[str] = []
+    allowed_caveats = set(allowed_caveat_lines or set())
     current_section = ""
     section_order: list[str] = []
 
@@ -640,6 +676,8 @@ def report_claim_mapping_errors(
             claim_without_source.append(str(line_number))
             continue
         if not claim_ids and not source_ids:
+            if current_section == CONFLICT_SECTION and stripped not in allowed_caveats:
+                unauthorized_caveat_lines.append(str(line_number))
             continue
         if len(claim_ids) != 1:
             multiple_claim_lines.append(str(line_number))
@@ -714,4 +752,5 @@ def report_claim_mapping_errors(
         "invalid_section_lines": invalid_section_lines,
         "multiple_claim_lines": multiple_claim_lines,
         "invalid_sources_section_lines": invalid_sources_section_lines,
+        "unauthorized_caveat_lines": unauthorized_caveat_lines,
     }

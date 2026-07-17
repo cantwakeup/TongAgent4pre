@@ -18,12 +18,25 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from evidence_graph import independent_evidence_source_ids
+from adaptive_control import (
+    build_control_assessment,
+    decide_control_action,
+    decision_id_for,
+    initialize_control_state,
+    record_control_decision,
+)
+from evidence_graph import (
+    allowed_report_caveat_lines,
+    independent_evidence_source_ids,
+    validate_evidence_graph,
+)
 from research_state import (
+    AdaptiveControlState,
     BudgetState,
     EvidenceStance,
     ResearchEvent,
     ResearchPlan,
+    ResearchStrategy,
     SubQuestion,
     SubquestionStatus,
     TongAgentState,
@@ -35,9 +48,13 @@ Planner = Callable[[str, int], ResearchPlan]
 BudgetSnapshot = Callable[[], dict[str, Any]]
 BudgetConfigure = Callable[[list[str]], None]
 BudgetActivate = Callable[[str | None], None]
+BudgetGrant = Callable[..., dict[str, Any]]
+ReportRead = Callable[[], str]
+ReportClear = Callable[[], None]
 EvidenceRecord = Callable[..., dict[str, Any]]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
+ControlRoute = Literal["select", "report"]
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
 
 
@@ -898,13 +915,23 @@ def build_research_state_tools(
                     active_usage.get("search_calls", snapshot.get("search_calls", 0))
                 ),
             )
+            if snapshot.get("strategy") == "adaptive":
+                remaining_fetches += max(0, int(snapshot.get("reserve_fetches", 0)))
+                remaining_searches += max(0, int(snapshot.get("reserve_searches", 0)))
             source_gap_recoverable = (
                 independent_count < minimum_sources and remaining_fetches > 0
             )
             search_gap_recoverable = (
                 successful_searches < required_searches and remaining_searches > 0
             )
-            if source_gap_recoverable or search_gap_recoverable:
+            claim_gap_recoverable = not eligible_claims and (
+                remaining_searches > 0 or remaining_fetches > 0
+            )
+            if (
+                source_gap_recoverable
+                or search_gap_recoverable
+                or claim_gap_recoverable
+            ):
                 return json.dumps(
                     {
                         "status": "error",
@@ -1001,40 +1028,66 @@ def build_research_state_tools(
 def build_research_graph(
     *,
     research_agent: Any,
+    report_agent: Any | None = None,
     planner: Planner,
     budget_snapshot: BudgetSnapshot,
     budget_configure: BudgetConfigure | None = None,
     budget_activate: BudgetActivate | None = None,
+    budget_grant: BudgetGrant | None = None,
+    report_read: ReportRead | None = None,
+    report_clear: ReportClear | None = None,
     checkpointer: Any | None,
     max_subquestions: int,
     max_research_cycles: int,
     interrupt_before: list[str] | None = None,
     require_researcher: bool = False,
+    strategy: ResearchStrategy = "fixed",
+    config_fingerprint: str = "",
+    hard_effort: str = "",
+    pinned_model: str = "",
+    pinned_topology: str = "",
+    max_escalations: int = 0,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
     Args:
         research_agent: Uncheckpointed Deep Agent subgraph or compatible node.
+        report_agent: Optional synthesis-only agent without research-state tools.
         planner: Injectable structured planner.
         budget_snapshot: Callable returning the latest serializable ledger.
         budget_configure: Optional callback that partitions the plan budget.
         budget_activate: Optional callback that selects the active SQ budget.
+        budget_grant: Optional idempotent adaptive reserve-release callback.
+        report_read: Optional callback that snapshots `/report.md` into state.
+        report_clear: Optional callback that removes any pre-synthesis report.
         checkpointer: Checkpointer owned exclusively by the outer graph.
         max_subquestions: Hard plan breadth limit.
         max_research_cycles: Loop limit protecting against stalled model behavior.
         interrupt_before: Optional node interrupts used by recovery tests.
         require_researcher: Force one researcher task call per active SQ.
+        strategy: Fixed baseline or deterministic adaptive control.
+        config_fingerprint: Pinned policy identity used for safe resume.
+        hard_effort: User-selected hard effort ceiling.
+        pinned_model: Model identity that cannot change inside this plan.
+        pinned_topology: Topology identity that cannot change inside this plan.
+        max_escalations: Maximum reserve releases for the whole plan.
 
     Returns:
         Compiled checkpointable research graph.
     """
+    if report_agent is None:
+        msg = "A separate synthesis-only report_agent is required"
+        raise ValueError(msg)
 
     def plan_node(state: TongAgentState) -> dict[str, Any]:
         topic = " ".join(state.get("research_topic", "").split())
         existing = state.get("research_plan")
+        resuming_plan = bool(
+            existing and existing["status"] in {"pending", "in_progress"}
+        )
         events = list(state.get("research_events", []))
         history = list(state.get("research_plan_history", []))
-        if existing and existing["status"] in {"pending", "in_progress"}:
+        if resuming_plan and existing:
             plan = refresh_plan_status(existing)
             events = append_research_event(
                 events,
@@ -1060,17 +1113,44 @@ def build_research_graph(
         if budget_activate is not None:
             budget_activate(None)
         budget = budget_snapshot()
+        saved_control = state.get("adaptive_control") if resuming_plan else None
+        if saved_control:
+            control = deepcopy(saved_control)
+            saved_fingerprint = str(control.get("config_fingerprint", ""))
+            if (
+                config_fingerprint
+                and saved_fingerprint
+                and saved_fingerprint != config_fingerprint
+            ):
+                msg = "Pending research plan was created with a different policy"
+                raise ValueError(msg)
+        else:
+            control = initialize_control_state(
+                strategy=strategy,
+                config_fingerprint=config_fingerprint,
+                hard_effort=hard_effort,
+                pinned_model=pinned_model,
+                pinned_topology=pinned_topology,
+                max_escalations=max_escalations,
+            )
         return {
             "research_plan": plan,
             "research_plan_history": history,
             "research_events": events,
             "active_subquestion_id": None,
             "active_source_ids_before": [],
+            "active_claim_ids_before": [],
             "active_evidence_ids_before": [],
+            "active_conflict_ids_before": [],
+            "active_tool_attempt_sequence_before": int(
+                budget.get("next_tool_attempt_sequence", 1)
+            ),
             "budget_state": cast("BudgetState", budget),
+            "adaptive_control": cast("AdaptiveControlState", control),
             "workflow_phase": "selecting",
             "research_cycles": 0,
             "max_research_cycles": max_research_cycles,
+            "report_markdown": "",
         }
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
@@ -1134,12 +1214,21 @@ def build_research_graph(
             str(item.get("evidence_id", ""))
             for item in budget.get("evidence_units", [])
         ]
+        claim_ids = [str(item.get("claim_id", "")) for item in budget.get("claims", [])]
+        conflict_ids = [
+            str(item.get("conflict_id", "")) for item in budget.get("conflicts", [])
+        ]
         return {
             "research_plan": plan,
             "research_events": events,
             "active_subquestion_id": active,
             "active_source_ids_before": source_ids,
+            "active_claim_ids_before": claim_ids,
             "active_evidence_ids_before": evidence_ids,
+            "active_conflict_ids_before": conflict_ids,
+            "active_tool_attempt_sequence_before": int(
+                budget.get("next_tool_attempt_sequence", 1)
+            ),
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
         }
@@ -1201,12 +1290,32 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
             for item in budget.get("evidence_units", [])
             if str(item.get("evidence_id", "")) not in previous_evidence_ids
         ]
+        previous_claim_ids = set(state.get("active_claim_ids_before", []))
+        new_claim_ids = [
+            str(item.get("claim_id", ""))
+            for item in budget.get("claims", [])
+            if str(item.get("claim_id", "")) not in previous_claim_ids
+        ]
+        previous_conflict_ids = set(state.get("active_conflict_ids_before", []))
+        new_conflict_ids = [
+            str(item.get("conflict_id", ""))
+            for item in budget.get("conflicts", [])
+            if str(item.get("conflict_id", "")) not in previous_conflict_ids
+        ]
+        first_attempt_sequence = int(
+            state.get("active_tool_attempt_sequence_before", 1)
+        )
+        new_tool_attempt_ids = [
+            str(item.get("attempt_id", ""))
+            for item in budget.get("tool_attempts", [])
+            if int(item.get("sequence", 0)) >= first_attempt_sequence
+        ]
         if active_id:
             active = next(
                 item for item in plan["subquestions"] if item["id"] == active_id
             )
             if active["status"] == "researching":
-                if active["attempts"] >= active["max_attempts"]:
+                if strategy == "fixed" and active["attempts"] >= active["max_attempts"]:
                     plan = transition_subquestion(
                         plan,
                         active_id,
@@ -1218,19 +1327,62 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                         plan,
                         active_id,
                         "pending",
-                        note="No new successful evidence; retry is allowed.",
+                        note=(
+                            "Adaptive controller will decide whether to retry or "
+                            "release reserve budget."
+                            if strategy == "adaptive"
+                            else "No new successful evidence; retry is allowed."
+                        ),
                     )
         for subquestion_id, reasons in invalid_covered_subquestions(
             plan, budget
         ).items():
-            plan = transition_subquestion(
-                plan,
-                subquestion_id,
-                "blocked",
-                note="Covered state rejected: " + "; ".join(reasons),
-            )
+            if strategy == "adaptive":
+                reopened = deepcopy(plan)
+                target = next(
+                    item
+                    for item in reopened["subquestions"]
+                    if item["id"] == subquestion_id
+                )
+                target["status"] = "pending"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["note"] = "Covered state rejected: " + "; ".join(reasons)
+                plan = refresh_plan_status(reopened)
+            else:
+                plan = transition_subquestion(
+                    plan,
+                    subquestion_id,
+                    "blocked",
+                    note="Covered state rejected: " + "; ".join(reasons),
+                )
         plan = refresh_plan_status(plan)
         cycles = int(state.get("research_cycles", 0)) + 1
+        control = deepcopy(
+            state.get("adaptive_control")
+            or initialize_control_state(
+                strategy=strategy,
+                config_fingerprint=config_fingerprint,
+                hard_effort=hard_effort,
+                pinned_model=pinned_model,
+                pinned_topology=pinned_topology,
+                max_escalations=max_escalations,
+            )
+        )
+        assessment = build_control_assessment(
+            plan=plan,
+            budget=budget,
+            control=control,
+            subquestion_id=active_id or "",
+            cycle=cycles,
+            new_source_ids=new_ids,
+            new_claim_ids=new_claim_ids,
+            new_evidence_ids=new_evidence_ids,
+            new_conflict_ids=new_conflict_ids,
+            new_tool_attempt_ids=new_tool_attempt_ids,
+        )
+        control["last_assessment"] = assessment
         events = append_research_event(
             list(state.get("research_events", [])),
             "coverage_evaluated",
@@ -1240,7 +1392,10 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                 "coverage": plan["coverage"],
                 "plan_status": plan["status"],
                 "new_source_ids": new_ids,
+                "new_claim_ids": new_claim_ids,
                 "new_evidence_ids": new_evidence_ids,
+                "new_conflict_ids": new_conflict_ids,
+                "new_tool_attempt_ids": new_tool_attempt_ids,
                 "cycle": cycles,
             },
         )
@@ -1248,12 +1403,15 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
             "research_plan": plan,
             "research_events": events,
             "budget_state": cast("BudgetState", budget),
+            "adaptive_control": cast("AdaptiveControlState", control),
             "active_subquestion_id": None,
             "research_cycles": cycles,
             "workflow_phase": "evaluating",
         }
 
-    def route_after_evaluate(state: TongAgentState) -> Route:
+    def route_after_evaluate(state: TongAgentState) -> str:
+        if strategy == "adaptive":
+            return "control"
         plan = state["research_plan"]
         unfinished = any(
             item["status"] in {"pending", "researching"}
@@ -1264,7 +1422,185 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
         )
         return "research" if unfinished and within_limit else "report"
 
+    def adaptive_control_node(state: TongAgentState) -> dict[str, Any]:
+        plan = deepcopy(state["research_plan"])
+        control = deepcopy(state["adaptive_control"])
+        assessment = deepcopy(control.get("last_assessment", {}))
+        cycle = int(state.get("research_cycles", 0))
+        cycle_limit = int(state.get("max_research_cycles", max_research_cycles))
+        action, reasons = decide_control_action(
+            plan=plan,
+            control=control,
+            assessment=assessment,
+            cycle_limit_reached=cycle >= cycle_limit,
+        )
+        sequence = len(control.get("decision_history", [])) + 1
+        subquestion_id = str(assessment.get("subquestion_id", ""))
+        decision_id = decision_id_for(plan["plan_id"], cycle, sequence, subquestion_id)
+        budget_before_snapshot = budget_snapshot()
+        budget_before = {
+            "search_calls": int(budget_before_snapshot.get("search_calls", 0)),
+            "fetch_calls": int(budget_before_snapshot.get("fetch_calls", 0)),
+            "granted_searches": int(budget_before_snapshot.get("granted_searches", 0)),
+            "granted_fetches": int(budget_before_snapshot.get("granted_fetches", 0)),
+            "reserve_searches": int(budget_before_snapshot.get("reserve_searches", 0)),
+            "reserve_fetches": int(budget_before_snapshot.get("reserve_fetches", 0)),
+        }
+        grant_result: dict[str, Any] = {}
+        if action == "expand_budget":
+            if budget_grant is None or not subquestion_id:
+                action = "stop_subquestion"
+                reasons = [*reasons, "budget_grant_unavailable"]
+            else:
+                search_retry_needed = "search_retry_needed" in reasons
+                fetch_retry_needed = "fetch_retry_needed" in reasons
+                needs_search = (
+                    search_retry_needed
+                    or ("successful_search_gap" in reasons)
+                    or (
+                        "provider_failure" in reasons
+                        and not search_retry_needed
+                        and not fetch_retry_needed
+                    )
+                )
+                needs_evidence = any(
+                    item in reasons for item in ("claim_gap", "independent_source_gap")
+                )
+                grant_result = budget_grant(
+                    decision_id,
+                    subquestion_id,
+                    search_delta=(
+                        1
+                        if needs_search or (needs_evidence and not fetch_retry_needed)
+                        else 0
+                    ),
+                    fetch_delta=1 if needs_evidence or fetch_retry_needed else 0,
+                )
+                if not grant_result.get("applied") and not grant_result.get(
+                    "idempotent_replay"
+                ):
+                    action = "stop_subquestion"
+                    reasons = [*reasons, "hard_ceiling_reached"]
+                else:
+                    target = next(
+                        item
+                        for item in plan["subquestions"]
+                        if item["id"] == subquestion_id
+                    )
+                    target["max_attempts"] = max(
+                        int(target["max_attempts"]), int(target["attempts"]) + 1
+                    )
+                    plan = refresh_plan_status(plan)
+        if action == "stop_subquestion" and subquestion_id:
+            target = next(
+                (item for item in plan["subquestions"] if item["id"] == subquestion_id),
+                None,
+            )
+            if target is not None and target["status"] in {"pending", "researching"}:
+                plan = transition_subquestion(
+                    plan,
+                    subquestion_id,
+                    "blocked",
+                    note="Adaptive controller stopped research: "
+                    + ", ".join(dict.fromkeys(reasons)),
+                )
+        if action == "fail_closed":
+            plan = deepcopy(plan)
+            for target in plan["subquestions"]:
+                target["status"] = "blocked"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["note"] = (
+                    "Evidence integrity validation failed; research stopped."
+                )
+            plan = refresh_plan_status(plan)
+        budget_after_snapshot = budget_snapshot()
+        budget_after = {
+            "search_calls": int(budget_after_snapshot.get("search_calls", 0)),
+            "fetch_calls": int(budget_after_snapshot.get("fetch_calls", 0)),
+            "granted_searches": int(budget_after_snapshot.get("granted_searches", 0)),
+            "granted_fetches": int(budget_after_snapshot.get("granted_fetches", 0)),
+            "reserve_searches": int(budget_after_snapshot.get("reserve_searches", 0)),
+            "reserve_fetches": int(budget_after_snapshot.get("reserve_fetches", 0)),
+        }
+        if action == "expand_budget" and grant_result:
+            original_before = grant_result.get("budget_before")
+            original_after = grant_result.get("budget_after")
+            if isinstance(original_before, dict) and isinstance(original_after, dict):
+                for field_name in (
+                    "granted_searches",
+                    "granted_fetches",
+                    "reserve_searches",
+                    "reserve_fetches",
+                ):
+                    budget_before[field_name] = int(original_before[field_name])
+                    budget_after[field_name] = int(original_after[field_name])
+        control = record_control_decision(
+            control,
+            decision_id=decision_id,
+            action=action,
+            assessment=assessment,
+            reason_codes=list(dict.fromkeys(reasons)),
+            budget_before=budget_before,
+            budget_after=budget_after,
+        )
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "control_assessed",
+            plan_id=plan["plan_id"],
+            subquestion_id=subquestion_id,
+            details={
+                "decision_id": decision_id,
+                "action": action,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "assessment": assessment,
+            },
+        )
+        action_event = {
+            "expand_budget": "budget_expanded",
+            "continue": "adaptive_continued",
+            "stop_subquestion": "adaptive_stopped",
+            "finish_success": "adaptive_stopped",
+            "finish_partial": "adaptive_stopped",
+            "fail_closed": "control_integrity_failed",
+        }[action]
+        events = append_research_event(
+            events,
+            action_event,
+            plan_id=plan["plan_id"],
+            subquestion_id=subquestion_id,
+            details={
+                "decision_id": decision_id,
+                "action": action,
+                "grant": grant_result,
+                "budget_before": budget_before,
+                "budget_after": budget_after,
+            },
+        )
+        return {
+            "research_plan": refresh_plan_status(plan),
+            "research_events": events,
+            "budget_state": cast("BudgetState", budget_after_snapshot),
+            "adaptive_control": cast("AdaptiveControlState", control),
+            "workflow_phase": "evaluating",
+        }
+
+    def route_after_control(state: TongAgentState) -> ControlRoute:
+        control = state["adaptive_control"]
+        history = control.get("decision_history", [])
+        action = history[-1].get("action") if history else "finish_partial"
+        if action in {"finish_success", "finish_partial", "fail_closed"}:
+            return "report"
+        if int(state.get("research_cycles", 0)) >= int(
+            state.get("max_research_cycles", max_research_cycles)
+        ):
+            return "report"
+        return "select"
+
     def prepare_report_node(state: TongAgentState) -> dict[str, Any]:
+        if report_clear is not None:
+            report_clear()
         if budget_activate is not None:
             budget_activate(None)
         plan = deepcopy(state["research_plan"])
@@ -1280,28 +1616,70 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                         note="The explicit research cycle limit was reached.",
                     )
         plan = refresh_plan_status(plan)
+        budget = budget_snapshot()
+        integrity_errors = validate_evidence_graph(budget)
+        control_history = state.get("adaptive_control", {}).get("decision_history", [])
+        integrity_fail_closed = bool(integrity_errors) or bool(
+            control_history and control_history[-1].get("action") == "fail_closed"
+        )
+        if integrity_fail_closed:
+            plan = deepcopy(plan)
+            for target in plan["subquestions"]:
+                target["status"] = "blocked"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["note"] = (
+                    "Evidence integrity validation failed; research stopped."
+                )
+            plan = refresh_plan_status(plan)
         events = append_research_event(
             list(state.get("research_events", [])),
             "report_requested",
             plan_id=plan["plan_id"],
-            details={"coverage": plan["coverage"], "status": plan["status"]},
+            details={
+                "coverage": plan["coverage"],
+                "status": plan["status"],
+                "integrity_fail_closed": integrity_fail_closed,
+                "integrity_errors": integrity_errors,
+            },
         )
         plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
-        budget = budget_snapshot()
-        ledger_json = json.dumps(
-            budget.get("successful_sources", []), ensure_ascii=False, indent=2
+        report_sources = (
+            [] if integrity_fail_closed else budget.get("successful_sources", [])
         )
-        evidence_graph_json = json.dumps(
-            {
+        ledger_json = json.dumps(report_sources, ensure_ascii=False, indent=2)
+        report_graph = (
+            {"claims": [], "evidence_units": [], "conflicts": []}
+            if integrity_fail_closed
+            else {
                 "claims": budget.get("claims", []),
                 "evidence_units": budget.get("evidence_units", []),
                 "conflicts": budget.get("conflicts", []),
-            },
+            }
+        )
+        evidence_graph_json = json.dumps(
+            report_graph,
             ensure_ascii=False,
             indent=2,
         )
+        allowed_caveats = sorted(
+            allowed_report_caveat_lines(plan, integrity_failure=integrity_fail_closed)
+        )
+        allowed_caveats_json = json.dumps(
+            allowed_caveats,
+            ensure_ascii=False,
+            indent=2,
+        )
+        fail_closed_instruction = (
+            "Evidence integrity validation failed. Do not report or cite any "
+            "canonical fact; leave the factual sections empty and copy only the "
+            "matching allowed caveat under Conflicts and Caveats.\n\n"
+            if integrity_fail_closed
+            else ""
+        )
         content = f"""[FINAL SYNTHESIS]
-You MUST call write_file to create the final `/report.md` for the root question using only the canonical evidence graph below. Use exactly these four H2 section headings in this order with Sources last: `## Short Answer`, `## Key Findings`, `## Conflicts and Caveats`, and `## Sources`; do not add other headings. Every non-empty finding line must contain exactly one canonical `claim.text` copied byte-for-byte from the graph plus its `[C#]` and linked `[S#]`; copy `claim.text`, NOT the evidence quote. The only valid shape is `- <exact claim.text> [C#][S#]`: add no prefix, suffix, emphasis, or local paraphrase. Every canonical claim_id attached to a covered SQ in PLAN MUST appear at least once, even when two claim texts look redundant. Put contested claims only in Conflicts and Caveats and cite both supporting and contradicting sources. A generic process or evidence-quality caveat in that section must contain no `[C#]` or `[S#]`; never attach a supported claim ID to locally written caveat text. Never present contradicted-only claims as facts. Every Sources line MUST have exactly this shape: `- [S#] <exact canonical title> — <canonical URL>`. If there are no reportable claims, leave Short Answer and Key Findings empty and explain the limitation only under Conflicts and Caveats. Search snippets and failed fetches are not evidence. If the plan is partial, write an honest partial report without claiming blocked work was completed.
+{fail_closed_instruction}You MUST call write_file to create the final `/report.md` for the root question using only the canonical evidence graph below. Use exactly these four H2 section headings in this order with Sources last: `## Short Answer`, `## Key Findings`, `## Conflicts and Caveats`, and `## Sources`; do not add other headings. Every non-empty finding line must contain exactly one canonical `claim.text` copied byte-for-byte from the graph plus its `[C#]` and linked `[S#]`; copy `claim.text`, NOT the evidence quote. The only valid shape is `- <exact claim.text> [C#][S#]`: add no prefix, suffix, emphasis, or local paraphrase. Every canonical claim_id attached to a covered SQ in PLAN MUST appear at least once, even when two claim texts look redundant. Put contested claims only in Conflicts and Caveats and cite both supporting and contradicting sources. Citation-free text in Conflicts and Caveats is forbidden unless the complete stripped line is copied byte-for-byte from ALLOWED CAVEAT LINES below; if that list is empty, leave the section empty unless it contains a canonical contested claim. Never attach a supported claim ID to caveat text. Never present contradicted-only claims as facts. Every Sources line MUST have exactly this shape: `- [S#] <exact canonical title> — <canonical URL>`. If there are no reportable claims, leave Short Answer and Key Findings empty and use only an applicable allowed caveat. Search snippets and failed fetches are not evidence. If the plan is partial, use only the exact applicable partial-coverage caveat without claiming blocked work was completed.
 
 PLAN:
 {plan_json}
@@ -1310,7 +1688,10 @@ CANONICAL SOURCE LEDGER:
 {ledger_json}
 
 CANONICAL EVIDENCE GRAPH:
-{evidence_graph_json}"""
+{evidence_graph_json}
+
+ALLOWED CAVEAT LINES:
+{allowed_caveats_json}"""
         return {
             "messages": [
                 HumanMessage(
@@ -1322,6 +1703,7 @@ CANONICAL EVIDENCE GRAPH:
             "research_events": events,
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "reporting",
+            "report_markdown": "",
         }
 
     def finish_node(state: TongAgentState) -> dict[str, Any]:
@@ -1348,6 +1730,21 @@ CANONICAL EVIDENCE GRAPH:
         return {
             **result,
             "budget_state": cast("BudgetState", budget_snapshot()),
+            "report_markdown": "",
+        }
+
+    def invoke_report_agent(
+        state: TongAgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Run synthesis without exposing untrusted research-turn messages."""
+        report_state = dict(state)
+        report_state["messages"] = [state["messages"][-1]]
+        result = report_agent.invoke(report_state, config=config)
+        report_markdown = report_read() if report_read is not None else ""
+        return {
+            **result,
+            "budget_state": cast("BudgetState", budget_snapshot()),
+            "report_markdown": report_markdown,
         }
 
     builder = StateGraph(TongAgentState)
@@ -1356,8 +1753,9 @@ CANONICAL EVIDENCE GRAPH:
     builder.add_node("prepare_research", prepare_research_node)
     builder.add_node("research_agent", invoke_inner_agent)
     builder.add_node("evaluate", evaluate_node)
+    builder.add_node("adaptive_control", adaptive_control_node)
     builder.add_node("prepare_report", prepare_report_node)
-    builder.add_node("report_agent", invoke_inner_agent)
+    builder.add_node("report_agent", invoke_report_agent)
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "select")
@@ -1371,7 +1769,16 @@ CANONICAL EVIDENCE GRAPH:
     builder.add_conditional_edges(
         "evaluate",
         route_after_evaluate,
-        {"research": "select", "report": "prepare_report"},
+        {
+            "research": "select",
+            "report": "prepare_report",
+            "control": "adaptive_control",
+        },
+    )
+    builder.add_conditional_edges(
+        "adaptive_control",
+        route_after_control,
+        {"select": "select", "report": "prepare_report"},
     )
     builder.add_edge("prepare_report", "report_agent")
     builder.add_edge("report_agent", "finish")

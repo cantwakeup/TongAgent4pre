@@ -7,6 +7,7 @@ from copy import deepcopy
 
 from agent_policy import EFFORT_POLICIES
 from evidence_graph import (
+    allowed_report_caveat_lines,
     independent_evidence_source_ids,
     report_claim_mapping_errors,
     text_sha256,
@@ -704,6 +705,44 @@ An invented fact after Sources.
         )
 
         self.assertTrue(errors["invalid_sources_section_lines"])
+
+    def test_only_state_derived_citation_free_caveats_are_allowed(self) -> None:
+        plan = {
+            "status": "partial",
+            "subquestions": [{"id": "SQ1", "status": "blocked", "claim_ids": []}],
+        }
+        allowed = allowed_report_caveat_lines(plan)
+        valid_report = """## Short Answer
+## Key Findings
+## Conflicts and Caveats
+- Research coverage is partial; unsupported subquestions: SQ1.
+- No canonical claim passed the evidence gate.
+## Sources
+"""
+        invented_report = """## Short Answer
+## Key Findings
+## Conflicts and Caveats
+- 北京研究院已于2025年关闭。
+## Sources
+"""
+
+        valid_errors = report_claim_mapping_errors(
+            valid_report,
+            plan_claim_ids=set(),
+            claims=[],
+            evidence_units=[],
+            allowed_caveat_lines=allowed,
+        )
+        invented_errors = report_claim_mapping_errors(
+            invented_report,
+            plan_claim_ids=set(),
+            claims=[],
+            evidence_units=[],
+            allowed_caveat_lines=allowed,
+        )
+
+        self.assertTrue(all(not value for value in valid_errors.values()))
+        self.assertTrue(invented_errors["unauthorized_caveat_lines"])
 
 
 if __name__ == "__main__":

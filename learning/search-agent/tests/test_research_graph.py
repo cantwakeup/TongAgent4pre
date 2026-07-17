@@ -15,6 +15,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph import MessagesState
 
+from evidence_graph import text_sha256
 from research_graph import (
     DraftSubquestion,
     build_model_planner,
@@ -66,10 +67,12 @@ class _FakeLedger:
         claim_id = f"C{len(self.claims) + 1}"
         evidence_id = f"E{len(self.evidence_units) + 1}"
         canonical_hash = content_hash or f"{len(self.sources) + 1:064x}"
+        quote = f"Exact evidence quote for {subquestion_id}."
+        url = f"https://example.com/{source_id}"
         self.sources.append(
             {
                 "source_id": source_id,
-                "url": f"https://example.com/{source_id}",
+                "url": url,
                 "title": source_id,
                 "content_chars": 800,
                 "content_sha256": canonical_hash,
@@ -106,7 +109,12 @@ class _FakeLedger:
                 "subquestion_id": subquestion_id,
                 "source_id": source_id,
                 "stance": "supports",
+                "quote": quote,
+                "quote_sha256": text_sha256(quote),
                 "source_content_sha256": canonical_hash,
+                "url": url,
+                "title": source_id,
+                "evidence_quality": "full",
             }
         )
         return source_id
@@ -673,6 +681,19 @@ class ResearchPlanTests(unittest.TestCase):
 class ResearchGraphTests(unittest.TestCase):
     """Verify graph ordering, bounded retries, and cross-process recovery."""
 
+    def test_graph_requires_an_explicit_synthesis_agent(self) -> None:
+        ledger = _FakeLedger()
+
+        with self.assertRaisesRegex(ValueError, "synthesis-only report_agent"):
+            build_research_graph(
+                research_agent=_fake_research_agent(ledger),
+                planner=_fixed_plan,
+                budget_snapshot=ledger.snapshot,
+                checkpointer=None,
+                max_subquestions=2,
+                max_research_cycles=4,
+            )
+
     def test_graph_completes_each_subquestion_before_reporting(self) -> None:
         ledger = _FakeLedger()
         planner_calls: list[str] = []
@@ -683,6 +704,7 @@ class ResearchGraphTests(unittest.TestCase):
 
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=planner,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -712,6 +734,7 @@ class ResearchGraphTests(unittest.TestCase):
         activated: list[str | None] = []
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             budget_configure=lambda ids: configured.append(list(ids)),
@@ -735,6 +758,7 @@ class ResearchGraphTests(unittest.TestCase):
         ledger = _FakeLedger()
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger, produce_evidence=False),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -764,6 +788,7 @@ class ResearchGraphTests(unittest.TestCase):
         ledger = _FakeLedger()
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger, claim_evidence=False),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -799,6 +824,7 @@ class ResearchGraphTests(unittest.TestCase):
         injected = refresh_plan_status(injected)
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -838,6 +864,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 interrupted = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -861,6 +888,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 resumed = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -886,6 +914,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 interrupted = build_research_graph(
                     research_agent=_fake_research_agent(first_ledger),
+                    report_agent=_fake_research_agent(first_ledger),
                     planner=_fixed_plan,
                     budget_snapshot=first_ledger.snapshot,
                     checkpointer=checkpointer,
@@ -913,6 +942,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 resumed = build_research_graph(
                     research_agent=_fake_research_agent(fresh_ledger),
+                    report_agent=_fake_research_agent(fresh_ledger),
                     planner=_fixed_plan,
                     budget_snapshot=fresh_ledger.snapshot,
                     checkpointer=checkpointer,
@@ -957,6 +987,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 graph = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=_fixed_plan,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -997,6 +1028,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 graph = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,

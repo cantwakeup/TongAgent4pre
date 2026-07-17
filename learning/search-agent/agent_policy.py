@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal
 
 
 EffortName = Literal["low", "medium", "high", "xhigh"]
 ModeName = Literal["single", "multi", "auto"]
 TopologyName = Literal["single", "multi"]
+POLICY_FINGERPRINT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,31 @@ def resolve_topology(mode: ModeName, effort: EffortName, topic: str) -> Topology
     if marker_hits >= 1 or len(topic) >= 80:
         return "multi"
     return "single"
+
+
+def policy_fingerprint(
+    *,
+    strategy: str,
+    effort: EffortName,
+    requested_mode: ModeName,
+    resolved_topology: TopologyName,
+    model_name: str,
+    worker_model_name: str,
+    max_escalations: int,
+) -> str:
+    """Hash every pinned runtime choice that affects pending-plan semantics."""
+    payload = {
+        "schema_version": POLICY_FINGERPRINT_SCHEMA_VERSION,
+        "strategy": strategy,
+        "effort": effort,
+        "requested_mode": requested_mode,
+        "resolved_topology": resolved_topology,
+        "model_name": model_name,
+        "worker_model_name": worker_model_name,
+        "max_escalations": max(0, max_escalations),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return sha256(canonical.encode()).hexdigest()
 
 
 def policy_prompt(policy: EffortPolicy, topology: TopologyName) -> str:

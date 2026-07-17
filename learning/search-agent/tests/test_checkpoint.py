@@ -157,27 +157,27 @@ class CheckpointTests(unittest.TestCase):
                 note="covered before report",
             )
             budget = ResearchBudget(EFFORT_POLICIES["low"])
-            budget.restore(
-                {
-                    "search_calls": 1,
-                    "fetch_calls": 2,
-                    "successful_sources": [
+            budget.configure_subquestions(["SQ1"])
+            budget.activate_subquestion("SQ1")
+            self.assertTrue(budget.reserve_search())
+            budget.record_search_success()
+            for sequence, label in enumerate(("one", "two"), start=1):
+                self.assertTrue(budget.reserve_fetch())
+                content = f"Official source {sequence} content. " * 30
+                self.assertEqual(
+                    budget.record_fetch(
                         {
-                            "source_id": "S1",
-                            "url": "https://example.com/one",
-                            "title": "One",
-                            "content_chars": 800,
-                        },
-                        {
-                            "source_id": "S2",
-                            "url": "https://example.com/two",
-                            "title": "Two",
-                            "content_chars": 800,
-                        },
-                    ],
-                    "failed_sources": [],
-                }
-            )
+                            "status": "success",
+                            "url": f"https://example.com/{label}",
+                            "title": label.title(),
+                            "content": content,
+                            "content_chars": len(content),
+                            "evidence_quality": "full",
+                        }
+                    ),
+                    f"S{sequence}",
+                )
+            budget.activate_subquestion(None)
 
             class _PendingAgent:
                 def __init__(self) -> None:
@@ -271,6 +271,153 @@ class CheckpointTests(unittest.TestCase):
                 )
 
             self.assertEqual(fake_agent.inputs, [None])
+
+    def test_auto_resume_uses_saved_question_then_rebuilds_for_new_topic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            output_dir.mkdir()
+            old_question = "short topic"
+            new_question = "比较两个复杂系统，并给出完整的证据分析"
+            old_plan = create_research_plan(
+                old_question,
+                ["Establish the saved fact"],
+                plan_id_factory=lambda: "plan-auto-resume",
+            )
+            old_plan["evidence_schema_version"] = 0
+            old_plan, _ = select_next_subquestion(old_plan)
+            old_plan = transition_subquestion(
+                old_plan,
+                "SQ1",
+                "covered",
+                evidence_source_ids=["S1"],
+                note="covered before finish",
+            )
+            saved_budget = ResearchBudget(EFFORT_POLICIES["low"])
+            saved_content = "Saved source content for thread-stable IDs. " * 20
+            self.assertEqual(
+                saved_budget.record_fetch(
+                    {
+                        "status": "success",
+                        "url": "https://example.com/saved",
+                        "title": "Saved Source",
+                        "content": saved_content,
+                        "content_chars": len(saved_content),
+                        "evidence_quality": "full",
+                    }
+                ),
+                "S1",
+            )
+            saved_budget.configure_subquestions(["SQ1"])
+            checkpoint_values = {
+                "messages": [
+                    HumanMessage(
+                        content="[FINAL SYNTHESIS]",
+                        id="report-step-plan-auto-resume-1",
+                    )
+                ],
+                "research_plan": old_plan,
+                "budget_state": saved_budget.snapshot(),
+                "adaptive_control": {"config_fingerprint": "saved-fingerprint"},
+                "active_subquestion_id": None,
+            }
+
+            class _NewPlanStarted(RuntimeError):
+                pass
+
+            class _AutoAgent:
+                def __init__(self, *, stop_on_invoke: bool) -> None:
+                    self.stop_on_invoke = stop_on_invoke
+                    self.inputs: list[dict[str, Any] | None] = []
+
+                def get_state(self, config: dict[str, Any]) -> Any:
+                    del config
+                    return SimpleNamespace(values=checkpoint_values, next=("finish",))
+
+                def invoke(
+                    self, payload: dict[str, Any] | None, *, config: dict[str, Any]
+                ) -> dict[str, Any]:
+                    del config
+                    self.inputs.append(payload)
+                    if self.stop_on_invoke:
+                        raise _NewPlanStarted
+                    return {
+                        **checkpoint_values,
+                        "research_events": [],
+                    }
+
+            resume_agent = _AutoAgent(stop_on_invoke=False)
+            new_plan_agent = _AutoAgent(stop_on_invoke=True)
+            resume_bundle = AgentBundle(
+                agent=resume_agent,
+                budget=ResearchBudget(EFFORT_POLICIES["low"]),
+                policy=EFFORT_POLICIES["low"],
+                mode="auto",
+                topology="single",
+                config_fingerprint="saved-fingerprint",
+            )
+            new_plan_bundle = AgentBundle(
+                agent=new_plan_agent,
+                budget=ResearchBudget(EFFORT_POLICIES["low"]),
+                policy=EFFORT_POLICIES["low"],
+                mode="auto",
+                topology="multi",
+                config_fingerprint="new-fingerprint",
+            )
+            built_topics: list[str] = []
+
+            def fake_build_agent(**kwargs: Any) -> AgentBundle:
+                topic = str(kwargs["topic"])
+                built_topics.append(topic)
+                return resume_bundle if topic == old_question else new_plan_bundle
+
+            args = Namespace(
+                model="test-model",
+                effort="low",
+                worker_model="test-worker",
+                mode="auto",
+                strategy="fixed",
+                max_escalations=2,
+                topic=new_question,
+                follow_up=[],
+                no_stream=True,
+                print_report=False,
+            )
+
+            with (
+                patch("search_agent.build_agent", side_effect=fake_build_agent),
+                self.assertRaises(_NewPlanStarted),
+            ):
+                _execute_cli(
+                    args,
+                    output_dir=output_dir,
+                    checkpoint_path=Path(temp_dir) / "checkpoint.sqlite",
+                    checkpointer=object(),
+                    thread_id="auto-resume",
+                )
+
+            self.assertEqual(
+                built_topics,
+                [new_question, old_question, new_question],
+            )
+            self.assertEqual(resume_agent.inputs, [None])
+            self.assertEqual(
+                new_plan_agent.inputs,
+                [
+                    {
+                        "messages": [{"role": "user", "content": new_question}],
+                        "research_topic": new_question,
+                    }
+                ],
+            )
+            migrated = new_plan_bundle.budget.snapshot()
+            self.assertEqual(
+                [item["source_id"] for item in migrated["successful_sources"]],
+                ["S1"],
+            )
+            self.assertEqual(migrated["next_source_sequence"], 2)
+            self.assertEqual(migrated["search_calls"], 0)
 
 
 if __name__ == "__main__":

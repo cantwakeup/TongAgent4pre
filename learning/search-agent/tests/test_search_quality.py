@@ -32,6 +32,18 @@ class SearchQualityTests(unittest.TestCase):
             _search_relevance_score(query, relevant), MIN_SEARCH_RELEVANCE_SCORE
         )
 
+    def test_site_operator_with_path_matches_the_result_host(self) -> None:
+        score = _search_relevance_score(
+            "site:bigai.ai/about/ info.bigai@bigai.ai",
+            {
+                "title": "关于通院",
+                "url": "https://www.bigai.ai/about/",
+                "snippet": "北京通用人工智能研究院官网信息。",
+            },
+        )
+
+        self.assertGreaterEqual(score, MIN_SEARCH_RELEVANCE_SCORE)
+
     def test_low_relevance_duckduckgo_results_trigger_bing(self) -> None:
         query = '"北京通用人工智能研究院" "通计划"'
         duckduckgo = [
