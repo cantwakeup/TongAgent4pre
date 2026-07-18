@@ -44,6 +44,28 @@ class SearchQualityTests(unittest.TestCase):
 
         self.assertGreaterEqual(score, MIN_SEARCH_RELEVANCE_SCORE)
 
+    def test_site_operator_does_not_match_domain_suffix_without_label_boundary(
+        self,
+    ) -> None:
+        score = _search_relevance_score(
+            "site:bigai.ai",
+            {
+                "title": "lookalike",
+                "url": "https://evilbigai.ai/page",
+                "snippet": "unrelated",
+            },
+        )
+
+        self.assertEqual(score, 0)
+
+    def test_empty_site_domain_never_matches_an_empty_result_host(self) -> None:
+        score = _search_relevance_score(
+            "site:/",
+            {"title": "unrelated", "url": "", "snippet": "unrelated"},
+        )
+
+        self.assertEqual(score, 0)
+
     def test_low_relevance_duckduckgo_results_trigger_bing(self) -> None:
         query = '"北京通用人工智能研究院" "通计划"'
         duckduckgo = [

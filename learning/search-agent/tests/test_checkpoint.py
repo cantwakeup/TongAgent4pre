@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from argparse import Namespace
@@ -122,6 +123,7 @@ class CheckpointTests(unittest.TestCase):
                         "input_tokens": 20,
                         "output_tokens": 3,
                         "total_tokens": 23,
+                        "input_token_details": {"cache_read": 0},
                     },
                 ),
             ]
@@ -130,13 +132,48 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(
             usage,
             {
+                "usage_status": "complete",
                 "model_calls": 2,
                 "input_tokens": 30,
                 "output_tokens": 5,
                 "total_tokens": 35,
                 "cache_read_tokens": 4,
+                "observed_model_messages": 2,
+                "missing_usage_messages": 0,
             },
         )
+
+    def test_api_usage_is_unavailable_without_provider_telemetry(self) -> None:
+        usage = _aggregate_message_usage([AIMessage(content="no telemetry")])
+
+        self.assertEqual(usage["usage_status"], "unavailable")
+        self.assertIsNone(usage["model_calls"])
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["total_tokens"])
+        self.assertEqual(usage["missing_usage_messages"], 1)
+
+    def test_api_usage_is_partial_instead_of_inventing_missing_totals(self) -> None:
+        usage = _aggregate_message_usage(
+            [
+                AIMessage(
+                    content="observed",
+                    usage_metadata={
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                ),
+                AIMessage(content="missing"),
+            ]
+        )
+
+        self.assertEqual(usage["usage_status"], "partial")
+        self.assertEqual(usage["model_calls"], 1)
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["output_tokens"])
+        self.assertIsNone(usage["total_tokens"])
+        self.assertIsNone(usage["cache_read_tokens"])
+        self.assertEqual(usage["missing_usage_messages"], 1)
 
     def test_execute_cli_continues_pending_node_with_none(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -261,7 +298,13 @@ class CheckpointTests(unittest.TestCase):
                 print_report=False,
             )
 
-            with patch("search_agent.build_agent", return_value=bundle):
+            with (
+                patch("search_agent.build_agent", return_value=bundle),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Run validation failed",
+                ),
+            ):
                 _execute_cli(
                     args,
                     output_dir=output_dir,
@@ -271,6 +314,14 @@ class CheckpointTests(unittest.TestCase):
                 )
 
             self.assertEqual(fake_agent.inputs, [None])
+            run = json.loads((output_dir / "run.json").read_text())
+            self.assertIsNone(run["research"]["structural_subquestion_coverage"])
+            self.assertTrue(
+                any(
+                    "legacy source-only checkpoint" in error
+                    for error in run["validation"]["errors"]
+                )
+            )
 
     def test_auto_resume_uses_saved_question_then_rebuilds_for_new_topic(
         self,

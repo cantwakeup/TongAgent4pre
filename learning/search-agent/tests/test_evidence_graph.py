@@ -715,7 +715,7 @@ An invented fact after Sources.
         valid_report = """## Short Answer
 ## Key Findings
 ## Conflicts and Caveats
-- Research coverage is partial; unsupported subquestions: SQ1.
+- Structural subquestion coverage is partial; unsupported subquestions: SQ1.
 - No canonical claim passed the evidence gate.
 ## Sources
 """

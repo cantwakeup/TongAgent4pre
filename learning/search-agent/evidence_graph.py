@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from research_state import ClaimRecord, ConflictRecord, EvidenceStance, EvidenceUnit
 
@@ -21,6 +23,7 @@ EVIDENCE_ID_PATTERN = re.compile(r"^E[1-9][0-9]*$")
 CONFLICT_ID_PATTERN = re.compile(r"^X[1-9][0-9]*$")
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 REPORT_CLAIM_PATTERN = re.compile(r"\[(C[1-9][0-9]*)\]")
 REPORT_SOURCE_PATTERN = re.compile(r"\[(S[1-9][0-9]*)\]")
 CANONICAL_SOURCE_LINE_PATTERN = re.compile(
@@ -61,14 +64,13 @@ def allowed_report_caveat_lines(
     if plan.get("status") != "completed":
         if unsupported_ids:
             allowed.add(
-                "- Research coverage is partial; unsupported subquestions: "
-                + ", ".join(unsupported_ids)
-                + "."
+                "- Structural subquestion coverage is partial; unsupported "
+                "subquestions: " + ", ".join(unsupported_ids) + "."
             )
         else:
             allowed.add(
-                "- Research coverage is partial; at least one subquestion remains "
-                "unsupported."
+                "- Structural subquestion coverage is partial; at least one "
+                "subquestion remains unsupported."
             )
     if not any(item.get("claim_ids") for item in plan.get("subquestions", [])):
         allowed.add(NO_CANONICAL_CLAIM_CAVEAT)
@@ -128,18 +130,49 @@ def _source_revisions(source: dict[str, Any]) -> list[dict[str, Any]]:
     return revisions
 
 
-def independent_evidence_source_ids(
+def normalized_source_host(url: str) -> str:
+    """Return the conservative hostname identity used for source grouping.
+
+    This intentionally does not guess registrable domains.  A `www.` prefix is
+    normalized, while other subdomains remain distinct and are documented as a
+    limitation of the lightweight grouping policy.
+    """
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not host:
+        return ""
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if len(ascii_host) > 253:
+        return ""
+    labels = ascii_host.split(".")
+    if any(not DNS_LABEL_PATTERN.fullmatch(label) for label in labels):
+        return ""
+    return ascii_host.removeprefix("www.")
+
+
+def source_diversity_metrics(
     *,
     source_ids: Iterable[str],
     sources: list[dict[str, Any]],
     evidence_units: list[dict[str, Any]],
     claim_ids: set[str] | None = None,
-) -> list[str]:
-    """Collapse sources whose cited evidence uses only already-seen revisions.
+) -> dict[str, Any]:
+    """Measure revisions, hosts, and conservative corroborating source groups.
 
-    Source-level duplicate flags describe each URL's latest fetch and may change
-    after content drift. Policy gates instead need the immutable revision hashes
-    attached to the plan's evidence edges.
+    Two evidence sources are placed in the same corroborating group when they
+    share the same normalized hostname *or* the same captured-content hash.  The
+    transitive closure is deliberate: same-host pages are not automatically
+    independent, and exact mirrors on different hosts are not double counted.
     """
     candidates = set(source_ids)
     hashes_by_source: dict[str, set[str]] = {}
@@ -147,23 +180,142 @@ def independent_evidence_source_ids(
         source_id = str(unit.get("source_id", ""))
         if source_id not in candidates:
             continue
+        if str(unit.get("stance", "")) != "supports":
+            continue
         if claim_ids is not None and str(unit.get("claim_id", "")) not in claim_ids:
             continue
         content_hash = str(unit.get("source_content_sha256", ""))
         if SHA256_PATTERN.fullmatch(content_hash):
             hashes_by_source.setdefault(source_id, set()).add(content_hash)
 
-    independent: list[str] = []
-    seen_hashes: set[str] = set()
+    ordered_sources: list[tuple[str, str, set[str]]] = []
+    unavailable_source_ids: list[str] = []
+    all_revision_hashes: set[str] = set()
     for source in sources:
         source_id = str(source.get("source_id", ""))
         if source_id not in candidates:
             continue
         revision_hashes = hashes_by_source.get(source_id, set())
-        if revision_hashes - seen_hashes:
-            independent.append(source_id)
-        seen_hashes.update(revision_hashes)
-    return independent
+        if not revision_hashes:
+            continue
+        all_revision_hashes.update(revision_hashes)
+        host = normalized_source_host(str(source.get("url", "")))
+        if not host:
+            unavailable_source_ids.append(source_id)
+            continue
+        ordered_sources.append(
+            (
+                source_id,
+                host,
+                revision_hashes,
+            )
+        )
+
+    parent = list(range(len(ordered_sources)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left, (_, left_host, left_hashes) in enumerate(ordered_sources):
+        for right in range(left):
+            _, right_host, right_hashes = ordered_sources[right]
+            same_host = bool(left_host) and left_host == right_host
+            same_content = bool(left_hashes.intersection(right_hashes))
+            if same_host or same_content:
+                union(right, left)
+
+    grouped_indexes: dict[int, list[int]] = {}
+    for index in range(len(ordered_sources)):
+        grouped_indexes.setdefault(find(index), []).append(index)
+    groups: list[dict[str, Any]] = []
+    for sequence, indexes in enumerate(grouped_indexes.values(), start=1):
+        source_group_ids = [ordered_sources[index][0] for index in indexes]
+        hosts = sorted(
+            {
+                ordered_sources[index][1]
+                for index in indexes
+                if ordered_sources[index][1]
+            }
+        )
+        hashes = sorted(
+            {
+                content_hash
+                for index in indexes
+                for content_hash in ordered_sources[index][2]
+            }
+        )
+        groups.append(
+            {
+                "group_id": f"G{sequence}",
+                "representative_source_id": source_group_ids[0],
+                "source_ids": source_group_ids,
+                "source_hosts": hosts,
+                "content_revisions": hashes,
+            }
+        )
+
+    distinct_hashes = sorted(all_revision_hashes)
+    distinct_hosts = sorted({host for _, host, _ in ordered_sources if host})
+    return {
+        "distinct_content_revisions": distinct_hashes,
+        "distinct_content_revision_count": len(distinct_hashes),
+        "distinct_source_hosts": distinct_hosts,
+        "distinct_source_host_count": len(distinct_hosts),
+        "corroborating_source_groups": groups,
+        "corroborating_source_group_count": len(groups),
+        "corroborating_source_ids": [
+            str(group["representative_source_id"]) for group in groups
+        ],
+        "unavailable_source_ids": unavailable_source_ids,
+        "hostname_policy": "normalized_hostname_without_www",
+    }
+
+
+def corroborating_evidence_source_ids(
+    *,
+    source_ids: Iterable[str],
+    sources: list[dict[str, Any]],
+    evidence_units: list[dict[str, Any]],
+    claim_ids: set[str] | None = None,
+) -> list[str]:
+    """Return one representative ID per conservative corroborating group."""
+    metrics = source_diversity_metrics(
+        source_ids=source_ids,
+        sources=sources,
+        evidence_units=evidence_units,
+        claim_ids=claim_ids,
+    )
+    return list(metrics["corroborating_source_ids"])
+
+
+def independent_evidence_source_ids(
+    *,
+    source_ids: Iterable[str],
+    sources: list[dict[str, Any]],
+    evidence_units: list[dict[str, Any]],
+    claim_ids: set[str] | None = None,
+) -> list[str]:
+    """Compatibility alias for conservative corroborating source groups.
+
+    The old name overstated what revision hashes could prove.  New code and
+    artifacts use `corroborating_source_groups`; this alias remains so older
+    callers do not silently regain the weaker revision-only policy.
+    """
+    return corroborating_evidence_source_ids(
+        source_ids=source_ids,
+        sources=sources,
+        evidence_units=evidence_units,
+        claim_ids=claim_ids,
+    )
 
 
 @dataclass

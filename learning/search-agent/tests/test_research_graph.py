@@ -54,6 +54,7 @@ class _FakeLedger:
         self.claims: list[dict[str, Any]] = []
         self.evidence_units: list[dict[str, Any]] = []
         self.conflicts: list[dict[str, Any]] = []
+        self.searches_by_subquestion: dict[str, int] = {}
 
     def add_source(
         self,
@@ -68,7 +69,10 @@ class _FakeLedger:
         evidence_id = f"E{len(self.evidence_units) + 1}"
         canonical_hash = content_hash or f"{len(self.sources) + 1:064x}"
         quote = f"Exact evidence quote for {subquestion_id}."
-        url = f"https://example.com/{source_id}"
+        url = f"https://source{len(self.sources) + 1}.example/{source_id}"
+        self.searches_by_subquestion[subquestion_id] = (
+            self.searches_by_subquestion.get(subquestion_id, 0) + 1
+        )
         self.sources.append(
             {
                 "source_id": source_id,
@@ -124,13 +128,29 @@ class _FakeLedger:
         return {
             "effort": "test",
             "search_calls": len(self.sources),
+            "provider_successes": len(self.sources),
+            "nonempty_searches": len(self.sources),
             "successful_searches": len(self.sources),
+            "relevant_searches": len(self.sources),
+            "evidence_producing_searches": len(self.evidence_units),
             "max_searches": 10,
             "fetch_calls": len(self.sources),
             "max_fetches": 10,
             "min_successful_sources": 1,
             "successful_sources": list(self.sources),
             "failed_sources": [],
+            "subquestion_usage": {
+                subquestion_id: {
+                    "search_calls": count,
+                    "provider_successes": count,
+                    "nonempty_searches": count,
+                    "successful_searches": count,
+                    "relevant_searches": count,
+                    "evidence_producing_searches": count,
+                    "fetch_calls": count,
+                }
+                for subquestion_id, count in self.searches_by_subquestion.items()
+            },
             "evidence_graph_version": 1,
             "claims": list(self.claims),
             "evidence_units": list(self.evidence_units),
@@ -145,6 +165,10 @@ class _FakeLedger:
             dict(item) for item in snapshot.get("evidence_units", [])
         ]
         self.conflicts = [dict(item) for item in snapshot.get("conflicts", [])]
+        self.searches_by_subquestion = {
+            str(key): int(value.get("relevant_searches", 0))
+            for key, value in snapshot.get("subquestion_usage", {}).items()
+        }
 
 
 def _fake_research_agent(
@@ -256,7 +280,7 @@ class ResearchPlanTests(unittest.TestCase):
                 evidence_source_ids=["not-a-source"],
             )
 
-    def test_coverage_and_selection_skip_completed_work(self) -> None:
+    def test_selection_skips_covered_work_but_unaudited_ids_do_not_count(self) -> None:
         plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
         plan = transition_subquestion(
             plan,
@@ -270,7 +294,8 @@ class ResearchPlanTests(unittest.TestCase):
 
         self.assertEqual(active, "SQ2")
         self.assertEqual(selected["subquestions"][0]["attempts"], 1)
-        self.assertEqual(calculate_plan_coverage(selected), 0.5)
+        self.assertEqual(calculate_plan_coverage(selected), 0.0)
+        self.assertFalse(selected["subquestions"][0]["structural_closure_validated"])
 
     def test_blocked_dependency_is_cascaded_instead_of_researched(self) -> None:
         plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
@@ -300,6 +325,8 @@ class ResearchPlanTests(unittest.TestCase):
         migrated = refresh_plan_status(legacy)
 
         self.assertEqual(migrated["evidence_schema_version"], 0)
+        self.assertIsNone(migrated["structural_subquestion_coverage"])
+        self.assertIsNone(migrated["coverage"])
         self.assertEqual(migrated["subquestions"][0]["claim_ids"], [])
         self.assertEqual(migrated["subquestions"][0]["conflict_ids"], [])
 
@@ -353,7 +380,7 @@ class ResearchPlanTests(unittest.TestCase):
         accepted_payload = json.loads(accepted.update["messages"][0].content)
         self.assertEqual(
             accepted_payload["canonical_sources"][0]["url"],
-            "https://example.com/S1",
+            "https://source1.example/S1",
         )
 
         ledger_payload = json.loads(
@@ -400,13 +427,24 @@ class ResearchPlanTests(unittest.TestCase):
             plan_id_factory=lambda: "plan-one",
         )
         plan, active = select_next_subquestion(plan)
-        search_state = {"calls": 1, "successful": 0}
+        search_state = {"calls": 1, "nonempty": 1, "relevant": 1}
 
         def snapshot() -> dict[str, Any]:
             value = ledger.snapshot()
             value["min_successful_sources"] = 2
             value["search_calls"] = search_state["calls"]
-            value["successful_searches"] = search_state["successful"]
+            value["nonempty_searches"] = search_state["nonempty"]
+            value["successful_searches"] = search_state["nonempty"]
+            value["relevant_searches"] = search_state["relevant"]
+            value["subquestion_usage"]["SQ1"]["nonempty_searches"] = search_state[
+                "nonempty"
+            ]
+            value["subquestion_usage"]["SQ1"]["successful_searches"] = search_state[
+                "nonempty"
+            ]
+            value["subquestion_usage"]["SQ1"]["relevant_searches"] = search_state[
+                "relevant"
+            ]
             return value
 
         update_tool = build_research_state_tools(snapshot)[1]
@@ -446,6 +484,7 @@ class ResearchPlanTests(unittest.TestCase):
             "Blocked status is premature", json.loads(premature_block)["error"]
         )
         second = ledger.add_source("SQ1")
+        search_state["relevant"] = 0
         missing_search = update_tool.func(
             subquestion_id="SQ1",
             status="covered",
@@ -454,10 +493,10 @@ class ResearchPlanTests(unittest.TestCase):
             runtime=runtime,
         )
         self.assertIn(
-            "requires at least 1 successful web searches",
+            "requires at least one relevant web_search",
             json.loads(missing_search)["error"],
         )
-        search_state["successful"] = 1
+        search_state["relevant"] = 1
         accepted = update_tool.func(
             subquestion_id="SQ1",
             status="covered",

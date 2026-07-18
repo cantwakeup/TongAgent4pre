@@ -18,7 +18,7 @@
   -> canonical 来源账本 [S1] [S2] ...
   -> 模型提交 claim + exact quote；代码对规范化网页正文做严格子串校验
   -> Claim [C#] -> Evidence [E#] -> Source [S#]；相反 stance 形成 Conflict [X#]
-  -> schema v1 Claim 闭包、`successful_searches`、revision 独立来源和 multi 委派硬门槛
+  -> schema v1 Claim 闭包、逐 SQ `relevant_searches`、保守佐证来源组和 multi 委派硬门槛
   -> write_file 写入严格四节的 [C#][S#] 报告
   -> 图完整性、逐行 Claim/来源映射和 deterministic Sources 验收
   -> run-scoped report/evidence/plan/events/control/trace/sources/run + SQLite checkpoint
@@ -102,7 +102,7 @@ low 自动升到 medium，也不会超过该档的 `max_searches/max_fetches`：
 | `adaptive` | 每个 SQ 先获得 `1 search / 1 fetch` | effort 总上限减去 baseline | 根据证据缺口继续、释放 reserve、停止或结束 |
 
 adaptive 控制器只读取结构化状态，不再调用一个模型来决定策略。它会综合
-Claim、独立来源、成功搜索、Evidence 完整性、当前周期的新证据、工具失败和
+Claim、保守佐证来源组、相关搜索、Evidence 完整性、当前周期的新证据、工具失败和
 剩余额度，记录 `continue`、`expand_budget`、`stop_subquestion`、
 `finish_success`、`finish_partial` 或 `fail_closed`。每次
 `expand_budget` 最多为当前 SQ 释放一个搜索和一个抓取额度；实际增量取决于
@@ -134,8 +134,9 @@ effect 之后、controller checkpoint 之前，同进程 replay 会返回首次�
   "这是 Stage 03D 的窄范围机制验收，只建立两个原子子问题。SQ1 核验北京通用人工智能研究院官网 about 页所述机构性质；SQ2 核验 https://www.bigai.ai/tongprogram-2026/ 公开的通计划联系邮箱。每个 SQ 必须委派 researcher、至少搜索一次、抓取对应官网页并登记 exact quote；若 baseline 不足，让外层 adaptive controller 根据证据缺口释放 reserve。不得研究论文、项目或产业合作，也不得把其他含“通用”的机构混入。"
 ```
 
-最终 release smoke 已以 `low/single/adaptive` 对两个 Python 官方页面跑通：
-`validation=passed`、`coverage=1.0`、2 个来源、2 个 Claim、2 个 Evidence、
+03D 历史 release smoke 曾以 `low/single/adaptive` 对两个 Python 官方页面跑通：
+`validation=passed`、`structural_subquestion_coverage=1.0`、2 个来源、2 个
+Claim、2 个 Evidence、
 `escalation_count=1`，decision 序列为
 `continue -> expand_budget -> finish_success`。对应产物位于
 `output/runs/stage03d-release-final-20260717-a1-12314473/20260717T051353.769171Z-e343e56c/`。
@@ -191,7 +192,19 @@ checkpoint 不保存整页正文。正文只在抓取后的当前进程内规范
 
 每个 plan 创建后，代码会按 SQ 数量确定性切分搜索和抓取额度。例如 medium 的两个 SQ 各自保留 `2 search / 3 fetch`，SQ1 不能消费 SQ2 的份额；checkpoint 会同时恢复当前 SQ、各 SQ 上限和已经使用的次数。进入最终报告阶段后不再激活任何 SQ，因此网络工具不能继续消耗研究预算。
 
-搜索结果会携带 `engine` 与 `relevance_score`。当 DuckDuckGo 失败、为空，或相关结果少于两条时，代码自动查询 Bing，并在结果中记录 `status`、`engine_status`、`fallback_reason`、`search_quality` 和 `relevant_results`。只有至少一个 provider 正常返回的调用才增加 `successful_searches`；DuckDuckGo 与 Bing 都异常时返回 `status=error`，该尝试仍消耗搜索预算但不满足成功搜索门槛。相关性分数只用于发现明显噪声和触发备用引擎，不等于语义相关性证明。
+搜索结果会携带 `engine` 与代码计算的 `relevance_score`。当 DuckDuckGo 失败、
+为空，或相关结果少于两条时，代码自动查询 Bing。搜索指标严格拆为：
+
+- `provider_successes`：至少一个 provider 正常返回；
+- `nonempty_searches`：provider 成功且至少返回一个带 URL 的结果；
+- `relevant_searches`：至少一个结果的代码计算分数达到门槛，一次调用最多加一；
+- `evidence_producing_searches`：该调用发现的 URL 后来产生了新的有效 Evidence。
+
+旧字段 `successful_searches` 只是 `nonempty_searches` 的 deprecated alias。
+非空但全低相关的搜索不会帮助 SQ covered，也不会让 controller 提前完成；
+预算拒绝记为 `provider_outcome=not_called`。后端冗余自报的布尔值不能覆盖代码
+从 status、URL 和逐结果分数计算的 canonical 语义；不一致会写入 attempt。
+相关性分数仍只是轻量词法门槛，不等于语义相关性证明。
 
 ## 输出与验收
 
@@ -218,11 +231,34 @@ SQLite checkpoint 默认仍位于共享的 `output/checkpoints.sqlite`。每个 
 | `<run-dir>/run.json` | 输出目录、模型、拓扑、effort/strategy、thread、预算/attempt ledger、adaptive 摘要、委派角色、基础 token 用量、证据图计数和验收结果 |
 | `output/checkpoints.sqlite` | 可恢复的消息、计划、事件、预算、来源修订与 `C#/E#/X#`；不含整页正文 |
 
-抓取成功不等于合格证据：少于 300 个可见字符的页面标记为 `insufficient_content`；300–499 字符的短页只有在同一 host 已存在至少一条 500 字符以上的完整证据时，才以 `evidence_quality=limited` 入账；500 字符以上为 `full`。URL fragment 会被去重，403/404、超时和安全拒绝会作为失败来源记录。每个 canonical URL 保留全部 `content_revisions`；正文相同的不同 URL 会在最新来源快照中标记 `duplicate_of_source_id`。这个 latest duplicate alias 可随重抓正文变化而重算；历史 plan 的“独立来源”门槛不读取该易变字段，而是按该 plan 的 Evidence 边所绑定的 `source_content_sha256`（来源 revision）去重计算。
+抓取成功不等于合格证据：少于 300 个可见字符的页面标记为
+`insufficient_content`；300–499 字符的短页只有在同一 host 已存在至少一条
+500 字符以上的完整证据时，才以 `evidence_quality=limited` 入账；500 字符
+以上为 `full`。URL fragment 会被去重，403/404、超时和安全拒绝会作为失败来源
+记录。每个 canonical URL 保留全部 `content_revisions`，并记录 `fetched_at`、
+完整可见正文长度、已解码字节数、HTTP Content-Length/Encoding、是否截断及
+截断原因。`captured_content_sha256` 只哈希“实际返回的规范化可见文本”；
+`content_sha256_complete=false` 时绝不把它描述为完整页面版本 hash。
+
+来源多样性不再与正文 revision 混为一谈。产物分别记录
+`distinct_content_revisions`、`distinct_source_hosts` 和
+`corroborating_source_groups`。完成门槛只看支持性 Evidence：同一规范化
+hostname 的不同页面合并，不同 hostname 上完全相同的 captured content 也
+合并，反驳来源不能补足“两来源支持”。当前轻量实现只规范化 hostname（含移除
+`www.`），不推断 publisher 或注册域；无法安全解析 hostname 的来源不增加组数。
 
 研究角色可以通过 `get_source_ledger` 读取 canonical `[S#]`，并用 `get_evidence_graph` 读取 `C#/E#/X#`。single 模式由主 Agent 调用 `record_evidence`；multi 模式只把该工具交给 researcher，parent 只能读取证据图并更新 SQ，不能自行登记 Evidence。调用 `record_evidence(source_id, claim, quote, stance)` 时，`claim` 必须是 12–500 个规范化字符的完整命题，`quote` 必须是 12–800 个字符且严格存在于当前进程缓存的规范化网页正文中；新建 Claim 时省略 `claim_id`，代码分配编号。代码保存 quote/hash 和来源修订 hash，但 `supports` 或 `contradicts` 是模型对边的标注，不是自动事实证明。同一 Claim 同时出现支持与反驳 Evidence 时，代码建立一个 `unresolved` 的 `[X#]`，但不自动裁决哪一方正确。
 
-schema v1 还执行四组运行时硬门槛：使整个 plan 完成的 covered 更新必须满足计划所需 `successful_searches` 和 effort 的独立来源数，失败但已消耗预算的搜索尝试不计入成功搜索门槛；multi 模式每个 SQ 的有效委派必须位于当前 `research-step-*` 之后，是 description 以正确 `[SQ:<active-id>]` 开头的 `task(subagent_type="researcher")`，并已收到与 tool-call ID 匹配的成功 `ToolMessage`，未返回、失败、错误 SQ 或旧步骤调用均不算；任一 active SQ 尝试 blocked 时，只要搜索或独立来源 policy gap 仍可恢复且该 SQ 对应的已授予额度或 adaptive reserve 尚可补足，就拒绝 premature blocked；CLI 会重新计算整个 Claim-Evidence-Source/Conflict 闭包。
+schema v1 还执行四组运行时硬门槛：每个 covered SQ 必须在自己的预算 scope 内
+至少有一次相关搜索，其他 SQ 的 surplus 不能串账；完成整个 plan 还必须满足
+effort 所需的保守佐证来源组。multi 模式每个 SQ 的有效委派必须位于当前
+`research-step-*` 之后，是 description 以正确 `[SQ:<active-id>]` 开头的
+`task(subagent_type="researcher")`，并已收到与 tool-call ID 匹配的成功
+`ToolMessage`；未返回、失败、错误 SQ 或旧步骤调用均不算。任一 active SQ
+尝试 blocked 时，只要相关搜索或佐证组 policy gap 仍可恢复且对应已授予额度或
+adaptive reserve 尚可补足，就拒绝 premature blocked。checkpoint 恢复还会
+核对 semantic counters 与有序 attempt ledger；缺少可证明指标的旧快照输出
+`null/unavailable`，不会把旧 nonempty 计数升级为 relevant。
 
 high/xhigh multi 的 reviewer 门槛也要求“成功发生在最终
 `write_file` 之前”：只有 report phase 中 tool-call ID 匹配且
@@ -248,7 +284,7 @@ Sources；该节每个非空行都必须精确为
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-当前 116 项全量离线测试全部通过。除原有拓扑、搜索、Evidence Graph、checkpoint
+当前 144 项全量离线测试全部通过。除原有拓扑、搜索、Evidence Graph、checkpoint
 和严格报告协议外，03D 覆盖了纯函数控制决策、完整性失败 fail-closed、baseline
 与 reserve、单调且幂等的硬上限 grant、attempt 分类、policy drift 拒绝、控制器
 节点前恢复只应用一次 grant、grant/checkpoint crash-window 原跃迁 replay、逐步
@@ -257,7 +293,13 @@ scope 恢复、首个 decision 前的合法恢复、独立 synthesis agent、cav
 reviewer 必须成功且早于最终写入、trace status/phase，以及不同 thread/run 的
 输出目录隔离。
 
-`run.json.api_usage` 汇总当前 plan checkpoint 中 AI 消息的 provider-reported input/output/cache-read token。结构化 planner 调用尚未进入消息状态，multi 模式的嵌套 subagent 用量也可能不进入外层消息；供应商没有返回账单或价目表，所以当前明确记录 `planner_call_included=false` 和 `estimated_cost_usd=null`，不会用猜测价格冒充真实费用。
+`run.json.api_usage` 汇总当前 plan checkpoint 中 AI 消息的
+provider-reported input/output/cache-read token。缺少 telemetry 时字段为
+`null` 且 `usage_status=unavailable`；只有部分消息或字段可用时标记 `partial`，
+不会补成 0。结构化 planner 调用尚未进入消息状态，multi 模式的嵌套 subagent
+用量也可能不进入外层消息；供应商没有返回账单或价目表，所以当前明确记录
+`planner_call_included=false` 和 `estimated_cost_usd=null`，不会用猜测价格
+冒充真实费用。
 
 ## 安全边界
 
@@ -270,8 +312,13 @@ checkpoint。如果进程在内层网络工具执行中崩溃，外层尚未提�
 可能重跑整个内层节点和其中的网络调用；当前的 grant ID 幂等不能提供所有外部
 工具的 exactly-once 保证。
 
-coverage 也仍是 SQ 级 Claim-Evidence 闭包，不是问题 facets 的语义清单。一个
+`structural_subquestion_coverage` 是 SQ 级 Claim-Evidence-Source 闭包比例；
+只有当前 ledger 审计确认 Claim 属于该 SQ、存在实际 supporting Evidence、
+来源边一致且该 SQ 有相关搜索时，`structural_closure_validated` 才会置为 true
+并计入该指标。恢复 checkpoint 时会重新审计，不信任持久化标志。它不是问题
+facets 的语义清单；旧 `coverage` 字段只是 deprecated alias。它不代表答案
+准确率、语义覆盖率、完整性或 citation entailment。一个
 宽 SQ 中若同时要求“成立背景、团队、项目和进展”，代码尚未把每个字段拆成必须
-逐项满足的机器可读 facet；控制器只看 Claim、来源、成功搜索、失败类型和预算
-缺口。因此应继续把验收问题写成原子 SQ，宽问题即使结构 coverage 达标也仍需
+逐项满足的机器可读 facet；控制器只看 Claim、佐证来源组、相关搜索、失败类型和预算
+缺口。因此应继续把验收问题写成原子 SQ，宽问题即使该结构指标达标也仍需
 人工或后续 semantic-facet validator 检查内容完整性。

@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from evidence_graph import (
-    independent_evidence_source_ids,
+    source_diversity_metrics,
     validate_evidence_graph,
 )
 from research_state import (
@@ -103,19 +103,21 @@ def build_control_assessment(
         and item.get("status") in {"supported", "contested"}
     ]
     source_ids, claim_ids = _plan_evidence_ids(plan)
-    independent_ids = independent_evidence_source_ids(
+    diversity = source_diversity_metrics(
         source_ids=source_ids,
         sources=budget.get("successful_sources", []),
         evidence_units=budget.get("evidence_units", []),
         claim_ids=claim_ids,
     )
+    corroborating_count = int(diversity["corroborating_source_group_count"])
     minimum_sources = int(budget.get("min_successful_sources", 0))
-    required_searches = min(
-        int(budget.get("max_searches", 0)),
-        max(1, len(plan.get("subquestions", []))),
+    raw_relevant_searches = budget.get("relevant_searches")
+    relevant_searches = (
+        int(raw_relevant_searches) if raw_relevant_searches is not None else None
     )
-    successful_searches = int(
-        budget.get("successful_searches", budget.get("search_calls", 0))
+    raw_scoped_relevant = usage.get("relevant_searches")
+    scoped_relevant_searches = (
+        int(raw_scoped_relevant) if raw_scoped_relevant is not None else None
     )
     current_attempt_ids = set(new_tool_attempt_ids)
     current_attempts = [
@@ -132,10 +134,10 @@ def build_control_assessment(
     elif target is not None and target.get("status") not in {"covered"}:
         if not eligible_claims:
             reason_codes.append("claim_gap")
-        if len(independent_ids) < minimum_sources:
-            reason_codes.append("independent_source_gap")
-        if successful_searches < required_searches:
-            reason_codes.append("successful_search_gap")
+        if corroborating_count < minimum_sources:
+            reason_codes.append("corroborating_source_gap")
+        if (scoped_relevant_searches or 0) < 1:
+            reason_codes.append("relevant_search_gap")
     if new_conflict_ids:
         reason_codes.append("new_conflict")
     if any(
@@ -183,6 +185,32 @@ def build_control_assessment(
         "reserve_searches": reserve_searches,
         "reserve_fetches": reserve_fetches,
         "no_progress_streak": no_progress_streak,
+        "provider_successes": budget.get("provider_successes"),
+        "nonempty_searches": budget.get("nonempty_searches"),
+        "relevant_searches": relevant_searches,
+        "current_subquestion_relevant_searches": scoped_relevant_searches,
+        "evidence_producing_searches": budget.get("evidence_producing_searches"),
+        "search_metric_availability": dict(
+            budget.get("search_metric_availability", {})
+        ),
+        "distinct_content_revision_count": int(
+            diversity["distinct_content_revision_count"]
+        ),
+        "distinct_source_host_count": int(diversity["distinct_source_host_count"]),
+        "corroborating_source_group_count": corroborating_count,
+        "current_search_attempts": [
+            {
+                "attempt_id": item.get("attempt_id"),
+                "provider_outcome": item.get("provider_outcome"),
+                "nonempty_search": item.get("nonempty_search"),
+                "relevant_search": item.get("relevant_search"),
+                "evidence_producing_search": item.get("evidence_producing_search"),
+                "outcome": item.get("outcome"),
+                "failure_class": item.get("failure_class"),
+            }
+            for item in current_attempts
+            if item.get("tool") == "web_search"
+        ],
         "reason_codes": list(dict.fromkeys(reason_codes)),
         "integrity_errors": integrity_errors,
     }
@@ -234,13 +262,13 @@ def decide_control_action(
     remaining_fetches = int(assessment.get("remaining_fetches", 0))
     search_retry_needed = "search_retry_needed" in reasons
     fetch_retry_needed = "fetch_retry_needed" in reasons
-    needs_search = "successful_search_gap" in reasons or (
+    needs_search = "relevant_search_gap" in reasons or (
         "provider_failure" in reasons
         and not search_retry_needed
         and not fetch_retry_needed
     )
     needs_evidence = any(
-        reason in reasons for reason in ("claim_gap", "independent_source_gap")
+        reason in reasons for reason in ("claim_gap", "corroborating_source_gap")
     )
     current_candidate_fetch_can_help = (
         "low_relevance_candidates" in reasons

@@ -43,6 +43,7 @@ class SubQuestion(TypedDict):
     evidence_source_ids: list[str]
     claim_ids: list[str]
     conflict_ids: list[str]
+    structural_closure_validated: bool
     note: str
 
 
@@ -55,7 +56,8 @@ class ResearchPlan(TypedDict):
     objective: str
     planner: str
     status: PlanStatus
-    coverage: float
+    structural_subquestion_coverage: float | None
+    coverage: float | None
     completion_criteria: list[str]
     subquestions: list[SubQuestion]
 
@@ -105,8 +107,13 @@ class BudgetState(TypedDict, total=False):
 
     effort: str
     search_calls: int
-    successful_searches: int
-    relevant_searches: int
+    search_metric_semantics_version: int
+    provider_successes: int | None
+    nonempty_searches: int | None
+    successful_searches: int | None
+    relevant_searches: int | None
+    evidence_producing_searches: int | None
+    search_metric_availability: dict[str, str]
     max_searches: int
     fetch_calls: int
     max_fetches: int
@@ -116,7 +123,7 @@ class BudgetState(TypedDict, total=False):
     next_source_sequence: int
     active_subquestion_id: str | None
     subquestion_limits: dict[str, dict[str, int]]
-    subquestion_usage: dict[str, dict[str, int]]
+    subquestion_usage: dict[str, dict[str, int | None]]
     strategy: ResearchStrategy
     granted_searches: int
     granted_fetches: int
@@ -145,6 +152,15 @@ class ToolAttempt(TypedDict, total=False):
     retryable: bool
     status: str
     error: str
+    provider_success: bool
+    provider_outcome: Literal["success", "failure", "not_called"]
+    nonempty_search: bool
+    relevant_search: bool
+    evidence_producing_search: bool
+    provider_failure: bool
+    relevant_results: int
+    result_urls: list[str]
+    relevant_result_urls: list[str]
 
 
 class ControlAssessment(TypedDict, total=False):
@@ -163,6 +179,16 @@ class ControlAssessment(TypedDict, total=False):
     reserve_searches: int
     reserve_fetches: int
     no_progress_streak: int
+    provider_successes: int | None
+    nonempty_searches: int | None
+    relevant_searches: int | None
+    current_subquestion_relevant_searches: int | None
+    evidence_producing_searches: int | None
+    search_metric_availability: dict[str, str]
+    distinct_content_revision_count: int
+    distinct_source_host_count: int
+    corroborating_source_group_count: int
+    current_search_attempts: list[dict[str, Any]]
     reason_codes: list[str]
     integrity_errors: list[str]
 

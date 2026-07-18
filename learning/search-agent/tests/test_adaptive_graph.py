@@ -47,12 +47,18 @@ def _adaptive_fake_agent(
             return {"messages": [AIMessage(content="report ready", id="fake-report")]}
         active = str(state["active_subquestion_id"])
         if budget.reserve_search():
-            budget.record_search_success()
+            result_url = f"https://source{budget.search_calls}.example/fact"
             budget.record_tool_attempt(
                 tool_name="web_search",
                 target=f"adaptive query {budget.search_calls}",
                 payload={
                     "status": "success",
+                    "results": [
+                        {
+                            "url": result_url,
+                            "relevance_score": 100,
+                        }
+                    ],
                     "relevant_results": 1,
                     "search_quality": "relevant",
                 },

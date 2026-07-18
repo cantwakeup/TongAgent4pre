@@ -473,6 +473,20 @@ class AdaptiveBudgetTests(unittest.TestCase):
         original.configure_subquestions(["SQ1"])
         original.activate_subquestion("SQ1")
         self.assertTrue(original.reserve_search())
+        original.record_tool_attempt(
+            tool_name="web_search",
+            target="checkpoint fixture",
+            payload={
+                "status": "success",
+                "results": [
+                    {
+                        "url": "https://checkpoint.test/page",
+                        "relevance_score": 100,
+                    }
+                ],
+                "relevant_results": 1,
+            },
+        )
         snapshot = original.snapshot()
 
         restored = ResearchBudget(EFFORT_POLICIES["low"], strategy="adaptive")

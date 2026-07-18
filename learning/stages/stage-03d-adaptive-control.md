@@ -1,8 +1,9 @@
 # Stage 03D：证据缺口驱动的有界 Adaptive Control
 
-日期：2026-07-17
+日期：2026-07-18
 
-状态：代码、116 项离线回归与最终 low/adaptive 联网 smoke 已完成
+状态：03D 原型已完成；Benchmark Ready Sprint 阶段 A 指标语义加固后，
+144 项离线回归通过，未重新调用付费模型
 
 前一阶段：`stage-03c` exact quote、Evidence Graph 与严格报告映射
 
@@ -10,7 +11,7 @@
 
 TongAgent 在保留 03C provenance 硬门槛的基础上，新增了一个不调用模型的
 deterministic controller：`--strategy adaptive` 先给每个 SQ 一个最小
-`1 search / 1 fetch` baseline，再根据 Claim、独立来源、成功搜索、工具失败和
+`1 search / 1 fetch` baseline，再根据 Claim、保守佐证来源组、相关搜索、工具失败和
 Evidence 完整性缺口，有界、幂等地释放用户所选 effort 内的 reserve，并把每次
 “继续、扩容、停止或结束”的原因写入 checkpoint 和审计产物。
 
@@ -41,8 +42,8 @@ Stage 03C 已能诚实拒绝缺少来源、Claim 闭包或 researcher 回执的�
 | exact quote 严格正文子串 | adaptive 只给额度，不放松 quote 或 Claim 规则 |
 | `C#/E#/S#/X#` 图与 revision hash | 完整性错误优先 `fail_closed` |
 | multi parent 只读 Evidence | 新证据仍只能由 researcher 登记 |
-| 调用尝试与成功搜索分离 | attempt ledger 进一步统一 search/fetch 的失败语义 |
-| revision 级独立来源 | `independent_source_gap` 沿用 Evidence 所绑定 revision 计算 |
+| 调用、provider、非空、相关与产证据分离 | attempt ledger 统一 search/fetch 的失败语义 |
+| 来源与 revision 分离 | 分别记录正文 revision、hostname 与保守佐证来源组 |
 | 当前 step、正确 SQ、成功 researcher 回执 | controller 不能绕过委派门槛 |
 | 四个 H2、exact claim.text、deterministic Sources | adaptive 不改变报告协议 |
 | 外层 checkpoint | control state、grant 和 attempts 一起恢复 |
@@ -129,7 +130,7 @@ evaluate                             |
 
 effort 的全局上限保持不变：
 
-| effort | `max_searches` | `max_fetches` | 最少独立成功来源 | 最多 SQ |
+| effort | `max_searches` | `max_fetches` | 最少佐证来源组 | 最多 SQ |
 | --- | ---: | ---: | ---: | ---: |
 | low | 2 | 3 | 2 | 1 |
 | medium | 4 | 6 | 2 | 2 |
@@ -184,14 +185,20 @@ attempt_id / sequence / subquestion_id
 tool / target
 outcome / failure_class / retryable
 status / error
+provider_outcome / nonempty_search / relevant_search
+evidence_producing_search
 ```
 
 - `target` 对 search 是 query，对 fetch 是 URL。
 - 成功、低相关、内容不足、provider/network/http 错误和预算拒绝都会登记。
 - `A#` 单调递增；checkpoint 恢复后从已见最大 sequence 继续。
 - 新 plan 会清空 plan-local attempts 并从 `A1` 重新开始。
-- attempt 不等于成功搜索；只有 provider 正常且至少有一个相关结果时，
-  `successful_searches` 才增加。
+- `provider_successes`、`nonempty_searches`、`relevant_searches` 和
+  `evidence_producing_searches` 是四个不同指标。旧字段
+  `successful_searches` 仅保留为 `nonempty_searches` 的 deprecated alias。
+- 一次搜索即使返回多个相关结果，也只增加一次 `relevant_searches`；非空但
+  全部低相关的结果不会帮助 SQ 完成。预算拒绝记为
+  `provider_outcome=not_called`，不是 provider failure。
 
 当前分类：
 
@@ -230,8 +237,8 @@ Evidence Graph integrity errors
 主要 reason codes 包括：
 
 - `claim_gap`
-- `independent_source_gap`
-- `successful_search_gap`
+- `corroborating_source_gap`
+- `relevant_search_gap`
 - `new_conflict`
 - `provider_failure`
 - `no_progress`
@@ -256,15 +263,15 @@ controller 的高层优先级是：
 research cycle 的总上限为：
 
 ```text
-max_subquestions * (2 + effective_max_escalations)
+max_subquestions * (2 + 2 * effective_max_escalations)
 ```
 
 ### grant 粒度
 
 一次 `expand_budget` 最多给当前 SQ：
 
-- 搜索或来源缺口：`+1 search`
-- Claim/独立来源缺口：同时最多 `+1 fetch`
+- 相关搜索或来源缺口：`+1 search`
+- Claim/佐证来源组缺口：同时最多 `+1 fetch`
 
 实际增量还受 reserve 限制。controller 会保存完整的
 `budget_before/budget_after`，并核对：
@@ -431,15 +438,20 @@ ruff format --check \
 当前验证结果：
 
 ```text
-Ran 116 tests
+Ran 144 tests
 OK
 ```
 
-116 项包括此前 03C 回归，并新增或强化：
+144 项包括此前 03C/03D 回归，并新增或强化：
 
 - fixed/adaptive baseline 语义；
 - reserve 的单调、幂等和 effort 硬上限；
 - success、低相关、内容、network/provider/http、安全和预算分类；
+- provider/nonempty/relevant/evidence-producing 的原子计数与后端自报防污染；
+- attempt ledger 与 checkpoint counters 的一致性及旧指标 unavailable；
+- hostname/content revision/支持性佐证组的保守分组；
+- 字符/字节/gzip 截断、Content-Length 与 captured hash scope；
+- ledger 复核的 structural closure、coverage alias 与 legacy source-only null 语义；
 - 完整性错误优先 fail-closed；
 - Claim/来源/搜索缺口驱动的 continue/expand/stop；
 - escalation/cycle/no-progress ceiling；
@@ -483,10 +495,13 @@ output/runs/stage03d-release-final-20260717-a1-12314473/
 
 验收结果：
 
-- `validation.status=passed`，`coverage=1.0`。
+- `validation.status=passed`，`structural_subquestion_coverage=1.0`
+  （旧 `coverage` 为 deprecated alias）。
 - `strategy=adaptive`、`effort=low`、`topology=single`。
-- `search_calls=1/2`、`successful_searches=1`、`fetch_calls=2/3`。
-- 2 个独立官方来源、2 个 supported Claim、2 个 Evidence、0 个完整性错误。
+- `search_calls=1/2`、历史字段 `successful_searches=1`（现明确为 nonempty
+  alias）、`fetch_calls=2/3`。
+- 2 个不同 hostname 且正文不重复的支持来源组、2 个 supported Claim、
+  2 个 Evidence、0 个完整性错误。
 - decision 序列为 `continue -> expand_budget -> finish_success`；
   `escalation_count=1`，grant ID 与逐步预算跃迁一致。
 - 最终报告只有四个 H2，`Conflicts and Caveats` 为空，没有自由 caveat；当前代码
@@ -496,7 +511,8 @@ output/runs/stage03d-release-final-20260717-a1-12314473/
 
 此前的 medium/adaptive 两 SQ smoke 也曾以 `escalation_count=0`、
 `stop_reason=plan_completed` 通过，证明 baseline 足够时不会为“看起来更努力”而
-强制扩容。最终 release 结论以本节 low smoke 和 116 项当前回归为准。
+强制扩容。该联网结果是 03D 当时的历史 smoke，不是正式 benchmark；本轮
+benchmark-readiness 结论以最新离线回归和重新生成的标准评测记录为准。
 
 ## 14. 已知限制
 
@@ -517,9 +533,13 @@ checkpoint 仍只属于外层图；内层 Deep Agent 使用 `checkpointer=False`
 因此，03D 已验证的是“controller 节点前恢复不重复 grant”，不是任意崩溃点的
 端到端无重复副作用。
 
-### 14.2 coverage 没有 semantic facets
+### 14.2 structural subquestion coverage 没有 semantic facets
 
-coverage 仍按 SQ 是否形成合法 Claim-Evidence-Source 闭包计算。代码目前没有把
+`structural_subquestion_coverage` 按 SQ 是否形成合法
+Claim-Evidence-Source 闭包计算；只有当前 ledger 重新核验过的
+`structural_closure_validated=true` SQ 才计数，伪造 C#/S# 或缺少逐 SQ
+相关搜索都不能产生 coverage，checkpoint 恢复时也会重新审计。旧 `coverage`
+仅是 deprecated alias。代码目前没有把
 “核心团队、论文、项目、开源、合作、目标、参与方式、公开进展”等宽问题字段
 展开成必须逐项满足的机器可读 facet。
 
@@ -530,9 +550,10 @@ coverage 仍按 SQ 是否形成合法 Claim-Evidence-Source 闭包计算。代�
 - controller 会看到 `claim_gap/source_gap/search_gap`，却看不到未建模的 facet；
 - `supports/contradicts` 仍由模型标注，exact quote 不等于语义蕴含证明。
 
-当前缓解方式是把真实验收提示拆成原子 SQ，并把宽范围 coverage 视为结构指标而
-不是语义完整性证明。后续可加入显式 facet schema、Claim-to-facet 映射和独立
-semantic reviewer。
+当前缓解方式是把真实验收提示拆成原子 SQ。该指标不能代表答案准确率、语义
+覆盖率、完整性或 citation entailment；宽问题即使达到 1.0 仍需外部 benchmark
+或 judge。旧 source-only schema 无法证明 Claim 闭包时输出 `null/unavailable`。
+后续可加入显式 facet schema、Claim-to-facet 映射和独立 semantic reviewer。
 
 ### 14.3 其他边界
 

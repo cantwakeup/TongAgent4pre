@@ -58,8 +58,9 @@ from evidence_graph import (
     EVIDENCE_GRAPH_VERSION,
     EvidenceGraphStore,
     allowed_report_caveat_lines,
-    independent_evidence_source_ids,
+    corroborating_evidence_source_ids,
     report_claim_mapping_errors,
+    source_diversity_metrics,
     text_sha256,
     validate_evidence_graph,
 )
@@ -150,7 +151,7 @@ class _DuckDuckGoResultParser(HTMLParser):
     def _result_url(href: str) -> str:
         absolute = "https:" + href if href.startswith("//") else href
         parsed = urlparse(absolute)
-        if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+        if parsed.hostname and _host_matches_domain(parsed.hostname, "duckduckgo.com"):
             redirected = parse_qs(parsed.query).get("uddg")
             if redirected:
                 return unquote(redirected[0])
@@ -198,6 +199,17 @@ def _normalized_host(url: str) -> str:
     return hostname.removeprefix("www.")
 
 
+def _host_matches_domain(host: str, domain: str) -> bool:
+    """Match a hostname to a domain on a DNS-label boundary."""
+    normalized_host = host.casefold().rstrip(".").removeprefix("www.")
+    normalized_domain = domain.casefold().rstrip(".").removeprefix("www.")
+    if not normalized_host or not normalized_domain:
+        return False
+    return normalized_host == normalized_domain or normalized_host.endswith(
+        f".{normalized_domain}"
+    )
+
+
 def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
     """Score lexical query/result overlap without trusting search-engine rank."""
     haystack = " ".join(
@@ -208,8 +220,8 @@ def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
     for domain in re.findall(r"\bsite:([^\s]+)", query, flags=re.IGNORECASE):
         # Search operators sometimes include a path; host matching must not.
         domain_host = domain.split("/", 1)[0].rstrip(".")
-        if _normalized_host(str(result.get("url", ""))).endswith(
-            domain_host.casefold().removeprefix("www.")
+        if _host_matches_domain(
+            _normalized_host(str(result.get("url", ""))), domain_host
         ):
             score += 100
 
@@ -220,12 +232,16 @@ def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
     ]
     score += 50 * sum(item in haystack for item in quoted)
 
+    query_without_site = re.sub(r"\bsite:[^\s]+", " ", query, flags=re.IGNORECASE)
     ascii_terms = {
         item.casefold()
-        for item in re.findall(r"[A-Za-z][A-Za-z0-9._-]{2,}", query)
+        for item in re.findall(r"[A-Za-z][A-Za-z0-9._-]{2,}", query_without_site)
         if item.casefold() not in {"site", "http", "https", "www"}
     }
-    score += 20 * sum(item in haystack for item in ascii_terms)
+    haystack_terms = {
+        item.casefold() for item in re.findall(r"[A-Za-z][A-Za-z0-9._-]{2,}", haystack)
+    }
+    score += 20 * len(ascii_terms.intersection(haystack_terms))
 
     query_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query))
     result_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", haystack))
@@ -383,6 +399,9 @@ def web_search(query: str, max_results: int = 5) -> str:
             for item in results
         )
         search_status = "success" if "success" in engine_status.values() else "error"
+        provider_success = search_status == "success"
+        nonempty_search = bool(results)
+        relevant_search = relevant_results > 0
     return json.dumps(
         {
             "status": search_status,
@@ -397,6 +416,10 @@ def web_search(query: str, max_results: int = 5) -> str:
             "fallback_reason": fallback_reason or None,
             "search_quality": "relevant" if relevant_results else "low_relevance",
             "relevant_results": relevant_results,
+            "provider_success": provider_success,
+            "nonempty_search": nonempty_search,
+            "relevant_search": relevant_search,
+            "provider_failure": not provider_success,
             **(
                 {"error": "all_search_engines_failed"}
                 if search_status == "error"
@@ -447,14 +470,44 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                         "error": f"Unsupported content type: {content_type or 'unknown'}",
                     }
 
+                raw_content_length = response.headers.get("content-length")
+                content_encoding = (
+                    response.headers.get("content-encoding", "").strip().casefold()
+                )
+                try:
+                    parsed_content_length = (
+                        int(raw_content_length)
+                        if raw_content_length is not None
+                        else None
+                    )
+                    http_content_length = (
+                        parsed_content_length
+                        if parsed_content_length is not None
+                        and parsed_content_length >= 0
+                        else None
+                    )
+                except ValueError:
+                    http_content_length = None
                 chunks: list[bytes] = []
                 downloaded = 0
+                download_truncated = False
                 for chunk in response.iter_bytes():
                     remaining = MAX_DOWNLOAD_BYTES - downloaded
                     if remaining <= 0:
+                        download_truncated = True
                         break
-                    chunks.append(chunk[:remaining])
-                    downloaded += min(len(chunk), remaining)
+                    captured = chunk[:remaining]
+                    chunks.append(captured)
+                    downloaded += len(captured)
+                    if len(chunk) > remaining:
+                        download_truncated = True
+                        break
+                if (
+                    http_content_length is not None
+                    and content_encoding in {"", "identity"}
+                    and http_content_length > downloaded
+                ):
+                    download_truncated = True
                 encoding = response.encoding or "utf-8"
                 body = b"".join(chunks).decode(encoding, errors="replace")
 
@@ -469,13 +522,31 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
             normalized = "\n".join(
                 line.strip() for line in text.splitlines() if line.strip()
             )
+            observed_content_length = len(normalized)
+            content_length = None if download_truncated else observed_content_length
+            char_truncated = observed_content_length > char_limit
             content = normalized[:char_limit]
+            truncation_reasons = []
+            if download_truncated:
+                truncation_reasons.append("download_byte_limit")
+            if char_truncated:
+                truncation_reasons.append("returned_character_limit")
             return {
                 "status": "success",
                 "url": current_url,
                 "title": title,
                 "content": content,
                 "content_chars": len(content),
+                "content_length": content_length,
+                "content_length_scope": "normalized_visible_text_from_downloaded_bytes",
+                "observed_content_length": observed_content_length,
+                "downloaded_bytes": downloaded,
+                "downloaded_bytes_scope": "httpx_decoded_response_bytes",
+                "http_content_length": http_content_length,
+                "http_content_encoding": content_encoding or None,
+                "fetched_at": datetime.now(UTC).isoformat(),
+                "truncated": bool(truncation_reasons),
+                "truncation_reasons": truncation_reasons,
             }
 
     return {"status": "error", "url": url, "error": "Could not fetch page"}
@@ -515,15 +586,18 @@ class ResearchBudget:
     policy: EffortPolicy
     strategy: ResearchStrategy = "fixed"
     search_calls: int = 0
-    successful_searches: int = 0
-    relevant_searches: int = 0
+    provider_successes: int | None = 0
+    nonempty_searches: int | None = 0
+    successful_searches: int | None = 0
+    relevant_searches: int | None = 0
+    evidence_producing_searches: int | None = 0
     fetch_calls: int = 0
     sources: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
     next_source_sequence: int = 1
     active_subquestion_id: str | None = None
     subquestion_limits: dict[str, dict[str, int]] = field(default_factory=dict)
-    subquestion_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    subquestion_usage: dict[str, dict[str, int | None]] = field(default_factory=dict)
     applied_grant_ids: list[str] = field(default_factory=list)
     applied_grants: list[dict[str, Any]] = field(default_factory=list)
     tool_attempts: list[dict[str, Any]] = field(default_factory=list)
@@ -569,8 +643,11 @@ class ResearchBudget:
             self.subquestion_usage = {
                 subquestion_id: {
                     "search_calls": 0,
+                    "provider_successes": 0,
+                    "nonempty_searches": 0,
                     "successful_searches": 0,
                     "relevant_searches": 0,
+                    "evidence_producing_searches": 0,
                     "fetch_calls": 0,
                 }
                 for subquestion_id in unique_ids
@@ -750,19 +827,68 @@ class ResearchBudget:
             return True
 
     def record_search_success(self, *, relevant: bool = True) -> None:
-        """Record a result-bearing search and separately track lexical relevance."""
+        """Record one legacy result-bearing search observation.
+
+        New tool wrappers record all search semantics atomically in
+        `record_tool_attempt`.  This method remains for compatibility with
+        direct callers and treats the observation as provider-successful and
+        non-empty.
+        """
         with self._lock:
-            self.successful_searches += 1
-            if relevant:
+            sequence = self.next_tool_attempt_sequence
+            self.tool_attempts.append(
+                {
+                    "attempt_id": f"A{sequence}",
+                    "sequence": sequence,
+                    "subquestion_id": self.active_subquestion_id or "",
+                    "tool": "web_search",
+                    "target": "<legacy-direct-observation>",
+                    "outcome": "success" if relevant else "low_relevance",
+                    "failure_class": "none" if relevant else "content",
+                    "retryable": not relevant,
+                    "status": "success",
+                    "error": "",
+                    "provider_success": True,
+                    "provider_outcome": "success",
+                    "nonempty_search": True,
+                    "relevant_search": relevant,
+                    "evidence_producing_search": False,
+                    "provider_failure": False,
+                    "relevant_results": 1 if relevant else 0,
+                    "reported_relevant_results": None,
+                    "scored_result_count": 0,
+                    "result_urls": [],
+                    "relevant_result_urls": [],
+                    "semantic_mismatches": [],
+                    "legacy_direct_observation": True,
+                }
+            )
+            self.next_tool_attempt_sequence += 1
+            if self.provider_successes is not None:
+                self.provider_successes += 1
+            if self.nonempty_searches is not None:
+                self.nonempty_searches += 1
+            if self.successful_searches is not None:
+                self.successful_searches += 1
+            if relevant and self.relevant_searches is not None:
                 self.relevant_searches += 1
             if self.subquestion_limits and self.active_subquestion_id is not None:
                 usage = self.subquestion_usage[self.active_subquestion_id]
-                usage["successful_searches"] = (
-                    int(usage.get("successful_searches", 0)) + 1
-                )
-                if relevant:
+                if usage.get("provider_successes") is not None:
+                    usage["provider_successes"] = (
+                        int(usage.get("provider_successes", 0)) + 1
+                    )
+                if usage.get("nonempty_searches") is not None:
+                    usage["nonempty_searches"] = (
+                        int(usage.get("nonempty_searches") or 0) + 1
+                    )
+                if usage.get("successful_searches") is not None:
+                    usage["successful_searches"] = (
+                        int(usage.get("successful_searches") or 0) + 1
+                    )
+                if relevant and usage.get("relevant_searches") is not None:
                     usage["relevant_searches"] = (
-                        int(usage.get("relevant_searches", 0)) + 1
+                        int(usage.get("relevant_searches") or 0) + 1
                     )
 
     @staticmethod
@@ -812,10 +938,60 @@ class ResearchBudget:
     ) -> dict[str, Any]:
         """Append one structured, ordered attempt to the serializable ledger."""
         with self._lock:
-            outcome, failure_class, retryable = self._classify_attempt(
-                tool_name, payload
-            )
             sequence = self.next_tool_attempt_sequence
+            results = payload.get("results", [])
+            result_urls = (
+                [
+                    urlparse(str(item.get("url", "")))._replace(fragment="").geturl()
+                    for item in results
+                    if isinstance(item, dict) and item.get("url")
+                ]
+                if isinstance(results, list)
+                else []
+            )
+            scored_results = (
+                [
+                    item
+                    for item in results
+                    if isinstance(item, dict)
+                    and not isinstance(item.get("relevance_score"), bool)
+                    and isinstance(item.get("relevance_score"), (int, float))
+                ]
+                if isinstance(results, list)
+                else []
+            )
+            relevant_result_urls = (
+                [
+                    urlparse(str(item.get("url", "")))._replace(fragment="").geturl()
+                    for item in results
+                    if isinstance(item, dict)
+                    and item.get("url")
+                    and not isinstance(item.get("relevance_score"), bool)
+                    and isinstance(item.get("relevance_score"), (int, float))
+                    and float(item["relevance_score"]) >= MIN_SEARCH_RELEVANCE_SCORE
+                ]
+                if isinstance(results, list)
+                else []
+            )
+            provider_called = str(payload.get("status", "")) not in {
+                "budget_exceeded",
+                "rejected",
+            }
+            provider_success = provider_called and payload.get("status") == "success"
+            provider_outcome = (
+                "not_called"
+                if not provider_called
+                else ("success" if provider_success else "failure")
+            )
+            nonempty_search = provider_success and bool(result_urls)
+            relevant_search = provider_success and bool(relevant_result_urls)
+            canonical_payload = dict(payload)
+            if tool_name == "web_search":
+                canonical_payload["results"] = results
+                canonical_payload["relevant_results"] = len(relevant_result_urls)
+            outcome, failure_class, retryable = self._classify_attempt(
+                tool_name, canonical_payload
+            )
             attempt = {
                 "attempt_id": f"A{sequence}",
                 "sequence": sequence,
@@ -828,6 +1004,77 @@ class ResearchBudget:
                 "status": str(payload.get("status", "error")),
                 "error": str(payload.get("error", "")),
             }
+            if tool_name == "web_search":
+                attempt.update(
+                    {
+                        "provider_success": provider_success,
+                        "provider_outcome": provider_outcome,
+                        "nonempty_search": nonempty_search,
+                        "relevant_search": relevant_search,
+                        "evidence_producing_search": False,
+                        "provider_failure": provider_outcome == "failure",
+                        "relevant_results": len(relevant_result_urls),
+                        "reported_relevant_results": payload.get("relevant_results"),
+                        "scored_result_count": len(scored_results),
+                        "result_urls": list(dict.fromkeys(result_urls)),
+                        "relevant_result_urls": list(
+                            dict.fromkeys(relevant_result_urls)
+                        ),
+                        "semantic_mismatches": [
+                            field
+                            for field, reported, canonical in (
+                                (
+                                    "provider_success",
+                                    payload.get("provider_success"),
+                                    provider_success,
+                                ),
+                                (
+                                    "nonempty_search",
+                                    payload.get("nonempty_search"),
+                                    nonempty_search,
+                                ),
+                                (
+                                    "relevant_search",
+                                    payload.get("relevant_search"),
+                                    relevant_search,
+                                ),
+                                (
+                                    "relevant_results",
+                                    payload.get("relevant_results"),
+                                    len(relevant_result_urls),
+                                ),
+                            )
+                            if reported is not None and reported != canonical
+                        ],
+                    }
+                )
+                if provider_success and self.provider_successes is not None:
+                    self.provider_successes += 1
+                if nonempty_search and self.nonempty_searches is not None:
+                    self.nonempty_searches += 1
+                if nonempty_search and self.successful_searches is not None:
+                    # Compatibility: `successful_searches` means non-empty search.
+                    self.successful_searches += 1
+                if relevant_search and self.relevant_searches is not None:
+                    self.relevant_searches += 1
+                if self.subquestion_limits and self.active_subquestion_id is not None:
+                    usage = self.subquestion_usage[self.active_subquestion_id]
+                    if provider_success and usage.get("provider_successes") is not None:
+                        usage["provider_successes"] = (
+                            int(usage.get("provider_successes", 0)) + 1
+                        )
+                    if nonempty_search and usage.get("nonempty_searches") is not None:
+                        usage["nonempty_searches"] = (
+                            int(usage.get("nonempty_searches") or 0) + 1
+                        )
+                    if nonempty_search and usage.get("successful_searches") is not None:
+                        usage["successful_searches"] = (
+                            int(usage.get("successful_searches") or 0) + 1
+                        )
+                    if relevant_search and usage.get("relevant_searches") is not None:
+                        usage["relevant_searches"] = (
+                            int(usage.get("relevant_searches") or 0) + 1
+                        )
             self.tool_attempts.append(attempt)
             self.next_tool_attempt_sequence += 1
             return dict(attempt)
@@ -888,6 +1135,48 @@ class ResearchBudget:
             if content_hash and duplicate is None:
                 first_source_by_hash[content_hash] = str(source["source_id"])
 
+    def _matching_search_attempt_id(self, url: str) -> str | None:
+        """Return the latest search attempt that exposed `url`."""
+        canonical = urlparse(url)._replace(fragment="").geturl()
+        active = self.active_subquestion_id or ""
+        for attempt in reversed(self.tool_attempts):
+            if attempt.get("tool") != "web_search":
+                continue
+            if str(attempt.get("subquestion_id", "")) != active:
+                continue
+            if canonical in attempt.get("result_urls", []):
+                return str(attempt.get("attempt_id", "")) or None
+        return None
+
+    def _mark_evidence_producing_search(self, source: dict[str, Any]) -> None:
+        """Mark one search attempt when its result becomes Evidence."""
+        attempt_id = str(
+            source.get("latest_discovered_by_search_attempt_id")
+            or source.get("discovered_by_search_attempt_id")
+            or ""
+        )
+        if not attempt_id:
+            return
+        attempt = next(
+            (
+                item
+                for item in self.tool_attempts
+                if str(item.get("attempt_id", "")) == attempt_id
+            ),
+            None,
+        )
+        if attempt is None or attempt.get("evidence_producing_search"):
+            return
+        attempt["evidence_producing_search"] = True
+        if self.evidence_producing_searches is not None:
+            self.evidence_producing_searches += 1
+        subquestion_id = str(attempt.get("subquestion_id", ""))
+        usage = self.subquestion_usage.get(subquestion_id)
+        if usage is not None and usage.get("evidence_producing_searches") is not None:
+            usage["evidence_producing_searches"] = (
+                int(usage.get("evidence_producing_searches", 0)) + 1
+            )
+
     def record_fetch(self, payload: dict[str, Any]) -> str | None:
         """Record one fetch result and assign stable IDs to unique successful URLs."""
         with self._lock:
@@ -902,12 +1191,37 @@ class ResearchBudget:
                 return None
             raw_url = str(payload.get("url", ""))
             url = urlparse(raw_url)._replace(fragment="").geturl()
+            requested_url = (
+                urlparse(str(payload.get("requested_url", raw_url)))
+                ._replace(fragment="")
+                .geturl()
+            )
             content = str(payload.get("content", ""))
             content_hash = text_sha256(content)
+            discovered_by_search_attempt_id = self._matching_search_attempt_id(
+                requested_url
+            ) or self._matching_search_attempt_id(url)
+            truncated = payload.get("truncated")
             revision = {
                 "content_sha256": content_hash,
+                "captured_content_sha256": content_hash,
+                "content_sha256_scope": "returned_normalized_visible_text",
+                "content_sha256_complete": (
+                    not truncated if isinstance(truncated, bool) else None
+                ),
                 "title": payload.get("title", ""),
                 "content_chars": payload.get("content_chars", len(content)),
+                "content_length": payload.get("content_length"),
+                "observed_content_length": payload.get("observed_content_length"),
+                "content_length_scope": payload.get("content_length_scope"),
+                "downloaded_bytes": payload.get("downloaded_bytes"),
+                "downloaded_bytes_scope": payload.get("downloaded_bytes_scope"),
+                "http_content_length": payload.get("http_content_length"),
+                "http_content_encoding": payload.get("http_content_encoding"),
+                "fetched_at": payload.get("fetched_at"),
+                "truncated": truncated if isinstance(truncated, bool) else None,
+                "truncation_reasons": list(payload.get("truncation_reasons", [])),
+                "discovered_by_search_attempt_id": discovered_by_search_attempt_id,
                 "evidence_quality": payload.get("evidence_quality", "full"),
                 "quality_reason": payload.get("quality_reason", ""),
             }
@@ -956,6 +1270,32 @@ class ResearchBudget:
                 existing["latest_content_chars"] = revision["content_chars"]
                 existing["latest_evidence_quality"] = revision["evidence_quality"]
                 existing["latest_quality_reason"] = revision["quality_reason"]
+                existing["latest_fetched_at"] = revision["fetched_at"]
+                existing["latest_content_length"] = revision["content_length"]
+                existing["latest_observed_content_length"] = revision[
+                    "observed_content_length"
+                ]
+                existing["latest_downloaded_bytes"] = revision["downloaded_bytes"]
+                existing["latest_downloaded_bytes_scope"] = revision[
+                    "downloaded_bytes_scope"
+                ]
+                existing["latest_http_content_length"] = revision["http_content_length"]
+                existing["latest_http_content_encoding"] = revision[
+                    "http_content_encoding"
+                ]
+                existing["latest_truncated"] = revision["truncated"]
+                existing["latest_truncation_reasons"] = list(
+                    revision["truncation_reasons"]
+                )
+                existing["latest_content_sha256_scope"] = revision[
+                    "content_sha256_scope"
+                ]
+                existing["latest_content_sha256_complete"] = revision[
+                    "content_sha256_complete"
+                ]
+                existing["latest_discovered_by_search_attempt_id"] = (
+                    discovered_by_search_attempt_id
+                )
                 existing["content_changed"] = existing["content_sha256"] != content_hash
                 self._refresh_duplicate_sources()
                 self.evidence_graph.cache_page(
@@ -973,12 +1313,39 @@ class ResearchBudget:
                 "title": revision["title"],
                 "content_chars": revision["content_chars"],
                 "content_sha256": content_hash,
+                "captured_content_sha256": content_hash,
+                "content_sha256_scope": revision["content_sha256_scope"],
+                "content_sha256_complete": revision["content_sha256_complete"],
                 "latest_content_sha256": content_hash,
                 "content_revisions": [revision],
                 "latest_title": revision["title"],
                 "latest_content_chars": revision["content_chars"],
                 "latest_evidence_quality": revision["evidence_quality"],
                 "latest_quality_reason": revision["quality_reason"],
+                "fetched_at": revision["fetched_at"],
+                "latest_fetched_at": revision["fetched_at"],
+                "content_length": revision["content_length"],
+                "latest_content_length": revision["content_length"],
+                "observed_content_length": revision["observed_content_length"],
+                "latest_observed_content_length": revision["observed_content_length"],
+                "downloaded_bytes": revision["downloaded_bytes"],
+                "latest_downloaded_bytes": revision["downloaded_bytes"],
+                "downloaded_bytes_scope": revision["downloaded_bytes_scope"],
+                "latest_downloaded_bytes_scope": revision["downloaded_bytes_scope"],
+                "http_content_length": revision["http_content_length"],
+                "latest_http_content_length": revision["http_content_length"],
+                "http_content_encoding": revision["http_content_encoding"],
+                "latest_http_content_encoding": revision["http_content_encoding"],
+                "truncated": revision["truncated"],
+                "latest_truncated": revision["truncated"],
+                "truncation_reasons": list(revision["truncation_reasons"]),
+                "latest_truncation_reasons": list(revision["truncation_reasons"]),
+                "latest_content_sha256_scope": revision["content_sha256_scope"],
+                "latest_content_sha256_complete": revision["content_sha256_complete"],
+                "discovered_by_search_attempt_id": discovered_by_search_attempt_id,
+                "latest_discovered_by_search_attempt_id": (
+                    discovered_by_search_attempt_id
+                ),
                 "content_changed": False,
                 "duplicate_of_source_id": None,
                 "evidence_quality": revision["evidence_quality"],
@@ -1006,7 +1373,8 @@ class ResearchBudget:
             if source is None:
                 msg = f"Unknown canonical source ID: {source_id}"
                 raise ValueError(msg)
-            return self.evidence_graph.record(
+            evidence_count = len(self.evidence_graph.evidence_units)
+            result = self.evidence_graph.record(
                 source=source,
                 subquestion_id=self.active_subquestion_id,
                 claim=claim,
@@ -1014,18 +1382,50 @@ class ResearchBudget:
                 stance=stance,
                 claim_id=claim_id,
             )
+            if len(self.evidence_graph.evidence_units) > evidence_count:
+                self._mark_evidence_producing_search(source)
+            return result
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable run ledger without downloaded page bodies."""
         with self._lock:
             granted_searches, granted_fetches = self._granted_totals()
             reserve_searches, reserve_fetches = self._reserve_totals()
+            evidence_snapshot = self.evidence_graph.snapshot()
+            evidence_source_ids = {
+                str(item.get("source_id", ""))
+                for item in evidence_snapshot.get("evidence_units", [])
+                if item.get("source_id")
+            }
+            diversity = source_diversity_metrics(
+                source_ids=evidence_source_ids,
+                sources=self.sources,
+                evidence_units=evidence_snapshot.get("evidence_units", []),
+            )
+            metric_values = {
+                "provider_successes": self.provider_successes,
+                "nonempty_searches": self.nonempty_searches,
+                "successful_searches": self.successful_searches,
+                "relevant_searches": self.relevant_searches,
+                "evidence_producing_searches": self.evidence_producing_searches,
+            }
             return {
                 "effort": self.policy.name,
                 "strategy": self.strategy,
                 "search_calls": self.search_calls,
+                "search_metric_semantics_version": 1,
+                "search_metric_availability": {
+                    key: "available" if value is not None else "unavailable"
+                    for key, value in metric_values.items()
+                },
+                "provider_successes": self.provider_successes,
+                "nonempty_searches": self.nonempty_searches,
                 "successful_searches": self.successful_searches,
+                "successful_searches_semantics": (
+                    "deprecated compatibility alias for nonempty_searches"
+                ),
                 "relevant_searches": self.relevant_searches,
+                "evidence_producing_searches": self.evidence_producing_searches,
                 "max_searches": self.policy.max_searches,
                 "fetch_calls": self.fetch_calls,
                 "max_fetches": self.policy.max_fetches,
@@ -1048,10 +1448,242 @@ class ResearchBudget:
                 "applied_grants": deepcopy(self.applied_grants),
                 "next_tool_attempt_sequence": self.next_tool_attempt_sequence,
                 "tool_attempts": deepcopy(self.tool_attempts),
-                **self.evidence_graph.snapshot(),
+                "source_diversity": diversity,
+                **evidence_snapshot,
             }
 
-    def _validate_strict_budget_snapshot(self, snapshot: dict[str, Any]) -> None:
+    @staticmethod
+    def _search_attempt_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Derive auditable search counters from the ordered attempt ledger."""
+        integrity_errors: list[str] = []
+        completeness_errors: list[str] = []
+        raw_attempts = snapshot.get("tool_attempts")
+        if not isinstance(raw_attempts, list):
+            return {
+                "complete": False,
+                "evidence_complete": False,
+                "integrity_errors": ["tool attempts are not a list"],
+                "completeness_errors": [],
+            }
+        attempts = [item for item in raw_attempts if isinstance(item, dict)]
+        if len(attempts) != len(raw_attempts):
+            integrity_errors.append("tool attempts contain a non-mapping entry")
+        sequences = [item.get("sequence") for item in attempts]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in sequences
+        ):
+            integrity_errors.append("tool attempt sequences are invalid")
+        elif sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
+            integrity_errors.append("tool attempt sequences are not unique and ordered")
+        attempt_ids = [str(item.get("attempt_id", "")) for item in attempts]
+        if any(not item for item in attempt_ids) or len(attempt_ids) != len(
+            set(attempt_ids)
+        ):
+            integrity_errors.append("tool attempt IDs are not non-empty and unique")
+        if all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in sequences
+        ):
+            expected_ids = [f"A{value}" for value in sequences]
+            if attempt_ids != expected_ids:
+                integrity_errors.append("tool attempt IDs do not match their sequences")
+        max_sequence = max(
+            (
+                int(value)
+                for value in sequences
+                if isinstance(value, int) and not isinstance(value, bool)
+            ),
+            default=0,
+        )
+        raw_next = snapshot.get("next_tool_attempt_sequence", max_sequence + 1)
+        if (
+            isinstance(raw_next, bool)
+            or not isinstance(raw_next, int)
+            or raw_next <= max_sequence
+        ):
+            integrity_errors.append("next tool attempt sequence is not monotonic")
+
+        totals = {
+            "provider_successes": 0,
+            "nonempty_searches": 0,
+            "relevant_searches": 0,
+            "evidence_producing_searches": 0,
+            "search_calls": 0,
+        }
+        scoped: dict[str, dict[str, int]] = {}
+        evidence_complete = True
+        for attempt in attempts:
+            if attempt.get("tool") != "web_search":
+                continue
+            has_new_semantics = all(
+                key in attempt
+                for key in (
+                    "provider_outcome",
+                    "provider_success",
+                    "nonempty_search",
+                    "relevant_search",
+                )
+            )
+            if has_new_semantics:
+                provider_outcome = attempt.get("provider_outcome")
+                if provider_outcome not in {"success", "failure", "not_called"}:
+                    integrity_errors.append(
+                        "search attempt provider outcome is invalid"
+                    )
+                    continue
+                semantic_values = {
+                    key: attempt.get(key)
+                    for key in (
+                        "provider_success",
+                        "nonempty_search",
+                        "relevant_search",
+                    )
+                }
+                if any(
+                    not isinstance(value, bool) for value in semantic_values.values()
+                ):
+                    integrity_errors.append(
+                        "search attempt semantic flags are not boolean"
+                    )
+                    continue
+                provider_success = bool(semantic_values["provider_success"])
+                nonempty_search = bool(semantic_values["nonempty_search"])
+                relevant_search = bool(semantic_values["relevant_search"])
+                raw_evidence = attempt.get("evidence_producing_search")
+                if not isinstance(raw_evidence, bool):
+                    evidence_complete = False
+                    evidence_producing = False
+                else:
+                    evidence_producing = raw_evidence
+                status = str(attempt.get("status", "error"))
+                expected_provider_outcome = (
+                    "not_called"
+                    if status in {"budget_exceeded", "rejected"}
+                    else ("success" if status == "success" else "failure")
+                )
+                if provider_outcome != expected_provider_outcome:
+                    integrity_errors.append(
+                        "search attempt provider outcome disagrees with status"
+                    )
+                expected_provider = provider_outcome == "success"
+                if provider_success != expected_provider:
+                    integrity_errors.append(
+                        "search attempt provider success disagrees with outcome"
+                    )
+                if provider_outcome == "not_called" and (
+                    nonempty_search or relevant_search or evidence_producing
+                ):
+                    integrity_errors.append(
+                        "not-called search attempt claims a result or evidence"
+                    )
+                if relevant_search and (not nonempty_search or not provider_success):
+                    integrity_errors.append(
+                        "relevant search attempt is not provider-successful and non-empty"
+                    )
+                if nonempty_search and not provider_success:
+                    integrity_errors.append(
+                        "non-empty search attempt is not provider-successful"
+                    )
+                if evidence_producing and not nonempty_search:
+                    integrity_errors.append(
+                        "evidence-producing search attempt is not non-empty"
+                    )
+                if status == "success":
+                    expected_outcome = (
+                        "empty_results"
+                        if not nonempty_search
+                        else "success"
+                        if relevant_search
+                        else "low_relevance"
+                    )
+                    if attempt.get("outcome") != expected_outcome:
+                        integrity_errors.append(
+                            "search attempt outcome disagrees with canonical flags"
+                        )
+            else:
+                status = str(attempt.get("status", "error"))
+                outcome = str(attempt.get("outcome", ""))
+                provider_outcome = (
+                    "not_called"
+                    if status in {"budget_exceeded", "rejected"}
+                    else ("success" if status == "success" else "failure")
+                )
+                provider_success = provider_outcome == "success"
+                nonempty_search = provider_success and outcome in {
+                    "success",
+                    "low_relevance",
+                }
+                relevant_search = provider_success and outcome == "success"
+                evidence_producing = False
+                evidence_complete = False
+
+            called = provider_outcome != "not_called"
+            if called:
+                totals["search_calls"] += 1
+            if provider_success:
+                totals["provider_successes"] += 1
+            if nonempty_search:
+                totals["nonempty_searches"] += 1
+            if relevant_search:
+                totals["relevant_searches"] += 1
+            if evidence_producing:
+                totals["evidence_producing_searches"] += 1
+            subquestion_id = str(attempt.get("subquestion_id", ""))
+            if called and subquestion_id:
+                usage = scoped.setdefault(
+                    subquestion_id,
+                    {
+                        "search_calls": 0,
+                        "provider_successes": 0,
+                        "nonempty_searches": 0,
+                        "relevant_searches": 0,
+                        "evidence_producing_searches": 0,
+                    },
+                )
+                usage["search_calls"] += 1
+                usage["provider_successes"] += int(provider_success)
+                usage["nonempty_searches"] += int(nonempty_search)
+                usage["relevant_searches"] += int(relevant_search)
+                usage["evidence_producing_searches"] += int(evidence_producing)
+
+        raw_search_calls = snapshot.get("search_calls", 0)
+        if (
+            isinstance(raw_search_calls, bool)
+            or not isinstance(raw_search_calls, int)
+            or raw_search_calls < 0
+        ):
+            completeness_errors.append("search call counter is unavailable")
+        elif totals["search_calls"] != raw_search_calls:
+            completeness_errors.append(
+                "called search attempts do not match the search call counter"
+            )
+        raw_usage = snapshot.get("subquestion_usage", {})
+        if isinstance(raw_usage, dict) and raw_usage:
+            for subquestion_id, usage in raw_usage.items():
+                if not isinstance(usage, dict):
+                    continue
+                expected_calls = usage.get("search_calls", 0)
+                observed_calls = scoped.get(str(subquestion_id), {}).get(
+                    "search_calls", 0
+                )
+                if expected_calls != observed_calls:
+                    completeness_errors.append(
+                        "called search attempts do not match subquestion usage"
+                    )
+                    break
+        return {
+            **totals,
+            "scoped": scoped,
+            "complete": not integrity_errors and not completeness_errors,
+            "evidence_complete": evidence_complete,
+            "integrity_errors": integrity_errors,
+            "completeness_errors": completeness_errors,
+        }
+
+    def _validate_strict_budget_snapshot(
+        self, snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
         """Reject checkpoint counters that could weaken the configured hard cap."""
 
         def nonnegative(value: Any, label: str) -> int:
@@ -1064,27 +1696,147 @@ class ResearchBudget:
                 raise ValueError(msg)
             return normalized
 
+        missing = object()
+
+        def optional_nonnegative(
+            mapping: dict[str, Any],
+            key: str,
+            label: str,
+            *,
+            legacy_alias: str | None = None,
+        ) -> int | None:
+            raw = mapping.get(key, missing)
+            if raw is missing and legacy_alias is not None:
+                raw = mapping.get(legacy_alias, missing)
+            if raw is missing or raw is None:
+                return None
+            return nonnegative(raw, label)
+
         search_calls = nonnegative(snapshot.get("search_calls", 0), "search_calls")
-        successful_searches = nonnegative(
-            snapshot.get("successful_searches", search_calls),
+        successful_searches = optional_nonnegative(
+            snapshot,
             "successful_searches",
+            "successful_searches",
+            legacy_alias="nonempty_searches",
         )
-        relevant_searches = nonnegative(
-            snapshot.get("relevant_searches", successful_searches),
+        nonempty_searches = optional_nonnegative(
+            snapshot,
+            "nonempty_searches",
+            "nonempty_searches",
+            legacy_alias="successful_searches",
+        )
+        relevant_searches = optional_nonnegative(
+            snapshot,
+            "relevant_searches",
             "relevant_searches",
         )
+        provider_successes = optional_nonnegative(
+            snapshot,
+            "provider_successes",
+            "provider_successes",
+        )
+        evidence_producing_searches = optional_nonnegative(
+            snapshot,
+            "evidence_producing_searches",
+            "evidence_producing_searches",
+        )
         fetch_calls = nonnegative(snapshot.get("fetch_calls", 0), "fetch_calls")
+        attempt_summary = self._search_attempt_summary(snapshot)
+        if attempt_summary["integrity_errors"]:
+            msg = "Checkpoint tool attempt ledger is invalid: " + "; ".join(
+                attempt_summary["integrity_errors"]
+            )
+            raise ValueError(msg)
         if search_calls > self.policy.max_searches:
             msg = "Checkpoint search usage exceeds the hard policy"
             raise ValueError(msg)
         if fetch_calls > self.policy.max_fetches:
             msg = "Checkpoint fetch usage exceeds the hard policy"
             raise ValueError(msg)
-        if successful_searches > search_calls:
-            msg = "Checkpoint successful searches exceed search calls"
+        if successful_searches is not None and successful_searches > search_calls:
+            msg = (
+                "Checkpoint successful_searches compatibility alias "
+                "(non-empty searches) exceeds search calls"
+            )
             raise ValueError(msg)
-        if relevant_searches > successful_searches:
-            msg = "Checkpoint relevant searches exceed successful searches"
+        if (
+            nonempty_searches is not None
+            and successful_searches is not None
+            and nonempty_searches != successful_searches
+        ):
+            msg = "Checkpoint non-empty searches disagree with compatibility alias"
+            raise ValueError(msg)
+        if provider_successes is not None and provider_successes > search_calls:
+            msg = "Checkpoint provider successes violate search counter ordering"
+            raise ValueError(msg)
+        if (
+            provider_successes is not None
+            and nonempty_searches is not None
+            and provider_successes < nonempty_searches
+        ):
+            msg = "Checkpoint provider successes violate search counter ordering"
+            raise ValueError(msg)
+        if relevant_searches is not None and relevant_searches > search_calls:
+            msg = "Checkpoint relevant searches exceed search calls"
+            raise ValueError(msg)
+        if (
+            relevant_searches is not None
+            and nonempty_searches is not None
+            and relevant_searches > nonempty_searches
+        ):
+            msg = "Checkpoint relevant searches exceed non-empty searches"
+            raise ValueError(msg)
+        if (
+            evidence_producing_searches is not None
+            and evidence_producing_searches > search_calls
+        ):
+            msg = "Checkpoint evidence-producing searches exceed non-empty searches"
+            raise ValueError(msg)
+        if attempt_summary["complete"]:
+            derived_counters = {
+                "provider successes": (
+                    provider_successes,
+                    attempt_summary["provider_successes"],
+                ),
+                "non-empty searches": (
+                    nonempty_searches,
+                    attempt_summary["nonempty_searches"],
+                ),
+                "successful-search compatibility aliases": (
+                    successful_searches,
+                    attempt_summary["nonempty_searches"],
+                ),
+                "relevant searches": (
+                    relevant_searches,
+                    attempt_summary["relevant_searches"],
+                ),
+            }
+            for label, (checkpoint_value, derived_value) in derived_counters.items():
+                if checkpoint_value is not None and checkpoint_value != derived_value:
+                    msg = f"Checkpoint {label} do not match the attempt ledger"
+                    raise ValueError(msg)
+            if evidence_producing_searches is not None:
+                if not attempt_summary["evidence_complete"]:
+                    msg = (
+                        "Checkpoint evidence-producing search metric is not "
+                        "available from the attempt ledger"
+                    )
+                    raise ValueError(msg)
+                if (
+                    evidence_producing_searches
+                    != attempt_summary["evidence_producing_searches"]
+                ):
+                    msg = (
+                        "Checkpoint evidence-producing searches do not match "
+                        "the attempt ledger"
+                    )
+                    raise ValueError(msg)
+        if (
+            evidence_producing_searches is not None
+            and nonempty_searches is not None
+            and evidence_producing_searches > nonempty_searches
+        ):
+            msg = "Checkpoint evidence-producing searches exceed non-empty searches"
             raise ValueError(msg)
 
         raw_limits = snapshot.get("subquestion_limits", {})
@@ -1097,8 +1849,16 @@ class ResearchBudget:
             raise ValueError(msg)
 
         scoped_search_calls = 0
+        scoped_provider_successes = 0
+        scoped_provider_available = True
+        scoped_nonempty_searches = 0
+        scoped_nonempty_available = True
         scoped_successful_searches = 0
+        scoped_successful_available = True
         scoped_relevant_searches = 0
+        scoped_relevant_available = True
+        scoped_evidence_searches = 0
+        scoped_evidence_available = True
         scoped_fetch_calls = 0
         granted_searches = 0
         granted_fetches = 0
@@ -1123,13 +1883,32 @@ class ResearchBudget:
                 raw_scope_usage.get("search_calls", 0),
                 f"search usage for {subquestion_id}",
             )
-            scoped_successful = nonnegative(
-                raw_scope_usage.get("successful_searches", scoped_search),
-                f"successful searches for {subquestion_id}",
+            scoped_successful = optional_nonnegative(
+                raw_scope_usage,
+                "successful_searches",
+                f"successful_searches compatibility alias for {subquestion_id}",
+                legacy_alias="nonempty_searches",
             )
-            scoped_relevant = nonnegative(
-                raw_scope_usage.get("relevant_searches", scoped_successful),
+            scoped_nonempty = optional_nonnegative(
+                raw_scope_usage,
+                "nonempty_searches",
+                f"non-empty searches for {subquestion_id}",
+                legacy_alias="successful_searches",
+            )
+            scoped_relevant = optional_nonnegative(
+                raw_scope_usage,
+                "relevant_searches",
                 f"relevant searches for {subquestion_id}",
+            )
+            scoped_provider = optional_nonnegative(
+                raw_scope_usage,
+                "provider_successes",
+                f"provider successes for {subquestion_id}",
+            )
+            scoped_evidence = optional_nonnegative(
+                raw_scope_usage,
+                "evidence_producing_searches",
+                f"evidence-producing searches for {subquestion_id}",
             )
             scoped_fetch = nonnegative(
                 raw_scope_usage.get("fetch_calls", 0),
@@ -1141,18 +1920,118 @@ class ResearchBudget:
             if scoped_fetch > fetch_limit:
                 msg = f"Checkpoint fetch usage exceeds grant for {subquestion_id}"
                 raise ValueError(msg)
-            if scoped_successful > scoped_search:
+            if scoped_successful is not None and scoped_successful > scoped_search:
                 msg = (
-                    "Checkpoint successful searches exceed search usage for "
+                    "Checkpoint successful_searches compatibility alias "
+                    f"(non-empty searches) exceeds search usage for {subquestion_id}"
+                )
+                raise ValueError(msg)
+            if (
+                scoped_nonempty is not None
+                and scoped_successful is not None
+                and scoped_nonempty != scoped_successful
+            ):
+                msg = (
+                    "Checkpoint scoped non-empty searches disagree with compatibility "
+                    f"alias for {subquestion_id}"
+                )
+                raise ValueError(msg)
+            if scoped_provider is not None and scoped_provider > scoped_search:
+                msg = f"Checkpoint provider successes are invalid for {subquestion_id}"
+                raise ValueError(msg)
+            if (
+                scoped_provider is not None
+                and scoped_nonempty is not None
+                and scoped_provider < scoped_nonempty
+            ):
+                msg = f"Checkpoint provider successes are invalid for {subquestion_id}"
+                raise ValueError(msg)
+            if scoped_relevant is not None and scoped_relevant > scoped_search:
+                msg = (
+                    "Checkpoint relevant searches exceed search usage for "
                     f"{subquestion_id}"
                 )
                 raise ValueError(msg)
-            if scoped_relevant > scoped_successful:
+            if (
+                scoped_relevant is not None
+                and scoped_nonempty is not None
+                and scoped_relevant > scoped_nonempty
+            ):
                 msg = (
-                    "Checkpoint relevant searches exceed successful searches for "
+                    "Checkpoint relevant searches exceed non-empty searches for "
                     f"{subquestion_id}"
                 )
                 raise ValueError(msg)
+            if scoped_evidence is not None and scoped_evidence > scoped_search:
+                msg = (
+                    "Checkpoint evidence-producing searches exceed non-empty searches "
+                    f"for {subquestion_id}"
+                )
+                raise ValueError(msg)
+            if (
+                scoped_evidence is not None
+                and scoped_nonempty is not None
+                and scoped_evidence > scoped_nonempty
+            ):
+                msg = (
+                    "Checkpoint evidence-producing searches exceed non-empty searches "
+                    f"for {subquestion_id}"
+                )
+                raise ValueError(msg)
+            if attempt_summary["complete"]:
+                derived_scope = attempt_summary["scoped"].get(
+                    str(subquestion_id),
+                    {
+                        "provider_successes": 0,
+                        "nonempty_searches": 0,
+                        "relevant_searches": 0,
+                        "evidence_producing_searches": 0,
+                    },
+                )
+                derived_scope_counters = {
+                    "provider successes": (
+                        scoped_provider,
+                        derived_scope["provider_successes"],
+                    ),
+                    "non-empty searches": (
+                        scoped_nonempty,
+                        derived_scope["nonempty_searches"],
+                    ),
+                    "successful-search compatibility aliases": (
+                        scoped_successful,
+                        derived_scope["nonempty_searches"],
+                    ),
+                    "relevant searches": (
+                        scoped_relevant,
+                        derived_scope["relevant_searches"],
+                    ),
+                }
+                for label, (
+                    checkpoint_value,
+                    derived_value,
+                ) in derived_scope_counters.items():
+                    if (
+                        checkpoint_value is not None
+                        and checkpoint_value != derived_value
+                    ):
+                        msg = (
+                            f"Checkpoint scoped {label} do not match the attempt "
+                            f"ledger for {subquestion_id}"
+                        )
+                        raise ValueError(msg)
+                if scoped_evidence is not None:
+                    if not attempt_summary["evidence_complete"]:
+                        msg = (
+                            "Checkpoint scoped evidence-producing search metric "
+                            "is unavailable from the attempt ledger"
+                        )
+                        raise ValueError(msg)
+                    if scoped_evidence != derived_scope["evidence_producing_searches"]:
+                        msg = (
+                            "Checkpoint scoped evidence-producing searches do not "
+                            f"match the attempt ledger for {subquestion_id}"
+                        )
+                        raise ValueError(msg)
             granted_searches += search_limit
             granted_fetches += fetch_limit
             normalized_limits[str(subquestion_id)] = {
@@ -1160,8 +2039,26 @@ class ResearchBudget:
                 "max_fetches": fetch_limit,
             }
             scoped_search_calls += scoped_search
-            scoped_successful_searches += scoped_successful
-            scoped_relevant_searches += scoped_relevant
+            if scoped_provider is None:
+                scoped_provider_available = False
+            else:
+                scoped_provider_successes += scoped_provider
+            if scoped_nonempty is None:
+                scoped_nonempty_available = False
+            else:
+                scoped_nonempty_searches += scoped_nonempty
+            if scoped_successful is None:
+                scoped_successful_available = False
+            else:
+                scoped_successful_searches += scoped_successful
+            if scoped_relevant is None:
+                scoped_relevant_available = False
+            else:
+                scoped_relevant_searches += scoped_relevant
+            if scoped_evidence is None:
+                scoped_evidence_available = False
+            else:
+                scoped_evidence_searches += scoped_evidence
             scoped_fetch_calls += scoped_fetch
 
         if granted_searches > self.policy.max_searches:
@@ -1171,12 +2068,70 @@ class ResearchBudget:
             msg = "Checkpoint subquestion fetch grants exceed the hard policy"
             raise ValueError(msg)
         if raw_limits and (
-            scoped_search_calls != search_calls
-            or scoped_successful_searches != successful_searches
-            or scoped_relevant_searches != relevant_searches
-            or scoped_fetch_calls != fetch_calls
+            scoped_search_calls != search_calls or scoped_fetch_calls != fetch_calls
         ):
             msg = "Checkpoint global and subquestion usage counters do not match"
+            raise ValueError(msg)
+        optional_counter_pairs = (
+            (
+                "non-empty searches",
+                nonempty_searches,
+                scoped_nonempty_available,
+                scoped_nonempty_searches,
+            ),
+            (
+                "successful-search compatibility aliases",
+                successful_searches,
+                scoped_successful_available,
+                scoped_successful_searches,
+            ),
+            (
+                "relevant searches",
+                relevant_searches,
+                scoped_relevant_available,
+                scoped_relevant_searches,
+            ),
+        )
+        for (
+            label,
+            global_value,
+            scoped_available,
+            scoped_value,
+        ) in optional_counter_pairs:
+            if (
+                raw_limits
+                and global_value is not None
+                and (not scoped_available or scoped_value != global_value)
+            ):
+                msg = f"Checkpoint global and scoped {label} do not match"
+                raise ValueError(msg)
+        if (
+            raw_limits
+            and provider_successes is not None
+            and (
+                not scoped_provider_available
+                or scoped_provider_successes != provider_successes
+            )
+        ):
+            msg = "Checkpoint global and scoped provider successes do not match"
+            raise ValueError(msg)
+        if (
+            raw_limits
+            and evidence_producing_searches is not None
+            and (
+                not scoped_evidence_available
+                or scoped_evidence_searches != evidence_producing_searches
+            )
+        ):
+            msg = "Checkpoint global and scoped evidence search counts do not match"
+            raise ValueError(msg)
+        if (
+            int(snapshot.get("search_metric_semantics_version", 0)) >= 1
+            and not attempt_summary["complete"]
+        ):
+            msg = "Checkpoint search metric ledger is incomplete: " + "; ".join(
+                attempt_summary["completeness_errors"]
+            )
             raise ValueError(msg)
         active = snapshot.get("active_subquestion_id")
         if active is not None and active not in raw_limits:
@@ -1326,6 +2281,7 @@ class ResearchBudget:
             if normalized_limits != expected_limits:
                 msg = "Checkpoint final SQ limits do not match adaptive grant records"
                 raise ValueError(msg)
+        return attempt_summary
 
     def restore(
         self,
@@ -1343,6 +2299,7 @@ class ResearchBudget:
             strict_policy: Reject effort/strategy drift for a pending plan.
         """
         with self._lock:
+            attempt_summary = self._search_attempt_summary(snapshot)
             if strict_policy:
                 saved_effort = str(snapshot.get("effort", self.policy.name))
                 saved_strategy = str(snapshot.get("strategy", "fixed"))
@@ -1358,41 +2315,101 @@ class ResearchBudget:
                         f"saved={saved_strategy} requested={self.strategy}"
                     )
                     raise ValueError(msg)
-                self._validate_strict_budget_snapshot(snapshot)
+                attempt_summary = self._validate_strict_budget_snapshot(snapshot)
+
+            missing = object()
+
+            def restored_optional(
+                mapping: dict[str, Any],
+                key: str,
+                *,
+                limit: int,
+                legacy_alias: str | None = None,
+            ) -> int | None:
+                raw = mapping.get(key, missing)
+                if raw is missing and legacy_alias is not None:
+                    raw = mapping.get(legacy_alias, missing)
+                if raw is missing or raw is None:
+                    return None
+                return min(max(0, int(raw)), limit)
+
             self.search_calls = (
                 0
                 if reset_usage
-                else min(int(snapshot.get("search_calls", 0)), self.policy.max_searches)
+                else min(
+                    max(0, int(snapshot.get("search_calls", 0))),
+                    self.policy.max_searches,
+                )
             )
+            self.provider_successes = (
+                0
+                if reset_usage
+                else None
+                if not attempt_summary["complete"]
+                else restored_optional(
+                    snapshot,
+                    "provider_successes",
+                    limit=self.search_calls,
+                )
+            )
+            restored_nonempty = restored_optional(
+                snapshot,
+                "nonempty_searches",
+                limit=self.search_calls,
+                legacy_alias="successful_searches",
+            )
+            self.nonempty_searches = (
+                0
+                if reset_usage
+                else None
+                if not attempt_summary["complete"]
+                else restored_nonempty
+            )
+            # Deprecated alias shares both the value and availability state.
             self.successful_searches = (
                 0
                 if reset_usage
-                else min(
-                    int(
-                        snapshot.get(
-                            "successful_searches", snapshot.get("search_calls", 0)
-                        )
-                    ),
-                    self.search_calls,
-                )
+                else None
+                if not attempt_summary["complete"]
+                else restored_nonempty
             )
             self.relevant_searches = (
                 0
                 if reset_usage
-                else min(
-                    int(
-                        snapshot.get(
-                            "relevant_searches",
-                            snapshot.get("successful_searches", 0),
-                        )
+                else None
+                if not attempt_summary["complete"]
+                else restored_optional(
+                    snapshot,
+                    "relevant_searches",
+                    limit=(
+                        self.nonempty_searches
+                        if self.nonempty_searches is not None
+                        else self.search_calls
                     ),
-                    self.successful_searches,
+                )
+            )
+            self.evidence_producing_searches = (
+                0
+                if reset_usage
+                else None
+                if not attempt_summary["complete"]
+                else restored_optional(
+                    snapshot,
+                    "evidence_producing_searches",
+                    limit=(
+                        self.nonempty_searches
+                        if self.nonempty_searches is not None
+                        else self.search_calls
+                    ),
                 )
             )
             self.fetch_calls = (
                 0
                 if reset_usage
-                else min(int(snapshot.get("fetch_calls", 0)), self.policy.max_fetches)
+                else min(
+                    max(0, int(snapshot.get("fetch_calls", 0))),
+                    self.policy.max_fetches,
+                )
             )
             self.sources = deepcopy(snapshot.get("successful_sources", []))
             self._refresh_duplicate_sources()
@@ -1424,24 +2441,64 @@ class ResearchBudget:
                     for key, value in snapshot.get("subquestion_limits", {}).items()
                 }
             )
+
+            def restored_scope_usage(
+                value: dict[str, Any],
+            ) -> dict[str, int | None]:
+                search_calls = max(0, int(value.get("search_calls", 0)))
+                if not attempt_summary["complete"]:
+                    return {
+                        **dict(value),
+                        "search_calls": search_calls,
+                        "provider_successes": None,
+                        "nonempty_searches": None,
+                        "successful_searches": None,
+                        "relevant_searches": None,
+                        "evidence_producing_searches": None,
+                        "fetch_calls": max(0, int(value.get("fetch_calls", 0))),
+                    }
+                nonempty_searches = restored_optional(
+                    value,
+                    "nonempty_searches",
+                    limit=search_calls,
+                    legacy_alias="successful_searches",
+                )
+                return {
+                    **dict(value),
+                    "search_calls": search_calls,
+                    "provider_successes": restored_optional(
+                        value,
+                        "provider_successes",
+                        limit=search_calls,
+                    ),
+                    "nonempty_searches": nonempty_searches,
+                    "successful_searches": nonempty_searches,
+                    "relevant_searches": restored_optional(
+                        value,
+                        "relevant_searches",
+                        limit=(
+                            nonempty_searches
+                            if nonempty_searches is not None
+                            else search_calls
+                        ),
+                    ),
+                    "evidence_producing_searches": restored_optional(
+                        value,
+                        "evidence_producing_searches",
+                        limit=(
+                            nonempty_searches
+                            if nonempty_searches is not None
+                            else search_calls
+                        ),
+                    ),
+                    "fetch_calls": max(0, int(value.get("fetch_calls", 0))),
+                }
+
             self.subquestion_usage = (
                 {}
                 if reset_usage
                 else {
-                    str(key): {
-                        **dict(value),
-                        "successful_searches": int(
-                            value.get(
-                                "successful_searches", value.get("search_calls", 0)
-                            )
-                        ),
-                        "relevant_searches": int(
-                            value.get(
-                                "relevant_searches",
-                                value.get("successful_searches", 0),
-                            )
-                        ),
-                    }
+                    str(key): restored_scope_usage(value)
                     for key, value in snapshot.get("subquestion_usage", {}).items()
                 }
             )
@@ -1506,8 +2563,11 @@ class ResearchBudget:
         """Reset plan-level usage while preserving thread-stable source IDs."""
         with self._lock:
             self.search_calls = 0
+            self.provider_successes = 0
+            self.nonempty_searches = 0
             self.successful_searches = 0
             self.relevant_searches = 0
+            self.evidence_producing_searches = 0
             self.fetch_calls = 0
             self.failures = []
             self.active_subquestion_id = None
@@ -1536,8 +2596,29 @@ def build_budgeted_tools(
                 "query": query,
                 **budget.budget_denial("search"),
             }
-            budget.record_tool_attempt(
+            attempt = budget.record_tool_attempt(
                 tool_name="web_search", target=query, payload=payload
+            )
+            payload.update(
+                {
+                    key: attempt.get(key)
+                    for key in (
+                        "attempt_id",
+                        "outcome",
+                        "failure_class",
+                        "retryable",
+                        "provider_success",
+                        "provider_outcome",
+                        "nonempty_search",
+                        "relevant_search",
+                        "evidence_producing_search",
+                        "provider_failure",
+                        "relevant_results",
+                        "reported_relevant_results",
+                        "scored_result_count",
+                        "semantic_mismatches",
+                    )
+                }
             )
             return json.dumps(payload, ensure_ascii=False)
         result_limit = min(max_results, budget.policy.max_results_per_search)
@@ -1545,18 +2626,34 @@ def build_budgeted_tools(
             payload = json.loads(
                 web_search.invoke({"query": query, "max_results": result_limit})
             )
-            if payload.get("status") == "success" and payload.get("results"):
-                budget.record_search_success(
-                    relevant=int(payload.get("relevant_results", 0)) > 0
-                )
-            else:
-                if payload.get("status") != "success":
-                    payload.setdefault("status", "error")
-                    payload.setdefault("error", "search_provider_error")
+            if payload.get("status") != "success":
+                payload.setdefault("status", "error")
+                payload.setdefault("error", "search_provider_error")
         except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
             payload = {"status": "error", "query": query, "error": type(exc).__name__}
-        budget.record_tool_attempt(
+        attempt = budget.record_tool_attempt(
             tool_name="web_search", target=query, payload=payload
+        )
+        payload.update(
+            {
+                key: attempt.get(key)
+                for key in (
+                    "attempt_id",
+                    "outcome",
+                    "failure_class",
+                    "retryable",
+                    "provider_success",
+                    "provider_outcome",
+                    "nonempty_search",
+                    "relevant_search",
+                    "evidence_producing_search",
+                    "provider_failure",
+                    "relevant_results",
+                    "reported_relevant_results",
+                    "scored_result_count",
+                    "semantic_mismatches",
+                )
+            }
         )
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1576,6 +2673,7 @@ def build_budgeted_tools(
             return json.dumps(payload, ensure_ascii=False)
         char_limit = min(max_chars, budget.policy.max_chars_per_page)
         payload = json.loads(fetch_url.invoke({"url": url, "max_chars": char_limit}))
+        payload.setdefault("requested_url", url)
         if payload.get("status") == "success":
             content_chars = int(payload.get("content_chars", 0))
             if content_chars < MIN_LIMITED_EVIDENCE_CHARS:
@@ -1922,16 +3020,50 @@ def _build_tool_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                     }
                 )
         elif isinstance(message, ToolMessage):
-            events.append(
-                {
-                    "event": "tool_result",
-                    "name": message.name,
-                    "tool_call_id": message.tool_call_id,
-                    "content_chars": len(str(message.content)),
-                    "status": message.status or "success",
-                    "phase": phase,
+            event = {
+                "event": "tool_result",
+                "name": message.name,
+                "tool_call_id": message.tool_call_id,
+                "content_chars": len(str(message.content)),
+                "status": message.status or "success",
+                "phase": phase,
+            }
+            try:
+                payload = (
+                    json.loads(message.content)
+                    if isinstance(message.content, str)
+                    else message.content
+                )
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and message.name == "web_search":
+                event["search_semantics"] = {
+                    "attempt_id": payload.get("attempt_id"),
+                    "outcome": payload.get("outcome"),
+                    "failure_class": payload.get("failure_class"),
+                    "retryable": payload.get("retryable"),
+                    "provider_success": payload.get("provider_success"),
+                    "provider_outcome": payload.get("provider_outcome"),
+                    "nonempty_search": payload.get("nonempty_search"),
+                    "relevant_search": payload.get("relevant_search"),
+                    "evidence_producing_search": payload.get(
+                        "evidence_producing_search"
+                    ),
+                    "relevant_results": payload.get("relevant_results"),
+                    "reported_relevant_results": payload.get(
+                        "reported_relevant_results"
+                    ),
+                    "semantic_mismatches": payload.get("semantic_mismatches", []),
+                    "provider_failure": payload.get("provider_failure"),
                 }
-            )
+            elif isinstance(payload, dict) and message.name == "fetch_url":
+                event["fetch_semantics"] = {
+                    "fetched_at": payload.get("fetched_at"),
+                    "content_length": payload.get("content_length"),
+                    "returned_content_length": payload.get("content_chars"),
+                    "truncated": payload.get("truncated"),
+                }
+            events.append(event)
     return events
 
 
@@ -2010,26 +3142,66 @@ def _messages_for_plan(messages: list[BaseMessage], plan_id: str) -> list[BaseMe
     return messages
 
 
-def _aggregate_message_usage(messages: list[BaseMessage]) -> dict[str, int]:
-    """Aggregate provider-reported token usage from checkpointed AI messages."""
+def _aggregate_message_usage(messages: list[BaseMessage]) -> dict[str, Any]:
+    """Aggregate usage without turning missing provider telemetry into zeros."""
+    model_messages = [message for message in messages if isinstance(message, AIMessage)]
+    usage_items = [
+        getattr(message, "usage_metadata", None) for message in model_messages
+    ]
+    observed_calls = sum(bool(item) for item in usage_items)
+    if observed_calls == 0:
+        return {
+            "usage_status": "unavailable",
+            "model_calls": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "cache_read_tokens": None,
+            "observed_model_messages": len(model_messages),
+            "missing_usage_messages": len(model_messages),
+        }
+
+    def complete_sum(key: str) -> int | None:
+        values: list[int] = []
+        for usage in usage_items:
+            if not usage:
+                return None
+            raw = usage.get(key)
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None
+            values.append(raw)
+        return sum(values)
+
+    def complete_cache_read_sum() -> int | None:
+        values: list[int] = []
+        for usage in usage_items:
+            if not usage:
+                return None
+            details = usage.get("input_token_details")
+            if not isinstance(details, dict):
+                return None
+            raw = details.get("cache_read")
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None
+            values.append(raw)
+        return sum(values)
+
     totals = {
-        "model_calls": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "cache_read_tokens": 0,
+        "model_calls": observed_calls,
+        "input_tokens": complete_sum("input_tokens"),
+        "output_tokens": complete_sum("output_tokens"),
+        "total_tokens": complete_sum("total_tokens"),
+        "cache_read_tokens": complete_cache_read_sum(),
     }
-    for message in messages:
-        usage = getattr(message, "usage_metadata", None)
-        if not usage:
-            continue
-        totals["model_calls"] += 1
-        totals["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
-        totals["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
-        totals["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
-        input_details = usage.get("input_token_details", {}) or {}
-        totals["cache_read_tokens"] += int(input_details.get("cache_read", 0) or 0)
-    return totals
+    complete = observed_calls == len(model_messages) and all(
+        value is not None for key, value in totals.items() if key != "model_calls"
+    )
+    return {
+        "usage_status": "complete" if complete else "partial",
+        **totals,
+        "observed_model_messages": len(model_messages),
+        "missing_usage_messages": max(0, len(model_messages) - observed_calls),
+    }
 
 
 def _canonical_mapping_errors(
@@ -2790,6 +3962,20 @@ def _execute_cli(
         if event["event"] == "tool_call" and event["name"] == "task"
     ]
     ledger = bundle.budget.snapshot()
+    attempts_by_id = {
+        str(item.get("attempt_id", "")): item
+        for item in ledger.get("tool_attempts", [])
+        if item.get("attempt_id")
+    }
+    for event in trace:
+        semantics = event.get("search_semantics")
+        if not isinstance(semantics, dict):
+            continue
+        attempt = attempts_by_id.get(str(semantics.get("attempt_id", "")))
+        if attempt is not None:
+            semantics["evidence_producing_search"] = attempt.get(
+                "evidence_producing_search"
+            )
     sources = ledger["successful_sources"]
     research_plan: ResearchPlan | None = result.get("research_plan")
     research_events: list[ResearchEvent] = result.get("research_events", [])
@@ -2826,8 +4012,11 @@ def _execute_cli(
         validation_errors.append("The run finished without a durable research plan")
     elif research_plan["status"] != "completed":
         validation_errors.append(
-            "The explicit research plan did not reach full coverage: "
-            f"status={research_plan['status']} coverage={research_plan['coverage']}"
+            "The explicit research plan did not reach full structural "
+            "subquestion coverage: "
+            f"status={research_plan['status']} "
+            "structural_subquestion_coverage="
+            f"{research_plan['structural_subquestion_coverage']}"
         )
     if not report:
         validation_errors.append("The agent finished without creating output/report.md")
@@ -2843,13 +4032,18 @@ def _execute_cli(
     }
     planned_searches = len(research_plan["subquestions"]) if research_plan else 1
     required_searches = min(bundle.policy.max_searches, max(1, planned_searches))
-    successful_searches = int(
-        ledger.get("successful_searches", ledger.get("search_calls", 0))
-    )
-    if successful_searches < required_searches:
+    raw_relevant_searches = ledger.get("relevant_searches")
+    if raw_relevant_searches is None:
         validation_errors.append(
-            f"The agent completed {successful_searches} successful searches; "
-            f"the explicit plan requires at least {required_searches}"
+            "The relevant-search metric is unavailable for this checkpoint; "
+            "legacy non-empty searches are not upgraded to relevant searches"
+        )
+    elif int(raw_relevant_searches) < required_searches:
+        relevant_searches = int(raw_relevant_searches)
+        validation_errors.append(
+            f"The agent completed {relevant_searches} relevant searches; "
+            f"the explicit plan requires at least {required_searches}. "
+            "Provider-successful but empty or lexically irrelevant searches do not count"
         )
     plan_source_ids = {
         source_id
@@ -2859,29 +4053,31 @@ def _execute_cli(
     plan_sources = [
         source for source in sources if source["source_id"] in plan_source_ids
     ]
-    independent_plan_source_ids = (
-        independent_evidence_source_ids(
+    corroborating_plan_source_ids: list[str] | None = (
+        corroborating_evidence_source_ids(
             source_ids=plan_source_ids,
             sources=sources,
             evidence_units=ledger.get("evidence_units", []),
             claim_ids=plan_claim_ids,
         )
         if graph_required
-        else [
-            str(source["source_id"])
-            for source in plan_sources
-            if not source.get("duplicate_of_source_id")
-        ]
+        else None
     )
-    independent_plan_sources = [
+    corroborating_plan_sources = [
         source
         for source in plan_sources
-        if source["source_id"] in set(independent_plan_source_ids)
+        if corroborating_plan_source_ids is not None
+        and source["source_id"] in set(corroborating_plan_source_ids)
     ]
-    if len(independent_plan_sources) < bundle.policy.min_successful_sources:
+    if corroborating_plan_source_ids is None:
+        validation_errors.append(
+            "Corroborating evidence source groups are unavailable for a legacy "
+            "source-only checkpoint"
+        )
+    elif len(corroborating_plan_sources) < bundle.policy.min_successful_sources:
         validation_errors.append(
             "The active plan references "
-            f"{len(independent_plan_sources)} independent successful sources; "
+            f"{len(corroborating_plan_sources)} corroborating source groups; "
             f"{bundle.policy.min_successful_sources} are required for effort={bundle.policy.name}"
         )
     evidence_graph_errors = validate_evidence_graph(ledger)
@@ -2965,24 +4161,21 @@ def _execute_cli(
         source for source in plan_sources if source["source_id"] in finding_source_ids
     ]
     cited_source_ids = {str(source["source_id"]) for source in cited_sources}
-    independent_cited_source_ids = (
-        independent_evidence_source_ids(
+    corroborating_cited_source_ids: list[str] | None = (
+        corroborating_evidence_source_ids(
             source_ids=cited_source_ids,
             sources=sources,
             evidence_units=ledger.get("evidence_units", []),
             claim_ids=plan_claim_ids,
         )
         if graph_required
-        else [
-            str(source["source_id"])
-            for source in cited_sources
-            if not source.get("duplicate_of_source_id")
-        ]
+        else None
     )
-    independent_cited_sources = [
+    corroborating_cited_sources = [
         source
         for source in cited_sources
-        if source["source_id"] in set(independent_cited_source_ids)
+        if corroborating_cited_source_ids is not None
+        and source["source_id"] in set(corroborating_cited_source_ids)
     ]
     report_source_ids = set(re.findall(r"\[(S[1-9][0-9]*)\]", report))
     ledger_source_ids = {str(source["source_id"]) for source in sources}
@@ -3010,9 +4203,14 @@ def _execute_cli(
             "and URLs on the same source line: "
             + ", ".join(mapping_errors["mismatched_titles"])
         )
-    if len(independent_cited_sources) < bundle.policy.min_successful_sources:
+    if corroborating_cited_source_ids is None:
         validation_errors.append(
-            "The report does not cite enough independent successfully fetched source IDs"
+            "Report corroborating evidence groups are unavailable for a legacy "
+            "source-only checkpoint"
+        )
+    elif len(corroborating_cited_sources) < bundle.policy.min_successful_sources:
+        validation_errors.append(
+            "The report does not cite enough corroborating source groups"
         )
     if graph_required:
         claim_mapping_errors = report_claim_mapping_errors(
@@ -3139,9 +4337,22 @@ def _execute_cli(
         "research": {
             "plan_id": research_plan["plan_id"] if research_plan else None,
             "status": research_plan["status"] if research_plan else "missing",
-            "coverage": research_plan["coverage"] if research_plan else 0.0,
+            "structural_subquestion_coverage": (
+                research_plan.get("structural_subquestion_coverage")
+                if research_plan and graph_required
+                else None
+            ),
+            "coverage": (
+                research_plan.get("coverage")
+                if research_plan and graph_required
+                else None
+            ),
+            "coverage_semantics": (
+                "deprecated alias for structural_subquestion_coverage; not accuracy, "
+                "semantic coverage, completeness, or citation entailment"
+            ),
             "subquestions": (
-                len(research_plan["subquestions"]) if research_plan else 0
+                len(research_plan["subquestions"]) if research_plan else None
             ),
             "events": len(research_events),
             "plan_path": str(plan_path),
@@ -3152,6 +4363,7 @@ def _execute_cli(
             "evidence_units": len(ledger.get("evidence_units", [])),
             "conflicts": len(ledger.get("conflicts", [])),
             "integrity_errors": len(evidence_graph_errors),
+            "source_diversity": ledger.get("source_diversity"),
         },
         "validation": {
             "status": "failed" if validation_errors else "passed",

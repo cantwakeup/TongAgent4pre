@@ -20,7 +20,7 @@ class ResearchBudgetTests(unittest.TestCase):
             {
                 "status": "success",
                 "query": "test",
-                "results": [{"url": "https://example.com"}],
+                "results": [{"url": "https://example.com", "relevance_score": 100}],
                 "relevant_results": 1,
                 "search_quality": "relevant",
             }
@@ -79,7 +79,12 @@ class ResearchBudgetTests(unittest.TestCase):
             {
                 "status": "success",
                 "query": "generic noise",
-                "results": [{"url": "https://noise.example/page"}],
+                "results": [
+                    {
+                        "url": "https://noise.example/page",
+                        "relevance_score": 0,
+                    }
+                ],
                 "relevant_results": 0,
                 "search_quality": "low_relevance",
             }
