@@ -1,0 +1,60 @@
+name: "TongAgent offline"
+
+on:
+  push:
+    paths:
+      - "learning/search-agent/**"
+      - "libs/deepagents/**"
+      - "scripts/check_tongagent.sh"
+      - ".github/workflows/tongagent-offline.yml"
+  pull_request:
+    paths:
+      - "learning/search-agent/**"
+      - "libs/deepagents/**"
+      - "scripts/check_tongagent.sh"
+      - ".github/workflows/tongagent-offline.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: "Python 3.11 / no network"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_DEFAULT_INDEX: "https://pypi.org/simple"
+      SEARCH_AGENT_API_KEY: ""
+      SEARCH_AGENT_BASE_URL: ""
+      SEARCH_AGENT_MODEL: ""
+      SEARCH_AGENT_WORKER_MODEL: ""
+      OPENAI_API_KEY: ""
+      OPENAI_BASE_URL: ""
+      LANGCHAIN_API_KEY: ""
+      LANGCHAIN_TRACING_V2: ""
+      LANGSMITH_API_KEY: ""
+      LANGSMITH_TRACING: ""
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: "Install uv and Python"
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.11.26"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: |
+            learning/search-agent/pyproject.toml
+            learning/search-agent/uv.lock
+            libs/deepagents/pyproject.toml
+            libs/deepagents/uv.lock
+
+      - name: "Run unified offline checks"
+        run: bash scripts/check_tongagent.sh

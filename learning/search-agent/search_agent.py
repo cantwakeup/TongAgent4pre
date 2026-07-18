@@ -2967,7 +2967,7 @@ def build_agent(
         budget_configure=budget.configure_subquestions,
         budget_activate=budget.activate_subquestion,
         budget_grant=budget.grant_subquestion,
-        report_read=lambda: (report_path.read_text() if report_path.is_file() else ""),
+        report_read=lambda: report_path.read_text() if report_path.is_file() else "",
         report_clear=lambda: report_path.unlink(missing_ok=True),
         checkpointer=checkpointer,
         max_subquestions=max_subquestions,

@@ -35,6 +35,7 @@
 - [Stage 03A：显式研究计划与可恢复状态图](stages/stage-03a-explicit-research-state.md)
 - [Stage 03B：搜索质量与证据控制强化](stages/stage-03b-search-evidence-controls.md)
 - [Stage 03C：正文片段级 Evidence Graph](stages/stage-03c-evidence-graph.md)
+- [Stage 03D：证据驱动的自适应控制](stages/stage-03d-adaptive-control.md)
 
 ## 先记住的一句话
 

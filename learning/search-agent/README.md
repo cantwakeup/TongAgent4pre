@@ -29,12 +29,27 @@ Agent 没有 shell 工具。它只能访问公开 HTTP(S) 页面，并只能写�
 
 ## 环境与安装
 
-要求 Python `>=3.11,<4.0`，不需要 CUDA、本地 GPU 或 Conda。在本目录执行：
+要求 Python `>=3.11,<4.0` 和
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/)，不需要 CUDA、
+本地 GPU 或 Conda。在本目录执行：
 
 ```bash
-../../../.tools/uv sync
+uv sync --group test
 cp .env.example .env
 ```
+
+默认使用标准 PyPI，仓库不再把某个镜像写死为不可覆盖的依赖源。国内网络环境
+如果需要镜像，可仅对本次安装显式选择，例如：
+
+```bash
+uv sync --group test \
+  --default-index https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+这只是可选的安装加速配置；不要把镜像地址提交回项目依赖配置或 lock 文件。
+项目固定使用 `deepagents==0.6.12`，并从仓库内的
+`../../libs/deepagents` editable 源码安装；该源码对应上游提交
+`4ddb361b99857c1fc23afb9ada0a68162c190f74`。
 
 然后在 `.env` 中填写私有配置：
 
@@ -280,18 +295,26 @@ Sources；该节每个非空行都必须精确为
 
 ## 离线回归
 
+从仓库根目录运行统一验证入口：
+
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+cd ../..
+bash scripts/check_tongagent.sh
 ```
 
-当前 144 项全量离线测试全部通过。除原有拓扑、搜索、Evidence Graph、checkpoint
-和严格报告协议外，03D 覆盖了纯函数控制决策、完整性失败 fail-closed、baseline
-与 reserve、单调且幂等的硬上限 grant、attempt 分类、policy drift 拒绝、控制器
-节点前恢复只应用一次 grant、grant/checkpoint crash-window 原跃迁 replay、逐步
-grant/ledger 审计、严格整数与 plan/budget
-scope 恢复、首个 decision 前的合法恢复、独立 synthesis agent、caveat 白名单、
-reviewer 必须成功且早于最终写入、trace status/phase，以及不同 thread/run 的
-输出目录隔离。
+该脚本统一执行格式检查、lint、静态 compile/import、关键指标回归和完整离线
+测试，并清除模型、搜索和 tracing 相关环境变量。测试必须在 socket 默认禁用的
+条件下通过，不会调用真实搜索引擎或付费模型。离线 fixture 及其汇总只能标记为
+smoke，用来证明框架和指标行为可重复；它们不衡量真实研究质量，也不是正式
+benchmark 结果。
+
+回归范围包括原有拓扑、搜索、Evidence Graph、checkpoint 和严格报告协议，以及
+03D 的纯函数控制决策、完整性失败 fail-closed、baseline 与 reserve、单调且幂等
+的硬上限 grant、attempt 分类、policy drift 拒绝、控制器节点前恢复只应用一次
+grant、grant/checkpoint crash-window 原跃迁 replay、逐步 grant/ledger 审计、
+严格整数与 plan/budget scope 恢复、首个 decision 前的合法恢复、独立
+synthesis agent、caveat 白名单、reviewer 必须成功且早于最终写入、
+trace status/phase，以及不同 thread/run 的输出目录隔离。
 
 `run.json.api_usage` 汇总当前 plan checkpoint 中 AI 消息的
 provider-reported input/output/cache-read token。缺少 telemetry 时字段为

@@ -4,14 +4,17 @@ version = "0.1.0"
 description = "A minimal real web research agent built while studying Deep Agents."
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    "deepagents",
+    "deepagents==0.6.12",
     "langchain-openai>=1.1.0,<2.0.0",
     "langgraph-checkpoint-sqlite>=3.0.0,<4.0.0",
 ]
 
+[dependency-groups]
+test = [
+    "pytest>=9.0.0,<10.0.0",
+    "pytest-socket>=0.7.0,<1.0.0",
+    "ruff>=0.15.20,<0.16.0",
+]
+
 [tool.uv.sources]
 deepagents = { path = "../../libs/deepagents", editable = true }
-
-[[tool.uv.index]]
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-default = true
