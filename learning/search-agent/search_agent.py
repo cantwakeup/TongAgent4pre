@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,6 +23,8 @@ from uuid import uuid4
 
 import httpx
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -41,6 +44,7 @@ from deepagents import (
     SubAgent,
     register_harness_profile,
 )
+from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends import FilesystemBackend
 from deepagents.graph import create_deep_agent
 
@@ -65,6 +69,7 @@ from evidence_graph import (
     validate_evidence_graph,
 )
 from research_graph import (
+    Planner,
     build_evidence_graph_tools,
     build_model_planner,
     build_research_graph,
@@ -910,7 +915,12 @@ class ResearchBudget:
             return "rejected", "safety", False
         if status == "insufficient_content":
             return "insufficient_content", "content", True
-        normalized_error = error.casefold()
+        normalized_error = " ".join(
+            (
+                error,
+                str(payload.get("provider_error_type", "")),
+            )
+        ).casefold()
         if any(
             marker in normalized_error
             for marker in (
@@ -1454,7 +1464,7 @@ class ResearchBudget:
 
     @staticmethod
     def _search_attempt_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
-        """Derive auditable search counters from the ordered attempt ledger."""
+        """Derive search metrics and admitted fetch lower bounds from attempts."""
         integrity_errors: list[str] = []
         completeness_errors: list[str] = []
         raw_attempts = snapshot.get("tool_attempts")
@@ -1510,11 +1520,35 @@ class ResearchBudget:
             "relevant_searches": 0,
             "evidence_producing_searches": 0,
             "search_calls": 0,
+            "fetch_calls": 0,
         }
         scoped: dict[str, dict[str, int]] = {}
         evidence_complete = True
         for attempt in attempts:
-            if attempt.get("tool") != "web_search":
+            tool_name = attempt.get("tool")
+            if tool_name == "fetch_url":
+                # Budget rejection is the only fetch outcome produced before a
+                # reservation. Provider, safety, and content failures all
+                # consume the fetch that was admitted by `reserve_fetch`.
+                admitted = str(attempt.get("status", "error")) != "budget_exceeded"
+                if admitted:
+                    totals["fetch_calls"] += 1
+                subquestion_id = str(attempt.get("subquestion_id", ""))
+                if admitted and subquestion_id:
+                    usage = scoped.setdefault(
+                        subquestion_id,
+                        {
+                            "search_calls": 0,
+                            "provider_successes": 0,
+                            "nonempty_searches": 0,
+                            "relevant_searches": 0,
+                            "evidence_producing_searches": 0,
+                            "fetch_calls": 0,
+                        },
+                    )
+                    usage["fetch_calls"] += 1
+                continue
+            if tool_name != "web_search":
                 continue
             has_new_semantics = all(
                 key in attempt
@@ -1639,6 +1673,7 @@ class ResearchBudget:
                         "nonempty_searches": 0,
                         "relevant_searches": 0,
                         "evidence_producing_searches": 0,
+                        "fetch_calls": 0,
                     },
                 )
                 usage["search_calls"] += 1
@@ -1752,6 +1787,12 @@ class ResearchBudget:
             raise ValueError(msg)
         if fetch_calls > self.policy.max_fetches:
             msg = "Checkpoint fetch usage exceeds the hard policy"
+            raise ValueError(msg)
+        if fetch_calls < int(attempt_summary["fetch_calls"]):
+            msg = (
+                "Checkpoint fetch calls underreport admitted fetch attempts in "
+                "the fetch attempt ledger"
+            )
             raise ValueError(msg)
         if successful_searches is not None and successful_searches > search_calls:
             msg = (
@@ -1920,6 +1961,17 @@ class ResearchBudget:
             if scoped_fetch > fetch_limit:
                 msg = f"Checkpoint fetch usage exceeds grant for {subquestion_id}"
                 raise ValueError(msg)
+            ledger_scoped_fetch = int(
+                attempt_summary["scoped"]
+                .get(str(subquestion_id), {})
+                .get("fetch_calls", 0)
+            )
+            if scoped_fetch < ledger_scoped_fetch:
+                msg = (
+                    "Checkpoint fetch usage underreports admitted fetch attempts "
+                    f"in the fetch attempt ledger for {subquestion_id}"
+                )
+                raise ValueError(msg)
             if scoped_successful is not None and scoped_successful > scoped_search:
                 msg = (
                     "Checkpoint successful_searches compatibility alias "
@@ -2061,6 +2113,21 @@ class ResearchBudget:
                 scoped_evidence_searches += scoped_evidence
             scoped_fetch_calls += scoped_fetch
 
+        if raw_limits:
+            ledger_scoped_fetch_calls = sum(
+                int(
+                    attempt_summary["scoped"]
+                    .get(str(subquestion_id), {})
+                    .get("fetch_calls", 0)
+                )
+                for subquestion_id in raw_usage
+            )
+            if ledger_scoped_fetch_calls != int(attempt_summary["fetch_calls"]):
+                msg = (
+                    "Checkpoint fetch attempt ledger contains an unknown or "
+                    "unscoped admitted fetch attempt"
+                )
+                raise ValueError(msg)
         if granted_searches > self.policy.max_searches:
             msg = "Checkpoint subquestion search grants exceed the hard policy"
             raise ValueError(msg)
@@ -2581,10 +2648,39 @@ class ResearchBudget:
 
 
 def build_budgeted_tools(
-    policy: EffortPolicy, *, strategy: ResearchStrategy = "fixed"
+    policy: EffortPolicy,
+    *,
+    strategy: ResearchStrategy = "fixed",
+    raw_search_tool: BaseTool | None = None,
+    raw_fetch_tool: BaseTool | None = None,
+    budget: ResearchBudget | None = None,
 ) -> tuple[list[BaseTool], ResearchBudget]:
-    """Wrap network tools with one hard budget shared by parent and subagents."""
-    budget = ResearchBudget(policy, strategy=strategy)
+    """Wrap raw search/fetch tools with one shared semantic and budget ledger."""
+    if budget is None:
+        budget = ResearchBudget(policy, strategy=strategy)
+    elif budget.policy != policy or budget.strategy != strategy:
+        msg = "Injected ResearchBudget must match the requested policy and strategy"
+        raise ValueError(msg)
+    # Keep the default lookup dynamic so existing callers can patch the module
+    # providers after constructing the wrappers.
+    search_provider = raw_search_tool
+    fetch_provider = raw_fetch_tool
+
+    def provider_error_payload(
+        *,
+        tool_name: str,
+        target: str,
+        error: Exception,
+    ) -> dict[str, Any]:
+        """Return a secret-free provider failure for invocation/contract errors."""
+        target_field = "query" if tool_name == "web_search" else "url"
+        return {
+            "status": "error",
+            target_field: target,
+            "error": "provider_error",
+            "provider_error_type": type(error).__name__,
+            "retry_with_another_source": True,
+        }
 
     @tool("web_search")
     def limited_web_search(query: str, max_results: int = 5) -> str:
@@ -2623,14 +2719,24 @@ def build_budgeted_tools(
             return json.dumps(payload, ensure_ascii=False)
         result_limit = min(max_results, budget.policy.max_results_per_search)
         try:
-            payload = json.loads(
-                web_search.invoke({"query": query, "max_results": result_limit})
+            raw_payload = json.loads(
+                (search_provider or web_search).invoke(
+                    {"query": query, "max_results": result_limit}
+                )
             )
+            if not isinstance(raw_payload, dict):
+                msg = "Search provider response must be a JSON object"
+                raise TypeError(msg)
+            payload = raw_payload
             if payload.get("status") != "success":
                 payload.setdefault("status", "error")
                 payload.setdefault("error", "search_provider_error")
-        except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
-            payload = {"status": "error", "query": query, "error": type(exc).__name__}
+        except Exception as exc:
+            payload = provider_error_payload(
+                tool_name="web_search",
+                target=query,
+                error=exc,
+            )
         attempt = budget.record_tool_attempt(
             tool_name="web_search", target=query, payload=payload
         )
@@ -2672,30 +2778,46 @@ def build_budgeted_tools(
             )
             return json.dumps(payload, ensure_ascii=False)
         char_limit = min(max_chars, budget.policy.max_chars_per_page)
-        payload = json.loads(fetch_url.invoke({"url": url, "max_chars": char_limit}))
-        payload.setdefault("requested_url", url)
-        if payload.get("status") == "success":
-            content_chars = int(payload.get("content_chars", 0))
-            if content_chars < MIN_LIMITED_EVIDENCE_CHARS:
-                payload["status"] = "insufficient_content"
-                payload["error"] = (
-                    f"Fewer than {MIN_LIMITED_EVIDENCE_CHARS} visible characters"
+        try:
+            raw_payload = json.loads(
+                (fetch_provider or fetch_url).invoke(
+                    {"url": url, "max_chars": char_limit}
                 )
-            elif content_chars < MIN_EVIDENCE_CHARS:
-                if budget.has_full_evidence_host(str(payload.get("url", url))):
-                    payload["evidence_quality"] = "limited"
-                    payload["quality_reason"] = (
-                        "Short page accepted because the same host already has "
-                        "full-length fetched evidence"
-                    )
-                else:
+            )
+            if not isinstance(raw_payload, dict):
+                msg = "Fetch provider response must be a JSON object"
+                raise TypeError(msg)
+            payload = raw_payload
+            payload.setdefault("requested_url", url)
+            if payload.get("status") == "success":
+                content_chars = int(payload.get("content_chars", 0))
+                if content_chars < MIN_LIMITED_EVIDENCE_CHARS:
                     payload["status"] = "insufficient_content"
                     payload["error"] = (
-                        f"Fewer than {MIN_EVIDENCE_CHARS} visible characters and "
-                        "no full-length source anchors this host"
+                        f"Fewer than {MIN_LIMITED_EVIDENCE_CHARS} visible characters"
                     )
-            else:
-                payload["evidence_quality"] = "full"
+                elif content_chars < MIN_EVIDENCE_CHARS:
+                    if budget.has_full_evidence_host(str(payload.get("url", url))):
+                        payload["evidence_quality"] = "limited"
+                        payload["quality_reason"] = (
+                            "Short page accepted because the same host already has "
+                            "full-length fetched evidence"
+                        )
+                    else:
+                        payload["status"] = "insufficient_content"
+                        payload["error"] = (
+                            f"Fewer than {MIN_EVIDENCE_CHARS} visible characters and "
+                            "no full-length source anchors this host"
+                        )
+                else:
+                    payload["evidence_quality"] = "full"
+        except Exception as exc:
+            payload = provider_error_payload(
+                tool_name="fetch_url",
+                target=url,
+                error=exc,
+            )
+            payload["requested_url"] = url
         source_id = budget.record_fetch(payload)
         if source_id is not None:
             payload["source_id"] = source_id
@@ -2738,12 +2860,37 @@ class AgentBundle:
     max_escalations: int = 0
 
 
+@dataclass(frozen=True)
+class AgentRuntimeDependencies:
+    """Explicit production seams used by offline and evaluation runtimes."""
+
+    model: BaseChatModel
+    reviewer_model: BaseChatModel
+    network_tools: Sequence[BaseTool]
+    budget: ResearchBudget
+    planner: Planner
+    middleware: Sequence[AgentMiddleware[Any, Any]] = ()
+
+
 _REGISTERED_HARNESS_KEYS: set[str] = set()
 
 
-def _disable_general_purpose_subagent(model_name: str) -> None:
+def _disable_general_purpose_subagent(model: BaseChatModel) -> None:
     """Disable Deep Agents' implicit subagent so `single` really means one agent."""
-    profile_key = f"openai:{model_name}"
+    identifier = get_model_identifier(model)
+    provider = get_model_provider(model)
+    if identifier is not None and ":" in identifier:
+        profile_key = identifier
+    elif provider is not None and identifier is not None:
+        profile_key = f"{provider}:{identifier}"
+    elif provider is not None:
+        profile_key = provider
+    else:
+        msg = (
+            "Cannot disable Deep Agents' implicit general-purpose subagent: "
+            "the resolved model exposes neither a provider nor an identifier"
+        )
+        raise RuntimeError(msg)
     if profile_key in _REGISTERED_HARNESS_KEYS:
         return
     register_harness_profile(
@@ -2771,8 +2918,8 @@ def _build_subagents(
     *,
     topology: TopologyName,
     policy: EffortPolicy,
-    model: ChatOpenAI,
-    reviewer_model: ChatOpenAI,
+    model: BaseChatModel,
+    reviewer_model: BaseChatModel,
     tools: list[BaseTool],
 ) -> list[SubAgent | CompiledSubAgent]:
     """Create explicit research roles only when the selected topology is multi-agent."""
@@ -2836,16 +2983,11 @@ def build_agent(
     max_escalations: int = 2,
     topic: str = "",
     checkpointer: Any | None = None,
+    runtime_dependencies: AgentRuntimeDependencies | None = None,
 ) -> AgentBundle:
     """Build a policy-controlled OpenAI-compatible research agent."""
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "report.md"
-    _load_local_env(Path(__file__).resolve().parent / ".env")
-    api_key = os.environ.get("SEARCH_AGENT_API_KEY")
-    base_url = os.environ.get("SEARCH_AGENT_BASE_URL")
-    if not api_key or not base_url:
-        msg = "Set SEARCH_AGENT_API_KEY and SEARCH_AGENT_BASE_URL in search-agent/.env"
-        raise RuntimeError(msg)
     policy = EFFORT_POLICIES[effort]
     topology = resolve_topology(mode, effort, topic)
     if max_escalations < 0:
@@ -2861,32 +3003,58 @@ def build_agent(
         worker_model_name=worker_model_name,
         max_escalations=effective_max_escalations,
     )
-    network_tools, budget = build_budgeted_tools(policy, strategy=strategy)
+    if runtime_dependencies is None:
+        _load_local_env(Path(__file__).resolve().parent / ".env")
+        api_key = os.environ.get("SEARCH_AGENT_API_KEY")
+        base_url = os.environ.get("SEARCH_AGENT_BASE_URL")
+        if not api_key or not base_url:
+            msg = "Set SEARCH_AGENT_API_KEY and SEARCH_AGENT_BASE_URL in search-agent/.env"
+            raise RuntimeError(msg)
+
+        def create_chat_model(name: str) -> ChatOpenAI:
+            free_model_options = (
+                {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+                if name in {"deepseek-v4-flash", "qwen3.6-35b-a3b"}
+                else {}
+            )
+            return ChatOpenAI(
+                model=name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.2,
+                max_tokens=policy.max_output_tokens,
+                use_responses_api=False,
+                **free_model_options,
+            )
+
+        network_tools, budget = build_budgeted_tools(policy, strategy=strategy)
+        model = create_chat_model(model_name)
+        reviewer_model = create_chat_model(worker_model_name)
+        planner = build_model_planner(model)
+        middleware: Sequence[AgentMiddleware[Any, Any]] = ()
+    else:
+        if (
+            runtime_dependencies.budget.policy != policy
+            or runtime_dependencies.budget.strategy != strategy
+        ):
+            msg = (
+                "Injected AgentRuntimeDependencies budget must match the "
+                "requested effort and strategy"
+            )
+            raise ValueError(msg)
+        network_tools = list(runtime_dependencies.network_tools)
+        budget = runtime_dependencies.budget
+        model = runtime_dependencies.model
+        reviewer_model = runtime_dependencies.reviewer_model
+        planner = runtime_dependencies.planner
+        middleware = tuple(runtime_dependencies.middleware)
+
     state_tools = build_research_state_tools(
         budget.snapshot, require_researcher=topology == "multi"
     )
     source_ledger_tool = build_source_ledger_tool(budget.snapshot)
     evidence_tools = build_evidence_graph_tools(budget.record_evidence, budget.snapshot)
-
-    def create_chat_model(name: str) -> ChatOpenAI:
-        free_model_options = (
-            {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-            if name in {"deepseek-v4-flash", "qwen3.6-35b-a3b"}
-            else {}
-        )
-        return ChatOpenAI(
-            model=name,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=0.2,
-            max_tokens=policy.max_output_tokens,
-            use_responses_api=False,
-            **free_model_options,
-        )
-
-    model = create_chat_model(model_name)
-    reviewer_model = create_chat_model(worker_model_name)
-    _disable_general_purpose_subagent(model_name)
+    _disable_general_purpose_subagent(model)
     subagents = _build_subagents(
         topology=topology,
         policy=policy,
@@ -2937,6 +3105,7 @@ def build_agent(
         backend=backend,
         state_schema=TongAgentState,
         checkpointer=False,
+        middleware=middleware,
         name="learning-search-agent",
     )
     report_subagents = [item for item in subagents if item.get("name") == "reviewer"]
@@ -2956,13 +3125,14 @@ def build_agent(
         backend=backend,
         state_schema=TongAgentState,
         checkpointer=False,
+        middleware=middleware,
         name="learning-search-report-agent",
     )
     max_subquestions = policy.max_subquestions
     agent = build_research_graph(
         research_agent=research_inner_agent,
         report_agent=report_inner_agent,
-        planner=build_model_planner(model),
+        planner=planner,
         budget_snapshot=budget.snapshot,
         budget_configure=budget.configure_subquestions,
         budget_activate=budget.activate_subquestion,

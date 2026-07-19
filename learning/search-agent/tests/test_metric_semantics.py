@@ -6,8 +6,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import httpx
 from langchain_core.messages import ToolMessage
 
 from adaptive_control import build_control_assessment, initialize_control_state
@@ -218,6 +219,120 @@ class SearchMetricSemanticsTests(unittest.TestCase):
         self.assertEqual(denied["provider_outcome"], "not_called")
         self.assertFalse(denied["provider_failure"])
         self.assertEqual(budget.snapshot()["provider_successes"], 2)
+
+    def test_provider_runtime_errors_are_recorded_after_budget_reservation(
+        self,
+    ) -> None:
+        for tool_name, argument, provider_kwarg in (
+            ("web_search", {"query": "fixture"}, "raw_search_tool"),
+            (
+                "fetch_url",
+                {"url": "https://fixture.test/page"},
+                "raw_fetch_tool",
+            ),
+        ):
+            with self.subTest(tool=tool_name):
+                provider = Mock()
+                provider.invoke.side_effect = RuntimeError("sensitive provider detail")
+                tools, budget = build_budgeted_tools(
+                    EFFORT_POLICIES["low"],
+                    **{provider_kwarg: provider},
+                )
+                wrapped = next(item for item in tools if item.name == tool_name)
+
+                result = json.loads(wrapped.invoke(argument))
+                snapshot = budget.snapshot()
+
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["error"], "provider_error")
+                self.assertEqual(result["provider_error_type"], "RuntimeError")
+                self.assertNotIn("sensitive provider detail", json.dumps(result))
+                self.assertEqual(len(snapshot["tool_attempts"]), 1)
+                self.assertEqual(
+                    snapshot["tool_attempts"][0]["failure_class"],
+                    "provider",
+                )
+                if tool_name == "web_search":
+                    self.assertEqual(snapshot["search_calls"], 1)
+                    self.assertEqual(
+                        snapshot["tool_attempts"][0]["provider_outcome"],
+                        "failure",
+                    )
+                else:
+                    self.assertEqual(snapshot["fetch_calls"], 1)
+                    self.assertEqual(len(snapshot["failed_sources"]), 1)
+                    self.assertEqual(
+                        snapshot["failed_sources"][0]["url"],
+                        argument["url"],
+                    )
+
+    def test_malformed_or_non_object_provider_json_is_recorded(self) -> None:
+        for tool_name, argument, provider_kwarg in (
+            ("web_search", {"query": "fixture"}, "raw_search_tool"),
+            (
+                "fetch_url",
+                {"url": "https://fixture.test/page"},
+                "raw_fetch_tool",
+            ),
+        ):
+            for raw_result, expected_type in (
+                ("{not-json", "JSONDecodeError"),
+                ("[]", "TypeError"),
+            ):
+                with self.subTest(
+                    tool=tool_name,
+                    raw_result=raw_result,
+                ):
+                    provider = Mock()
+                    provider.invoke.return_value = raw_result
+                    tools, budget = build_budgeted_tools(
+                        EFFORT_POLICIES["low"],
+                        **{provider_kwarg: provider},
+                    )
+                    wrapped = next(item for item in tools if item.name == tool_name)
+
+                    result = json.loads(wrapped.invoke(argument))
+                    snapshot = budget.snapshot()
+
+                    self.assertEqual(result["status"], "error")
+                    self.assertEqual(result["error"], "provider_error")
+                    self.assertEqual(result["provider_error_type"], expected_type)
+                    self.assertEqual(len(snapshot["tool_attempts"]), 1)
+                    self.assertEqual(
+                        snapshot["tool_attempts"][0]["failure_class"],
+                        "provider",
+                    )
+                    if tool_name == "fetch_url":
+                        self.assertEqual(len(snapshot["failed_sources"]), 1)
+
+    def test_provider_timeout_type_preserves_network_failure_class(self) -> None:
+        for tool_name, argument, provider_kwarg in (
+            ("web_search", {"query": "fixture"}, "raw_search_tool"),
+            (
+                "fetch_url",
+                {"url": "https://fixture.test/page"},
+                "raw_fetch_tool",
+            ),
+        ):
+            with self.subTest(tool=tool_name):
+                provider = Mock()
+                provider.invoke.side_effect = httpx.ReadTimeout(
+                    "sensitive timeout detail",
+                    request=httpx.Request("GET", "https://fixture.test"),
+                )
+                tools, budget = build_budgeted_tools(
+                    EFFORT_POLICIES["low"],
+                    **{provider_kwarg: provider},
+                )
+                wrapped = next(item for item in tools if item.name == tool_name)
+
+                result = json.loads(wrapped.invoke(argument))
+                attempt = budget.snapshot()["tool_attempts"][0]
+
+                self.assertEqual(result["error"], "provider_error")
+                self.assertEqual(result["provider_error_type"], "ReadTimeout")
+                self.assertNotIn("sensitive timeout detail", json.dumps(result))
+                self.assertEqual(attempt["failure_class"], "network")
 
     def test_low_relevance_search_can_produce_evidence_but_not_coverage(
         self,
@@ -495,6 +610,68 @@ class SearchMetricSemanticsTests(unittest.TestCase):
         restored = ResearchBudget(EFFORT_POLICIES["low"])
         with self.assertRaisesRegex(ValueError, "attempt ledger"):
             restored.restore(tampered, strict_policy=True)
+
+    def test_strict_restore_rejects_fetch_counters_below_admitted_attempts(
+        self,
+    ) -> None:
+        budget = ResearchBudget(EFFORT_POLICIES["low"])
+        budget.configure_subquestions(["SQ1"])
+        budget.activate_subquestion("SQ1")
+        self.assertTrue(budget.reserve_fetch())
+        budget.record_tool_attempt(
+            tool_name="fetch_url",
+            target="https://unavailable.test/page",
+            payload={
+                "status": "error",
+                "url": "https://unavailable.test/page",
+                "error": "HTTP 503",
+            },
+        )
+        for tamper_global in (True, False):
+            with self.subTest(tamper_global=tamper_global):
+                tampered = budget.snapshot()
+                if tamper_global:
+                    tampered["fetch_calls"] = 0
+                tampered["subquestion_usage"]["SQ1"]["fetch_calls"] = 0
+
+                restored = ResearchBudget(EFFORT_POLICIES["low"])
+                with self.assertRaisesRegex(ValueError, "fetch attempt ledger"):
+                    restored.restore(tampered, strict_policy=True)
+
+                self.assertEqual(restored.snapshot()["fetch_calls"], 0)
+
+    def test_strict_restore_does_not_charge_budget_denied_fetch_attempt(self) -> None:
+        budget = ResearchBudget(EFFORT_POLICIES["low"])
+        budget.configure_subquestions(["SQ1"])
+        budget.activate_subquestion("SQ1")
+        for index in range(budget.policy.max_fetches):
+            self.assertTrue(budget.reserve_fetch())
+            budget.record_tool_attempt(
+                tool_name="fetch_url",
+                target=f"https://unavailable.test/{index}",
+                payload={
+                    "status": "error",
+                    "url": f"https://unavailable.test/{index}",
+                    "error": "HTTP 503",
+                },
+            )
+        self.assertFalse(budget.reserve_fetch())
+        denied_url = "https://unavailable.test/denied"
+        budget.record_tool_attempt(
+            tool_name="fetch_url",
+            target=denied_url,
+            payload={
+                "status": "budget_exceeded",
+                "url": denied_url,
+                **budget.budget_denial("fetch"),
+            },
+        )
+        snapshot = budget.snapshot()
+
+        restored = ResearchBudget(EFFORT_POLICIES["low"])
+        restored.restore(snapshot, strict_policy=True)
+
+        self.assertEqual(restored.snapshot(), snapshot)
 
     def test_incomplete_legacy_ledger_makes_search_metrics_unavailable(self) -> None:
         budget = ResearchBudget(EFFORT_POLICIES["low"])
