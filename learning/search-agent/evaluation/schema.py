@@ -44,6 +44,9 @@ class EvalTask(StrictModel):
     id: NonEmptyString
     question: NonEmptyString
     reference_answer: str | None = None
+    source_dataset: NonEmptyString | None = None
+    source_split: NonEmptyString | None = None
+    source_index: NonNegativeInt | None = None
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("id")
@@ -75,6 +78,34 @@ class EvalTask(StrictModel):
             msg = "reference_answer must be null or contain non-whitespace text"
             raise ValueError(msg)
         return value
+
+    @field_validator("source_dataset", "source_split")
+    @classmethod
+    def validate_source_identity(cls, value: str | None) -> str | None:
+        """Reject whitespace-only external provenance identifiers."""
+
+        if value is not None and not value.strip():
+            raise ValueError("source provenance identifiers must contain text")
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_provenance(self) -> EvalTask:
+        """Require external dataset provenance to be complete or wholly absent."""
+
+        provenance = (
+            self.source_dataset,
+            self.source_split,
+            self.source_index,
+        )
+        if any(item is not None for item in provenance) and not all(
+            item is not None for item in provenance
+        ):
+            msg = (
+                "source_dataset, source_split, and source_index must be "
+                "provided together"
+            )
+            raise ValueError(msg)
+        return self
 
 
 class FailureType(StrEnum):

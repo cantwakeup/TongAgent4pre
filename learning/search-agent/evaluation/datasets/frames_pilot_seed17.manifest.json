@@ -1,0 +1,46 @@
+{
+  "benchmark_status": "pipeline_pilot_not_a_formal_benchmark",
+  "dataset_id": "google/frames-benchmark",
+  "dataset_revision": "58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef",
+  "dataset_url": "https://huggingface.co/datasets/google/frames-benchmark",
+  "download_date": "2026-07-19",
+  "eligibility_rule": {
+    "requirements": [
+      "non-empty text question",
+      "non-empty reference answer",
+      "no explicit dependency on an attached, uploaded, or provided local artifact",
+      "at least one HTTP(S) Wikipedia provenance URL"
+    ],
+    "version": 1
+  },
+  "eligible_rows": 824,
+  "license": "apache-2.0",
+  "output_sha256": "sha256:e81379800805857fc04599c94f6174566e639d82eb0ccbd6b295ce72f328ee52",
+  "rejected_rows": 0,
+  "rejection_distribution": {},
+  "schema_version": 1,
+  "selected_count": 5,
+  "selected_source_indices": [
+    664,
+    191,
+    123,
+    16,
+    718
+  ],
+  "selected_task_ids": [
+    "frames-test-0664",
+    "frames-test-0191",
+    "frames-test-0123",
+    "frames-test-0016",
+    "frames-test-0718"
+  ],
+  "selection_algorithm": "python-random-v1-shuffle-eligible-then-first-n",
+  "selection_seed": 17,
+  "source_byte_size": 484887,
+  "source_config": "default",
+  "source_filename": "test.tsv",
+  "source_sha256": "sha256:4255093c93b595b5b04c7c8dde290b48ec87d72ca0fb0b760d9dd02740d669ff",
+  "source_split": "test",
+  "source_url": "https://huggingface.co/datasets/google/frames-benchmark/resolve/58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef/test.tsv",
+  "total_source_rows": 824
+}

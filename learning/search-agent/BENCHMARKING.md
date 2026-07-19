@@ -87,7 +87,7 @@ planner 调用也必须记入共同 model/token 预算与 trace，不能成为�
 输入是 UTF-8 JSONL，每个非空行严格符合：
 
 ```json
-{"id":"example-001","question":"需要研究的问题","reference_answer":null,"metadata":{"split":"pilot"}}
+{"id":"example-001","question":"需要研究的问题","reference_answer":"参考答案","source_dataset":"dataset/repo","source_split":"test","source_index":42,"metadata":{"split":"pilot"}}
 ```
 
 规则如下：
@@ -96,9 +96,11 @@ planner 调用也必须记入共同 model/token 预算与 trace，不能成为�
   必须是字母或数字；同一文件中不能重复。
 - `question` 必须是非空文本。
 - `reference_answer` 可以为 `null`；存在时必须为非空文本。
+- `source_dataset`、`source_split` 和非负整数 `source_index` 是可选的外部数据
+  provenance，但必须三者同时存在或同时省略。
 - `metadata` 是任意 JSON 对象，可保存原数据集 ID、split、许可证、facet、
   官方 evaluator 版本等不参与提问的元数据。
-- schema 不接受额外顶层字段。转换外部数据集时应把额外信息放进 `metadata`。
+- schema 不接受上述字段以外的额外顶层字段。其他外部信息放进 `metadata`。
 
 dataset digest 覆盖完整文件的原始字节，而不只是 `--limit` 选中的样本。
 runner 使用局部 PRNG 按 `--seed` 确定性打乱，再应用 `--limit`；同一文件、
@@ -430,13 +432,15 @@ judge、人工双评或明确的可执行 validator：
 
 ## 接入外部 benchmark
 
-仓库不捆绑 BrowseComp、FRAMES 或 DeepResearch Bench 的受许可数据、官方
-evaluator 或付费 judge。接入时遵循同一流程：
+仓库不捆绑 BrowseComp、完整 FRAMES、DeepResearch Bench、官方 evaluator 或
+付费 judge。仓库只保存了一个从官方 FRAMES revision 确定性抽取的 5 题
+pipeline pilot 子集、manifest 和选择器；它不是完整数据集或正式结果。接入其他
+release 时遵循同一流程：
 
 1. 固定数据集 release、split、许可证和原始文件 digest。
 2. 写一个只做 schema 转换的 importer；每条输出
-   `id/question/reference_answer/metadata`，并在 metadata 保留原始 ID 和
-   release。
+   `id/question/reference_answer/source_dataset/source_split/source_index/metadata`，
+   并在 metadata 保留 release、许可证和其他 provenance。
 3. 对转换后的 JSONL 计算并记录 digest，先用 `--dry-run`，再用小 `--limit`
    做 live pilot。
 4. 三个系统使用同一 resolved config、seed、预算、credential allowlist 和
@@ -462,6 +466,8 @@ release 指定的官方评分协议。尤其不能用 substring match 或手工�
 B3 而把同一题人工拆成多个只对 B3 可见的任务；若要评估 facet/子问题覆盖，
 这些 annotations 必须作为三系统共享的外部 judge 输入。最终指标使用所选
 FRAMES release 的官方 evaluator，本项目 whole-string EM 仍只是附加诊断。
+当前 5 题子集的固定 revision、eligibility、seed、hash 和下一步命令见
+[FORMAL_PILOT_PLAN.md](FORMAL_PILOT_PLAN.md)。
 
 ### DeepResearch Bench
 
