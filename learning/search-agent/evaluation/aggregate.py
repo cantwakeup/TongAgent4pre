@@ -46,6 +46,9 @@ _RESULT_COLUMNS = (
     "fairness_fingerprint",
     "artifact_directory",
 )
+FIXTURE_SMOKE_DISCLAIMER = (
+    "Deterministic offline fixture smoke test; not a formal benchmark result."
+)
 
 
 def aggregate_experiment(
@@ -90,6 +93,9 @@ def aggregate_experiment(
         "backend_kind": backend_kind,
         "fixture_smoke": (
             backend_kind == "fixture" if backend_kind is not None else None
+        ),
+        "benchmark_disclaimer": (
+            FIXTURE_SMOKE_DISCLAIMER if backend_kind == "fixture" else None
         ),
         "selected_result_count": len(selected),
         "incomplete_attempt_count": incomplete_attempts,
@@ -341,8 +347,7 @@ def _render_markdown(payload: dict[str, Any]) -> str:
     if payload["fixture_smoke"] is True:
         lines.extend(
             [
-                "> Warning: offline fixture executions are smoke tests, "
-                "not formal benchmark results.",
+                f"> {FIXTURE_SMOKE_DISCLAIMER}",
                 "",
             ]
         )

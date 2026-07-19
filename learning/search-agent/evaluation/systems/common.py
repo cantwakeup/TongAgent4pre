@@ -6,7 +6,7 @@ that must be identical across systems:
 * one hard :class:`ExecutionBudget` for model and tool calls;
 * one sanitized :class:`TraceCollector`;
 * TongAgent's production search/fetch semantic wrappers, with raw providers
-  injected underneath them;
+  injected underneath them and an evidence-free ledger for B1/B2;
 * conservative extraction of answers, citations, token usage, and failures;
 * standard, atomic intermediate artifacts.
 
@@ -75,6 +75,39 @@ _URL = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 _SOURCE_ID = re.compile(r"(?<![A-Za-z0-9])S[1-9][0-9]*(?![A-Za-z0-9])")
 _HEX_SHA = re.compile(r"^[0-9a-f]{7,64}$")
 SemanticStrategy = Literal["fixed", "adaptive"]
+
+
+class _BaselineNoEvidenceState:
+    """Explicitly disable Evidence Graph state for the B1/B2 baselines.
+
+    The three evaluated systems reuse the exact same production search/fetch
+    wrappers.  Those wrappers accept an injected retrieval ledger, but the
+    production ``ResearchBudget`` normally creates an ``EvidenceGraphStore``.
+    B1/B2 need the shared search semantics and counters without silently
+    acquiring TongAgent evidence state, so they inject this deliberately empty
+    state object instead.  No evidence tools are exposed to either baseline.
+    """
+
+    def cache_page(
+        self,
+        source_id: str,
+        content: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        del source_id, content, metadata
+
+    @staticmethod
+    def snapshot() -> dict[str, Any]:
+        return {"evidence_graph_available": False}
+
+    @staticmethod
+    def reset() -> None:
+        return None
+
+    @staticmethod
+    def restore(snapshot: Mapping[str, Any]) -> None:
+        del snapshot
 
 
 @dataclass(frozen=True)
@@ -690,6 +723,7 @@ def prepare_runtime(
     injected_model: BaseChatModel | None = None,
     semantic_policy: EffortPolicy | None = None,
     semantic_strategy: SemanticStrategy = "fixed",
+    enable_tongagent_evidence_state: bool = False,
 ) -> PreparedRuntime:
     """Resolve model and raw providers, then install shared semantic wrappers."""
 
@@ -725,6 +759,7 @@ def prepare_runtime(
         raw_tools,
         policy=semantic_policy,
         strategy=semantic_strategy,
+        enable_tongagent_evidence_state=enable_tongagent_evidence_state,
     )
     middleware = EvaluationMiddleware(
         execution_budget,
@@ -1066,6 +1101,7 @@ def _semantic_network_tools(
     *,
     policy: EffortPolicy | None = None,
     strategy: SemanticStrategy = "fixed",
+    enable_tongagent_evidence_state: bool = False,
 ) -> tuple[list[BaseTool], Any]:
     by_name = {item.name: item for item in raw_tools}
     raw_search = by_name.get("web_search")
@@ -1077,7 +1113,7 @@ def _semantic_network_tools(
     # This is the only TongAgent application import needed by B1/B2: both
     # baselines deliberately reuse the production provider semantics instead
     # of copying search/fetch wrappers into the evaluation package.
-    from search_agent import build_budgeted_tools  # noqa: PLC0415
+    from search_agent import ResearchBudget, build_budgeted_tools  # noqa: PLC0415
 
     limits = resolved_config.budget
     if policy is None:
@@ -1100,11 +1136,21 @@ def _semantic_network_tools(
     ):
         msg = "semantic policy network limits must equal the shared evaluation budget"
         raise ValueError(msg)
+    budget = (
+        None
+        if enable_tongagent_evidence_state
+        else ResearchBudget(
+            policy,
+            strategy=strategy,
+            evidence_graph=_BaselineNoEvidenceState(),
+        )
+    )
     return build_budgeted_tools(
         policy,
         strategy=strategy,
         raw_search_tool=raw_search,
         raw_fetch_tool=raw_fetch,
+        budget=budget,
     )
 
 

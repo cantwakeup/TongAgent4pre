@@ -133,6 +133,7 @@ class TongAgentRunner:
                 injected_model=self._model,
                 semantic_policy=policy,
                 semantic_strategy=_STRATEGY,
+                enable_tongagent_evidence_state=True,
             )
             planner = _build_accounted_planner(
                 task=task,

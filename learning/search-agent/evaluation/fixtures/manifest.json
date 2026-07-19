@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "fixture_id": "tongagent-stage-d-offline-smoke-v1",
+  "fixture_kind": "deterministic_offline_smoke",
+  "benchmark_status": "smoke_only_not_a_formal_benchmark",
+  "search_file": "search.json",
+  "page_file": "pages.json"
+}

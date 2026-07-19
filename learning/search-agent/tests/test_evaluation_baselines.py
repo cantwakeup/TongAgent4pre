@@ -10,6 +10,7 @@ from typing import Any
 import deepagents
 import pytest
 
+from evidence_graph import EvidenceGraphStore
 from evaluation import (
     BudgetLimits,
     CompletionStatus,
@@ -419,3 +420,43 @@ def test_baseline_modules_do_not_import_tongagent_graphs_or_profiles() -> None:
     assert deepagents.__version__ == "0.6.12"
     assert isinstance(get_runner("simple_react"), SimpleReactRunner)
     assert isinstance(get_runner("vanilla_deepagents"), VanillaDeepAgentsRunner)
+
+
+@pytest.mark.parametrize(
+    ("system_id", "runner_type"),
+    [
+        ("simple_react", SimpleReactRunner),
+        ("vanilla_deepagents", VanillaDeepAgentsRunner),
+    ],
+)
+def test_baselines_never_construct_or_write_tongagent_evidence_graph(
+    tmp_path: Path,
+    research_fixture: tuple[Path, FixtureBackend],
+    monkeypatch: pytest.MonkeyPatch,
+    system_id: str,
+    runner_type: type[SimpleReactRunner] | type[VanillaDeepAgentsRunner],
+) -> None:
+    fixture_dir, backend = research_fixture
+
+    def forbidden_evidence_graph_init(self: EvidenceGraphStore) -> None:
+        del self
+        raise AssertionError("B1/B2 must not construct TongAgent Evidence Graph state")
+
+    monkeypatch.setattr(EvidenceGraphStore, "__init__", forbidden_evidence_graph_init)
+    artifact_directory = tmp_path / "runs" / system_id / "no-evidence"
+    config = _config(
+        system_id=system_id,
+        fixture=backend,
+        fixture_dir=fixture_dir,
+        artifact_directory=artifact_directory,
+    )
+
+    result = runner_type(fixture_backend=backend).run(_research_task(), config)
+
+    assert result.completion_status == CompletionStatus.COMPLETED
+    assert result.evidence_count is None
+    assert result.structural_subquestion_coverage is None
+    budget = json.loads(
+        (artifact_directory / "native" / "budget.json").read_text(encoding="utf-8")
+    )
+    assert budget["research"]["evidence_graph_available"] is False

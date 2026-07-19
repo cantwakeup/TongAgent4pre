@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "benchmark_disclaimer": "Deterministic offline fixture smoke test; not a formal benchmark result.",
+  "sanitized_export": true,
+  "experiment_id": "stage-d-offline-smoke-final-20260719-a8",
+  "source_git_sha": "6d51f71715fca01fdb60ac749395953dec2da267",
+  "dataset_digest": "sha256:b0c8a12630cb71416009128d2f6bd1703a5418ef7926e1807ac73dc71a245487",
+  "fixture_revision": "6f09f8f239d324b03ff8f948e8dfb29dfeacdf3e24c20d146514a06b742b99e9",
+  "fairness_fingerprint": "sha256:d0609f6df2bfa994785e85f525398268037f3d2c1f6a7537685f48c499cec4b8",
+  "selected_result_count": 18,
+  "incomplete_attempt_count": 0,
+  "resume_validation": {
+    "fresh_executed": 18,
+    "fresh_skipped": 0,
+    "resume_executed": 0,
+    "resume_skipped": 18,
+    "result_hashes_unchanged": true,
+    "targeted_rerun_executed": 1,
+    "strict_validation": "passed"
+  },
+  "systems": [
+    {
+      "system_id": "simple_react",
+      "runs": 6,
+      "completion_distribution": {
+        "budget_exhausted": 1,
+        "completed": 5
+      },
+      "failure_distribution": {
+        "budget_exhausted": 1
+      },
+      "total_tool_calls": 22,
+      "mean_tool_calls": 3.6666666666666665,
+      "total_search_calls": 11,
+      "total_fetch_calls": 10,
+      "total_relevant_searches": 10,
+      "total_wall_time_seconds": 4.07722960699175,
+      "mean_wall_time_seconds": 0.6795382678319584,
+      "total_tokens": 19223
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "runs": 6,
+      "completion_distribution": {
+        "budget_exhausted": 1,
+        "completed": 5
+      },
+      "failure_distribution": {
+        "budget_exhausted": 1
+      },
+      "total_tool_calls": 22,
+      "mean_tool_calls": 3.6666666666666665,
+      "total_search_calls": 11,
+      "total_fetch_calls": 10,
+      "total_relevant_searches": 10,
+      "total_wall_time_seconds": 4.458978216993273,
+      "mean_wall_time_seconds": 0.7431630361655456,
+      "total_tokens": 73039
+    },
+    {
+      "system_id": "tongagent",
+      "runs": 6,
+      "completion_distribution": {
+        "budget_exhausted": 1,
+        "completed": 4,
+        "partial": 1
+      },
+      "failure_distribution": {
+        "budget_exhausted": 1
+      },
+      "total_tool_calls": 41,
+      "mean_tool_calls": 6.833333333333333,
+      "total_search_calls": 11,
+      "total_fetch_calls": 10,
+      "total_relevant_searches": 7,
+      "total_wall_time_seconds": 10.71475786199153,
+      "mean_wall_time_seconds": 1.7857929769985883,
+      "total_tokens": 280088
+    }
+  ],
+  "results": [
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-budget-resume",
+      "completion_status": "budget_exhausted",
+      "failure_type": "budget_exhausted",
+      "search_calls": 4,
+      "fetch_calls": 0,
+      "relevant_searches": 4,
+      "tool_calls": 5,
+      "wall_time_seconds": 0.6788646920031169,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-conflict",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 3,
+      "relevant_searches": 2,
+      "tool_calls": 5,
+      "wall_time_seconds": 0.6835898219869705,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-fetch-retry",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 3,
+      "relevant_searches": 1,
+      "tool_calls": 4,
+      "wall_time_seconds": 0.6822318829945289,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-nonempty-irrelevant",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 0,
+      "relevant_searches": 0,
+      "tool_calls": 1,
+      "wall_time_seconds": 0.6621382309967885,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-one-hop",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 2,
+      "relevant_searches": 1,
+      "tool_calls": 3,
+      "wall_time_seconds": 0.6829372060019523,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "simple_react",
+      "task_id": "fixture-two-source",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 2,
+      "relevant_searches": 2,
+      "tool_calls": 4,
+      "wall_time_seconds": 0.6874677730083931,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-budget-resume",
+      "completion_status": "budget_exhausted",
+      "failure_type": "budget_exhausted",
+      "search_calls": 4,
+      "fetch_calls": 0,
+      "relevant_searches": 4,
+      "tool_calls": 5,
+      "wall_time_seconds": 0.753277618001448,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-conflict",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 3,
+      "relevant_searches": 2,
+      "tool_calls": 5,
+      "wall_time_seconds": 0.7476970360003179,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-fetch-retry",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 3,
+      "relevant_searches": 1,
+      "tool_calls": 4,
+      "wall_time_seconds": 0.7467528799897991,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-nonempty-irrelevant",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 0,
+      "relevant_searches": 0,
+      "tool_calls": 1,
+      "wall_time_seconds": 0.7294063169974834,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-one-hop",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 2,
+      "relevant_searches": 1,
+      "tool_calls": 3,
+      "wall_time_seconds": 0.7427942610083846,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "vanilla_deepagents",
+      "task_id": "fixture-two-source",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 2,
+      "relevant_searches": 2,
+      "tool_calls": 4,
+      "wall_time_seconds": 0.7390501049958402,
+      "evidence_count": null,
+      "structural_subquestion_coverage": null
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-budget-resume",
+      "completion_status": "budget_exhausted",
+      "failure_type": "budget_exhausted",
+      "search_calls": 4,
+      "fetch_calls": 0,
+      "relevant_searches": 1,
+      "tool_calls": 6,
+      "wall_time_seconds": 1.8635937200015178,
+      "evidence_count": 0,
+      "structural_subquestion_coverage": 0.0
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-conflict",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 3,
+      "relevant_searches": 2,
+      "tool_calls": 10,
+      "wall_time_seconds": 2.4593042469932698,
+      "evidence_count": 3,
+      "structural_subquestion_coverage": 1.0
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-fetch-retry",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 3,
+      "relevant_searches": 1,
+      "tool_calls": 8,
+      "wall_time_seconds": 1.6939630289998604,
+      "evidence_count": 2,
+      "structural_subquestion_coverage": 1.0
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-nonempty-irrelevant",
+      "completion_status": "partial",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 0,
+      "relevant_searches": 0,
+      "tool_calls": 2,
+      "wall_time_seconds": 1.245436309996876,
+      "evidence_count": 0,
+      "structural_subquestion_coverage": 0.0
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-one-hop",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 1,
+      "fetch_calls": 2,
+      "relevant_searches": 1,
+      "tool_calls": 7,
+      "wall_time_seconds": 1.7883240100054536,
+      "evidence_count": 2,
+      "structural_subquestion_coverage": 1.0
+    },
+    {
+      "system_id": "tongagent",
+      "task_id": "fixture-two-source",
+      "completion_status": "completed",
+      "failure_type": null,
+      "search_calls": 2,
+      "fetch_calls": 2,
+      "relevant_searches": 2,
+      "tool_calls": 8,
+      "wall_time_seconds": 1.6641365459945519,
+      "evidence_count": 2,
+      "structural_subquestion_coverage": 1.0
+    }
+  ]
+}
