@@ -150,8 +150,8 @@ effect 之后、controller checkpoint 之前，同进程 replay 会返回首次�
 ```
 
 03D 历史 release smoke 曾以 `low/single/adaptive` 对两个 Python 官方页面跑通：
-`validation=passed`、`structural_subquestion_coverage=1.0`、2 个来源、2 个
-Claim、2 个 Evidence、
+`validation=passed`、旧产物字段 `coverage=1.0`（按当前定义等价于
+`structural_subquestion_coverage=1.0`）、2 个来源、2 个 Claim、2 个 Evidence、
 `escalation_count=1`，decision 序列为
 `continue -> expand_budget -> finish_success`。对应产物位于
 `output/runs/stage03d-release-final-20260717-a1-12314473/20260717T051353.769171Z-e343e56c/`。
@@ -323,6 +323,77 @@ provider-reported input/output/cache-read token。缺少 telemetry 时字段为
 用量也可能不进入外层消息；供应商没有返回账单或价目表，所以当前明确记录
 `planner_call_included=false` 和 `estimated_cost_usd=null`，不会用猜测价格
 冒充真实费用。
+
+## 正式评测入口
+
+可比较的 B1/B2/B3 实验使用独立的统一入口，而不是直接把三条
+`search_agent.py` 命令拼成表格。Stage D 确定性 fixture smoke 的 canonical
+验收入口是：
+
+```bash
+bash scripts/run_stage_d_smoke.sh \
+  "stage-d-offline-smoke-$(date +%Y%m%d-%H%M%S)"
+```
+
+脚本会先验证 dataset/fixture，再运行 18 个 fresh `task × system` worker，
+验证 resume 不改写既有 `result.json`，保留一次显式 rerun，最后调用严格
+validator 核验场景行为、provenance、公平性、空值和汇总。experiment ID 必须
+全新；脚本不会删除或覆盖旧实验。
+
+下面是底层 runner 的 dry-run 与单步运行方式，适合调试调度或自定义实验，不替代
+上面的完整 Stage D 验收：
+
+```bash
+.venv/bin/python -m evaluation.cli run \
+  --systems simple_react vanilla_deepagents tongagent \
+  --dataset evaluation/datasets/stage_d_offline_smoke.jsonl \
+  --experiment offline-smoke-v1 \
+  --seed 0 \
+  --dry-run
+
+.venv/bin/python -m evaluation.cli run \
+  --systems simple_react vanilla_deepagents tongagent \
+  --dataset evaluation/datasets/stage_d_offline_smoke.jsonl \
+  --experiment offline-smoke-v1 \
+  --seed 0
+```
+
+第一条只验证 JSONL、调度和公平性 fingerprint，不创建目录或调用模型/工具；
+第二条默认使用严格离线 fixture。每个 `task × system` 在全新 Python 进程中
+运行，共享同一模型、search/fetch 实现和全局 model/token/tool/wall-time
+预算；与上一节主研究 CLI 的 `run.json.api_usage` 边界不同，evaluation adapter
+会把 B3 的独立 planner 调用也纳入共同 model/token 预算和 trace。结果位于
+`output/evaluations/<experiment>/<system>/<task>/attempt-####/`，
+`result.json` 最后原子写入并作为唯一完成标志；同一实验再次执行默认安全
+resume，`--rerun` 会保留旧 attempt 并新建下一编号。汇总可单独重建：
+
+```bash
+.venv/bin/python -m evaluation.cli summarize \
+  --experiment offline-smoke-v1
+```
+
+已有 Stage D 实验可单独重跑严格 validator：
+
+```bash
+.venv/bin/python -m evaluation.validate_stage_d \
+  --dataset evaluation/datasets/stage_d_offline_smoke.jsonl \
+  --fixtures evaluation/fixtures \
+  --experiment-directory output/evaluations/<experiment-id> \
+  --require-rerun
+```
+
+默认 fixture 输出只能称为 smoke，不能作为真实研究质量排名。live pilot 必须
+显式配置 `backend_kind=live`，凭证只通过 `model.credential_env` 列出允许传入
+worker 的环境变量名，secret 值不会进入 resolved config 或产物。B1/B2 没有
+TongAgent Evidence Graph，因此其 `evidence_count` 和
+`structural_subquestion_coverage` 为 `null`，不能用 0 代替。
+
+严格 baseline 定义、公平预算、JSONL、live 配置、fresh-process/resume 及外部
+benchmark 接入见 [BENCHMARKING.md](BENCHMARKING.md)；每个 RunResult 字段、
+搜索语义、来源佐证分组、结构覆盖度和空值边界见
+[METRICS.md](METRICS.md)。本轮阶段状态、18-run 表、准确测试计数、commit
+provenance、已知风险和下一条 live pilot 命令见
+[BENCHMARK_READINESS_REPORT.md](BENCHMARK_READINESS_REPORT.md)。
 
 ## 安全边界
 

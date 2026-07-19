@@ -7,10 +7,12 @@ Agent 原型。项目目标不是单纯增加 Agent 数量，而是把长程网�
 
 当前实现已到
 [Stage 03D：证据驱动的自适应控制](learning/stages/stage-03d-adaptive-control.md)；
-`codex/benchmark-readiness` 分支正在把原型收敛为可安装、可离线测试，并能在
-公平预算下统一运行 B1（Simple ReAct）、B2（原生 Deep Agents）和
-B3（TongAgent）的评测版本。离线 fixture 只用于 smoke 和框架回归，不能称为
-正式 benchmark 结果。
+仓库可以通过锁定依赖建立可复现环境，并提供可离线测试的统一评测框架，能在
+公平预算下运行 B1（Simple ReAct）、B2（原生 Deep Agents）和
+B3（TongAgent）。离线 fixture 只用于 smoke 和框架回归，不能称为正式
+benchmark 结果；运行合同、严格验收入口与当前 readiness 判定见
+[TongAgent 统一评测指南](learning/search-agent/BENCHMARKING.md)和
+[Benchmark Readiness 报告](learning/search-agent/BENCHMARK_READINESS_REPORT.md)。
 
 ```text
 问题
@@ -49,8 +51,11 @@ bash scripts/check_tongagent.sh
 
 真实联网研究 Agent 的配置、运行和产物说明见
 [learning/search-agent/README.md](learning/search-agent/README.md)。正式 baseline
-不会由单次 `search_agent.py` 演示得出；Benchmark Ready Sprint 完成后，以统一
-B1/B2/B3 runner 和 `BENCHMARKING.md` 为正式评测入口。
+不会由单次 `search_agent.py` 演示得出；当前统一 B1/B2/B3 runner、确定性
+Stage D smoke 和 live pilot 的正式入口与边界，以
+[TongAgent 统一评测指南](learning/search-agent/BENCHMARKING.md)为准；仓库内
+还保存了
+[18-run 脱敏 smoke 汇总](learning/search-agent/evaluation/results/stage_d_offline_smoke/summary.md)。
 
 ## 上游基线
 
