@@ -8,7 +8,7 @@
       "OPENAI_API_KEY"
     ],
     "temperature": 0.0,
-    "max_output_tokens": 5000,
+    "max_output_tokens": 1024,
     "parameters": {
       "base_url": "https://api.openai.com/v1"
     }

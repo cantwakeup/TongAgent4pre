@@ -30,10 +30,15 @@ _RESULT_COLUMNS = (
     "run_id",
     "completion_status",
     "failure_type",
+    "budget_resource",
+    "answer_status",
+    "extracted_answer",
     "normalized_exact_match",
     "judge_score",
     "wall_time_seconds",
     "tool_calls",
+    "external_retrieval_calls",
+    "internal_tool_calls",
     "search_calls",
     "fetch_calls",
     "relevant_searches",
@@ -196,10 +201,17 @@ def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
         "failure_type": (
             result.failure_type.value if result.failure_type is not None else None
         ),
+        "budget_resource": (
+            result.budget_resource.value if result.budget_resource is not None else None
+        ),
+        "answer_status": result.answer_status.value,
+        "extracted_answer": result.extracted_answer,
         "normalized_exact_match": result.normalized_exact_match,
         "judge_score": result.judge_score,
         "wall_time_seconds": result.wall_time_seconds,
         "tool_calls": len(result.tool_calls),
+        "external_retrieval_calls": result.external_retrieval_calls,
+        "internal_tool_calls": result.internal_tool_calls,
         "search_calls": result.search_calls,
         "fetch_calls": result.fetch_calls,
         "relevant_searches": result.relevant_searches,
@@ -247,6 +259,16 @@ def _system_summaries(
             for result in results
             if result.relevant_searches is not None
         ]
+        external_values = [
+            result.external_retrieval_calls
+            for result in results
+            if result.external_retrieval_calls is not None
+        ]
+        internal_values = [
+            result.internal_tool_calls
+            for result in results
+            if result.internal_tool_calls is not None
+        ]
         cost_values = [
             result.estimated_cost
             for result in results
@@ -279,6 +301,18 @@ def _system_summaries(
                 ),
                 "total_tool_calls": sum(len(result.tool_calls) for result in results),
                 "mean_tool_calls": fmean(len(result.tool_calls) for result in results),
+                "known_external_retrieval_runs": len(external_values),
+                "total_external_retrieval_calls": (
+                    sum(external_values)
+                    if len(external_values) == len(results)
+                    else None
+                ),
+                "known_internal_tool_runs": len(internal_values),
+                "total_internal_tool_calls": (
+                    sum(internal_values)
+                    if len(internal_values) == len(results)
+                    else None
+                ),
                 "known_search_call_runs": len(search_values),
                 "total_search_calls": (
                     sum(search_values) if len(search_values) == len(results) else None
@@ -362,9 +396,9 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             "## System comparison",
             "",
             "| System | Backend | Smoke | Runs | Completed | Not completed | Exact match | "
-            "Mean tools | "
+            "Mean tools | External retrieval | Internal tools | "
             "Mean wall time (s) | Failure distribution |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for system in payload["systems"]:
@@ -382,7 +416,7 @@ def _render_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             "| {system} | {backend} | {smoke} | {runs} | {completed} | "
             "{failed} | {exact} | "
-            "{tools} | {wall} | {failures} |".format(
+            "{tools} | {external} | {internal} | {wall} | {failures} |".format(
                 system=system["system_id"],
                 backend=system["backend_kind"],
                 smoke=_markdown_value(system["fixture_smoke"]),
@@ -391,6 +425,8 @@ def _render_markdown(payload: dict[str, Any]) -> str:
                 failed=failed,
                 exact=_markdown_value(system["normalized_exact_match_rate"]),
                 tools=_markdown_value(system["mean_tool_calls"]),
+                external=_markdown_value(system["total_external_retrieval_calls"]),
+                internal=_markdown_value(system["total_internal_tool_calls"]),
                 wall=_markdown_value(system["mean_wall_time_seconds"]),
                 failures=failure_text,
             )
@@ -400,23 +436,29 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Selected task results",
             "",
-            "| System | Task | Attempt | Status | Failure | Exact match | "
-            "Tools | Wall time (s) | Evidence | Structural coverage | Tokens |",
-            "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| System | Task | Attempt | Status | Failure | Budget | Answer status | "
+            "Exact match | Tools | External | Internal | Wall time (s) | Evidence | "
+            "Structural coverage | Tokens |",
+            "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in payload["results"]:
         lines.append(
             "| {system} | {task} | {attempt} | {status} | {failure} | "
-            "{exact} | {tools} | {wall} | {evidence} | {coverage} | "
+            "{budget} | {answer_status} | {exact} | {tools} | {external} | "
+            "{internal} | {wall} | {evidence} | {coverage} | "
             "{tokens} |".format(
                 system=row["system_id"],
                 task=row["task_id"],
                 attempt=row["attempt"],
                 status=row["completion_status"],
                 failure=_markdown_value(row["failure_type"]),
+                budget=_markdown_value(row["budget_resource"]),
+                answer_status=row["answer_status"],
                 exact=_markdown_value(row["normalized_exact_match"]),
                 tools=row["tool_calls"],
+                external=_markdown_value(row["external_retrieval_calls"]),
+                internal=_markdown_value(row["internal_tool_calls"]),
                 wall=_markdown_value(row["wall_time_seconds"]),
                 evidence=_markdown_value(row["evidence_count"]),
                 coverage=_markdown_value(row["structural_subquestion_coverage"]),

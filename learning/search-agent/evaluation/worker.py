@@ -23,6 +23,7 @@ from .schema import (
     FailureDetail,
     FailureType,
     RunResult,
+    answer_for_exact_match,
     normalized_exact_match,
 )
 from .tracing import sanitize_trace_value
@@ -151,7 +152,7 @@ def _canonicalize_runner_result(
         "artifact_directory": str(Path(config.artifact_directory).resolve()),
         "fixture_smoke": config.backend_kind == "fixture",
         "normalized_exact_match": normalized_exact_match(
-            result.final_answer,
+            answer_for_exact_match(result.final_answer),
             task.reference_answer,
         ),
     }

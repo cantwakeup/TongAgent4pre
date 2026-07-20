@@ -66,6 +66,7 @@ from ..schema import (
 from ..tracing import TraceCollector, sanitize_trace_value
 from .common import (
     PreparedRuntime,
+    _attach_final_marker,
     build_evaluation_summarization_middleware,
     build_run_result,
     prepare_runtime,
@@ -248,6 +249,24 @@ class TongAgentRunner:
             "final_answer": report or None,
             "tongagent_state": native_state,
         }
+        final_answer_override: str | None = None
+        if runtime is not None and resolved_config.backend_kind == "live":
+            try:
+                final_answer_override = runtime.middleware.finalize_answer(
+                    runtime.model,
+                    question=task.question,
+                    draft=report or None,
+                )
+            except Exception as exc:
+                if caught is None:
+                    caught = exc
+                    trace.record(
+                        "run_exception",
+                        phase="final_synthesis",
+                        exception_type=type(exc).__name__,
+                        message=_safe_exception_message(exc),
+                    )
+                final_answer_override = _attach_final_marker(report or None, "ABSTAIN")
         finished_at = datetime.now(UTC)
         wall_time_seconds = max(0.0, time.perf_counter() - started)
         base_result = build_run_result(
@@ -265,6 +284,7 @@ class TongAgentRunner:
             caught=caught,
             evidence_count=evidence_count,
             structural_subquestion_coverage=structural_coverage,
+            final_answer_override=final_answer_override,
         )
         result = _apply_native_completion(
             base_result,
@@ -334,13 +354,6 @@ def _resolve_options(
     if max_escalations != _MAX_ESCALATIONS:
         raise ValueError("B3 main baseline requires max_escalations=2")
     policy = EFFORT_POLICIES[cast("EffortName", effort)]
-    configured_output = resolved_config.model.max_output_tokens
-    if configured_output != policy.max_output_tokens:
-        raise ValueError(
-            "TongAgent effort/model output cap mismatch: "
-            f"effort={policy.name} requires {policy.max_output_tokens}, "
-            f"configured={configured_output}"
-        )
     return {
         **raw_options,
         "effort": effort,
@@ -597,7 +610,9 @@ def _apply_native_completion(
     """Make plan/report integrity authoritative over a terminal chat message."""
 
     payload = base.model_dump(mode="python", exclude_none=False)
-    payload["final_answer"] = report or None
+    # The canonical output may append a strict FINAL_ANSWER contract to the
+    # native report. Keep that output while validating the native report
+    # independently below.
     payload["citations"] = citations
     if base.completion_status != CompletionStatus.COMPLETED:
         return RunResult.model_validate(payload)

@@ -480,6 +480,9 @@ def test_subprocess_timeout_writes_structured_terminal_failure(
     assert result is not None
     assert result.completion_status == CompletionStatus.TIMED_OUT
     assert result.failure_type == FailureType.DEADLINE_EXCEEDED
+    assert result.final_answer == "FINAL_ANSWER: ABSTAIN"
+    assert result.answer_status.value == "abstain"
+    assert result.extracted_answer is None
     assert result.search_calls is None
     assert result.fetch_calls is None
     assert result.relevant_searches is None
@@ -513,6 +516,9 @@ def test_parent_converts_worker_crash_before_result_to_terminal_failure(
     assert result.failure_type == FailureType.RUNNER_ERROR
     assert result.failure is not None
     assert result.failure.details == {"return_code": 7}
+    assert result.final_answer == "FINAL_ANSWER: ABSTAIN"
+    assert result.answer_status.value == "abstain"
+    assert result.extracted_answer is None
     assert result.search_calls is None
     assert result.fetch_calls is None
     assert result.relevant_searches is None

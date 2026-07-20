@@ -601,6 +601,7 @@ def build_failure_result(
         retryable=False,
         details=safe_details,
     )
+    final_answer = "FINAL_ANSWER: ABSTAIN"
     return RunResult(
         run_id=run_id,
         task_id=task.id,
@@ -612,7 +613,7 @@ def build_failure_result(
         started_at=started_at,
         finished_at=finished_at,
         wall_time_seconds=max(0.0, monotonic() - started_monotonic),
-        final_answer=None,
+        final_answer=final_answer,
         citations=[],
         tool_calls=[],
         # The parent cannot observe how far a timed-out or crashed worker ran.
@@ -631,7 +632,7 @@ def build_failure_result(
         artifact_directory=str(Path(config.artifact_directory).resolve()),
         fixture_smoke=config.backend_kind == "fixture",
         normalized_exact_match=normalized_exact_match(
-            None,
+            final_answer,
             task.reference_answer,
         ),
         judge_score=None,
@@ -707,7 +708,7 @@ def _canonical_trace_payload(result: RunResult, native: Path) -> dict[str, Any]:
 
 
 def _canonical_metrics_payload(result: RunResult) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "schema_version": 1,
         "run_id": result.run_id,
         "completion_status": result.completion_status.value,
@@ -731,10 +732,37 @@ def _canonical_metrics_payload(result: RunResult) -> dict[str, Any]:
             else None
         ),
     }
+    if (
+        result.external_retrieval_calls is not None
+        or result.internal_tool_calls is not None
+        or result.budget_resource is not None
+        or result.extracted_answer is not None
+        or "FINAL_ANSWER:" in (result.final_answer or "")
+    ):
+        payload.update(
+            {
+                "answer_status": result.answer_status.value,
+                "extracted_answer": result.extracted_answer,
+                "budget_accounting_version": result.budget_accounting_version,
+                "external_retrieval_calls": result.external_retrieval_calls,
+                "internal_tool_calls": result.internal_tool_calls,
+                "budget_resource": (
+                    result.budget_resource.value
+                    if result.budget_resource is not None
+                    else None
+                ),
+                "budget_snapshot": (
+                    result.budget_snapshot.model_dump(mode="json")
+                    if result.budget_snapshot is not None
+                    else None
+                ),
+            }
+        )
+    return payload
 
 
 def _canonical_failure_payload(result: RunResult) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "failure_type": (
             result.failure_type.value if result.failure_type is not None else None
         ),
@@ -744,6 +772,22 @@ def _canonical_failure_payload(result: RunResult) -> dict[str, Any]:
             else None
         ),
     }
+    if result.budget_resource is not None or result.budget_snapshot is not None:
+        payload.update(
+            {
+                "budget_resource": (
+                    result.budget_resource.value
+                    if result.budget_resource is not None
+                    else None
+                ),
+                "budget_snapshot": (
+                    result.budget_snapshot.model_dump(mode="json")
+                    if result.budget_snapshot is not None
+                    else None
+                ),
+            }
+        )
+    return payload
 
 
 def _validate_companion_artifacts(result_path: Path, result: RunResult) -> None:

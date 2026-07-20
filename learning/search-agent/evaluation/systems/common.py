@@ -43,15 +43,29 @@ from langchain.agents.middleware.types import (
 )
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.outputs import ChatResult
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from pydantic import JsonValue
 
 from agent_policy import EffortPolicy
 
-from ..budget import BudgetExceeded, ExecutionBudget, ModelCallReservation
+from ..budget import (
+    BudgetExceeded,
+    BudgetResource,
+    BudgetSnapshot,
+    ExecutionBudget,
+    ModelCallReservation,
+)
 from ..config import ResolvedConfig
 from ..offline import FixtureBackend, FixtureChatModel
 from ..schema import (
@@ -64,6 +78,8 @@ from ..schema import (
     TokenUsage,
     ToolCall,
     ToolCallStatus,
+    answer_for_exact_match,
+    extract_answer_contract,
     normalized_exact_match,
 )
 from ..tracing import TraceCollector, sanitize_trace_value
@@ -75,6 +91,8 @@ _URL = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 _SOURCE_ID = re.compile(r"(?<![A-Za-z0-9])S[1-9][0-9]*(?![A-Za-z0-9])")
 _HEX_SHA = re.compile(r"^[0-9a-f]{7,64}$")
 SemanticStrategy = Literal["fixed", "adaptive"]
+_FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE = 4_096
+_FINAL_SYNTHESIS_DRAFT_CHARS = 6_000
 
 
 class _BaselineNoEvidenceState:
@@ -138,6 +156,7 @@ class EvaluationMiddleware(AgentMiddleware):
         trace: TraceCollector,
         *,
         max_output_tokens: int,
+        reserve_final_synthesis: bool = False,
     ) -> None:
         super().__init__()
         self.execution_budget = execution_budget
@@ -153,6 +172,20 @@ class EvaluationMiddleware(AgentMiddleware):
         self._reasoning_tokens = 0
         self._known_usage_fields: set[str] = set()
         self._budget_denied = False
+        self._budget_failure: BudgetExceeded | None = None
+        self._final_evidence_fragments: list[str] = []
+        self._final_synthesis_reservation: ModelCallReservation | None = None
+        if reserve_final_synthesis:
+            token_reservation = max_output_tokens + _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE
+            reservation = execution_budget.require_model_call(
+                token_reservation=token_reservation
+            )
+            self._final_synthesis_reservation = reservation
+            self.trace.record(
+                "final_synthesis_reserved",
+                token_reservation=token_reservation,
+                budget=execution_budget.snapshot(),
+            )
 
     @property
     def budget_denied(self) -> bool:
@@ -160,6 +193,13 @@ class EvaluationMiddleware(AgentMiddleware):
 
         with self._lock:
             return self._budget_denied
+
+    @property
+    def budget_failure(self) -> BudgetExceeded | None:
+        """Return the exact terminal execution-budget denial, if any."""
+
+        with self._lock:
+            return self._budget_failure
 
     @property
     def tool_calls(self) -> list[ToolCall]:
@@ -259,6 +299,114 @@ class EvaluationMiddleware(AgentMiddleware):
             reservation=reservation,
         )
 
+    def external_tool_guard(self, tool_name: str) -> dict[str, JsonValue] | None:
+        """Reserve provider-facing retrieval after semantic slice checks pass."""
+
+        try:
+            self.execution_budget.require_tool(tool_name)
+        except BudgetExceeded as exc:
+            with self._lock:
+                self._budget_denied = True
+                self._budget_failure = exc
+            snapshot = exc.snapshot or self.execution_budget.snapshot()
+            self.trace.record(
+                "external_retrieval_budget_exceeded",
+                tool_name=tool_name,
+                budget_resource=exc.resource,
+                attempted=exc.attempted,
+                budget=snapshot,
+            )
+            return {
+                "status": "budget_exceeded",
+                "outcome": "budget_exceeded",
+                "reason": "execution_budget_exceeded",
+                "budget_resource": exc.resource.value,
+                "budget_snapshot": cast(
+                    "JsonValue",
+                    snapshot.model_dump(mode="json"),
+                ),
+                "attempted": cast(
+                    "JsonValue",
+                    sanitize_trace_value(exc.attempted),
+                ),
+                "provider_success": False,
+                "provider_outcome": "not_called",
+                "retryable": False,
+            }
+        return None
+
+    def finalize_answer(
+        self,
+        model: BaseChatModel,
+        *,
+        question: str,
+        draft: str | None,
+    ) -> str:
+        """Use the held common reservation for one strict final synthesis."""
+
+        with self._lock:
+            reservation = self._final_synthesis_reservation
+            self._final_synthesis_reservation = None
+        if reservation is None:
+            return draft or ""
+
+        clean_draft = _remove_final_answer_lines(draft or "")
+        with self._lock:
+            evidence_context = "\n\n".join(self._final_evidence_fragments)
+        prompt = (
+            "Question:\n"
+            f"{question[:2_000]}\n\n"
+            "Agent draft and retrieved findings:\n"
+            f"{clean_draft[:_FINAL_SYNTHESIS_DRAFT_CHARS]}\n\n"
+            "Retrieved evidence context (may be partial):\n"
+            f"{evidence_context[:_FINAL_SYNTHESIS_DRAFT_CHARS]}\n\n"
+            "Return exactly one line in this form:\n"
+            "FINAL_ANSWER: <concise core answer>\n"
+            "Use FINAL_ANSWER: ABSTAIN only when the draft contains no usable "
+            "evidence. With partial usable evidence, perform a best-effort "
+            "synthesis. Never use a browsing limitation or request for more "
+            "information as the candidate answer."
+        )
+        label = "evaluation.final_synthesis"
+        started = time.perf_counter()
+        try:
+            response = model.invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are a strict answer extractor. Do not add "
+                            "explanation, citations, or formatting outside the "
+                            "single FINAL_ANSWER line."
+                        )
+                    ),
+                    HumanMessage(content=prompt),
+                ]
+            )
+        except Exception:
+            self.cancel_external_model_call(reservation, label=label)
+            raise
+
+        duration = max(0.0, time.perf_counter() - started)
+        try:
+            self.record_external_model_response(
+                response,
+                label=label,
+                reservation=reservation,
+            )
+        except BudgetExceeded:
+            # Actual provider usage is already settled and the exact token
+            # denial recorded. Preserve the obtained final answer.
+            pass
+        marker = _strict_final_marker(_message_text(response))
+        self.trace.record(
+            "final_synthesis_finished",
+            duration_seconds=duration,
+            marker=marker,
+            budget=self.execution_budget.snapshot(),
+        )
+        prefix = clean_draft.rstrip()
+        return f"{prefix}\n\n{marker}".lstrip() if prefix else marker
+
     def wrap_model_call(
         self,
         request: ModelRequest[Any],
@@ -328,11 +476,24 @@ class EvaluationMiddleware(AgentMiddleware):
         arguments = _sanitized_arguments(raw_call.get("args", {}))
         started_at = datetime.now(UTC)
         started = time.perf_counter()
-        if not self.execution_budget.try_reserve_tool(tool_name):
+        denial: BudgetExceeded | None = None
+        if not _is_external_retrieval_tool(tool_name):
+            try:
+                self.execution_budget.require_tool(tool_name)
+            except BudgetExceeded as exc:
+                denial = exc
+        if denial is not None:
             duration = max(0.0, time.perf_counter() - started)
             finished_at = datetime.now(UTC)
             with self._lock:
                 self._budget_denied = True
+                self._budget_failure = denial
+            snapshot = denial.snapshot or self.execution_budget.snapshot()
+            failure = _failure_from_exception(
+                denial,
+                default_type=FailureType.BUDGET_EXHAUSTED,
+                stage=tool_name,
+            )
             tool_call = ToolCall(
                 call_id=call_id,
                 tool_name=tool_name,
@@ -345,10 +506,10 @@ class EvaluationMiddleware(AgentMiddleware):
                     "status": "budget_exceeded",
                     "tool": tool_name,
                 },
+                failure=failure,
                 metadata={
-                    "execution_budget": self.execution_budget.snapshot().model_dump(
-                        mode="json"
-                    )
+                    "budget_resource": denial.resource.value,
+                    "execution_budget": snapshot.model_dump(mode="json"),
                 },
             )
             self._append_tool_call(tool_call)
@@ -357,7 +518,9 @@ class EvaluationMiddleware(AgentMiddleware):
                 call_id=call_id,
                 tool_name=tool_name,
                 arguments=arguments,
-                budget=self.execution_budget.snapshot(),
+                budget_resource=denial.resource,
+                budget=snapshot,
+                attempted=denial.attempted,
             )
             return ToolMessage(
                 content=json.dumps(
@@ -413,13 +576,49 @@ class EvaluationMiddleware(AgentMiddleware):
 
         duration = max(0.0, time.perf_counter() - started)
         finished_at = datetime.now(UTC)
+        fragment = _ephemeral_tool_evidence(tool_name, response)
+        if fragment:
+            with self._lock:
+                self._final_evidence_fragments.append(fragment)
         parsed_result = _tool_response_value(response)
         semantic_failure = _semantic_tool_failure(tool_name, parsed_result)
-        status = (
-            ToolCallStatus.ERROR
-            if semantic_failure is not None
-            else ToolCallStatus.SUCCESS
-        )
+        if (
+            semantic_failure is not None
+            and semantic_failure.failure_type == FailureType.BUDGET_EXHAUSTED
+            and semantic_failure.details.get("budget_resource")
+            != BudgetResource.SUBQUESTION_SLICE.value
+        ):
+            raw_resource = semantic_failure.details.get("budget_resource")
+            try:
+                resource = BudgetResource(str(raw_resource))
+            except ValueError:
+                resource = (
+                    BudgetResource.SEARCH
+                    if _tool_failure_type(tool_name) == FailureType.SEARCH_ERROR
+                    else BudgetResource.FETCH
+                )
+            snapshot = self.execution_budget.snapshot()
+            with self._lock:
+                self._budget_denied = True
+                if self._budget_failure is None:
+                    self._budget_failure = BudgetExceeded(
+                        resource,
+                        snapshot=snapshot,
+                        attempted={
+                            "tool_name": tool_name,
+                            "semantic_result": sanitize_trace_value(parsed_result),
+                        },
+                    )
+        if semantic_failure is None:
+            status = ToolCallStatus.SUCCESS
+        elif (
+            semantic_failure.failure_type == FailureType.BUDGET_EXHAUSTED
+            and semantic_failure.details.get("budget_resource")
+            != BudgetResource.SUBQUESTION_SLICE.value
+        ):
+            status = ToolCallStatus.BUDGET_EXCEEDED
+        else:
+            status = ToolCallStatus.ERROR
         metadata = _tool_result_metadata(parsed_result)
         tool_call = ToolCall(
             call_id=call_id,
@@ -455,10 +654,28 @@ class EvaluationMiddleware(AgentMiddleware):
         estimated_input_tokens: int,
     ) -> ModelCallReservation:
         token_reservation = estimated_input_tokens + self._max_output_tokens
-        reservation = self.execution_budget.try_reserve_model_call(
-            token_reservation=token_reservation
-        )
-        if reservation is not None:
+        try:
+            reservation = self.execution_budget.require_model_call(
+                token_reservation=token_reservation
+            )
+        except BudgetExceeded as exc:
+            with self._lock:
+                self._budget_denied = True
+                self._budget_failure = exc
+            snapshot = exc.snapshot or self.execution_budget.snapshot()
+            self.trace.record(
+                "model_call_budget_exceeded",
+                label=label,
+                budget_resource=exc.resource,
+                attempted={
+                    **exc.attempted,
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "max_output_tokens": self._max_output_tokens,
+                },
+                budget=snapshot,
+            )
+            raise
+        else:
             self.trace.record(
                 "model_call_started",
                 label=label,
@@ -468,16 +685,6 @@ class EvaluationMiddleware(AgentMiddleware):
                 budget=self.execution_budget.snapshot(),
             )
             return reservation
-        with self._lock:
-            self._budget_denied = True
-        snapshot = self.execution_budget.snapshot()
-        self.trace.record(
-            "model_call_budget_exceeded",
-            label=label,
-            budget=snapshot,
-        )
-        resource = "deadline" if snapshot.deadline_exceeded else "model_or_token"
-        raise BudgetExceeded(resource)
 
     def _record_model_response(
         self,
@@ -536,7 +743,18 @@ class EvaluationMiddleware(AgentMiddleware):
             return
         with self._lock:
             self._budget_denied = True
-        raise BudgetExceeded("tokens")
+        denial = BudgetExceeded(
+            BudgetResource.TOKEN,
+            snapshot=self.execution_budget.snapshot(),
+            attempted={
+                "label": label,
+                "actual_tokens": accounted_total,
+                "reserved_tokens": reservation.reserved_tokens,
+            },
+        )
+        with self._lock:
+            self._budget_failure = denial
+        raise denial
 
     def _merge_usage(self, usage: Mapping[str, int | None]) -> None:
         with self._lock:
@@ -678,9 +896,18 @@ class EvaluationSummarizationMiddleware(SummarizationMiddleware):
         middleware = model.evaluation_middleware
         if not middleware.budget_denied:
             return
+        failure = middleware.budget_failure
+        if failure is not None:
+            raise failure
         snapshot = middleware.execution_budget.snapshot()
-        resource = "deadline" if snapshot.deadline_exceeded else "model_or_token"
-        raise BudgetExceeded(resource)
+        raise BudgetExceeded(
+            (
+                BudgetResource.DEADLINE
+                if snapshot.deadline_exceeded
+                else BudgetResource.TOKEN
+            ),
+            snapshot=snapshot,
+        )
 
 
 def build_evaluation_summarization_middleware(
@@ -754,17 +981,19 @@ def prepare_runtime(
         raw_tools = _live_raw_tools()
         model = injected_model or _live_model(resolved_config)
 
+    middleware = EvaluationMiddleware(
+        execution_budget,
+        trace,
+        max_output_tokens=resolved_config.model.max_output_tokens or 1,
+        reserve_final_synthesis=resolved_config.backend_kind == "live",
+    )
     semantic_tools, research_budget = _semantic_network_tools(
         resolved_config,
         raw_tools,
         policy=semantic_policy,
         strategy=semantic_strategy,
         enable_tongagent_evidence_state=enable_tongagent_evidence_state,
-    )
-    middleware = EvaluationMiddleware(
-        execution_budget,
-        trace,
-        max_output_tokens=resolved_config.model.max_output_tokens or 1,
+        external_guard=middleware.external_tool_guard,
     )
     trace.record(
         "runtime_prepared",
@@ -843,6 +1072,26 @@ def run_graph_system(
             message=_safe_message(exc),
         )
 
+    final_answer_override: str | None = None
+    if runtime is not None and resolved_config.backend_kind == "live":
+        draft = extract_final_answer(native_output)
+        try:
+            final_answer_override = runtime.middleware.finalize_answer(
+                runtime.model,
+                question=task.question,
+                draft=draft,
+            )
+        except Exception as exc:
+            if caught is None:
+                caught = exc
+                trace.record(
+                    "run_exception",
+                    exception_type=type(exc).__name__,
+                    message=_safe_message(exc),
+                    stage="final_synthesis",
+                )
+            final_answer_override = _attach_final_marker(draft, "ABSTAIN")
+
     finished_at = datetime.now(UTC)
     wall_time_seconds = max(0.0, time.perf_counter() - started)
     result = build_run_result(
@@ -858,6 +1107,7 @@ def run_graph_system(
         trace=trace,
         native_output=native_output,
         caught=caught,
+        final_answer_override=final_answer_override,
     )
     write_intermediate_artifacts(
         artifact_directory,
@@ -889,11 +1139,16 @@ def build_run_result(
     caught: Exception | None,
     evidence_count: int | None = None,
     structural_subquestion_coverage: float | None = None,
+    final_answer_override: str | None = None,
 ) -> RunResult:
     """Build a truthful result from canonical runtime observations."""
 
     del trace
-    final_answer = extract_final_answer(native_output)
+    final_answer = (
+        final_answer_override
+        if final_answer_override is not None
+        else extract_final_answer(native_output)
+    )
     tool_calls = runtime.middleware.tool_calls if runtime is not None else []
     token_usage = runtime.middleware.token_usage if runtime is not None else None
     research_snapshot = (
@@ -905,6 +1160,13 @@ def build_run_result(
         final_answer=final_answer,
         runtime=runtime,
         deadline_exceeded=execution_snapshot.deadline_exceeded,
+    )
+    budget_resource, budget_snapshot = _terminal_budget_observation(
+        completion_status=completion_status,
+        failure=failure,
+        caught=caught,
+        runtime=runtime,
+        execution_snapshot=execution_snapshot,
     )
     citations = extract_citations(final_answer, tool_calls)
     return RunResult(
@@ -921,6 +1183,8 @@ def build_run_result(
         final_answer=final_answer,
         citations=citations,
         tool_calls=tool_calls,
+        external_retrieval_calls=execution_snapshot.external_retrieval_calls,
+        internal_tool_calls=execution_snapshot.internal_tool_calls,
         search_calls=execution_snapshot.search_calls,
         fetch_calls=execution_snapshot.fetch_calls,
         relevant_searches=_nonnegative_metric(
@@ -934,10 +1198,13 @@ def build_run_result(
         completion_status=completion_status,
         failure_type=failure.failure_type if failure is not None else None,
         failure=failure,
+        budget_resource=budget_resource,
+        budget_snapshot=budget_snapshot,
+        budget_accounting_version=2,
         artifact_directory=resolved_config.artifact_directory,
         fixture_smoke=resolved_config.backend_kind == "fixture",
         normalized_exact_match=normalized_exact_match(
-            final_answer,
+            answer_for_exact_match(final_answer),
             task.reference_answer,
         ),
         judge_score=None,
@@ -1102,6 +1369,7 @@ def _semantic_network_tools(
     policy: EffortPolicy | None = None,
     strategy: SemanticStrategy = "fixed",
     enable_tongagent_evidence_state: bool = False,
+    external_guard: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> tuple[list[BaseTool], Any]:
     by_name = {item.name: item for item in raw_tools}
     raw_search = by_name.get("web_search")
@@ -1151,6 +1419,7 @@ def _semantic_network_tools(
         raw_search_tool=raw_search,
         raw_fetch_tool=raw_fetch,
         budget=budget,
+        external_guard=external_guard,
     )
 
 
@@ -1298,6 +1567,58 @@ def _tool_response_value(response: ToolMessage | Command[Any]) -> JsonValue:
     return sanitize_trace_value(raw)
 
 
+def _ephemeral_tool_evidence(
+    tool_name: str,
+    response: ToolMessage | Command[Any],
+) -> str:
+    """Build bounded in-memory synthesis context without persisting page bodies."""
+
+    if not isinstance(response, ToolMessage):
+        return ""
+    raw: Any = response.content
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(raw, Mapping):
+        return ""
+    status = str(raw.get("status", "success")).casefold()
+    if status not in {"success", "ok", "completed"}:
+        return ""
+    normalized = tool_name.strip().casefold()
+    pieces: list[str] = []
+    if normalized in {"web_search", "search"}:
+        results = raw.get("results")
+        if not isinstance(results, Sequence) or isinstance(
+            results,
+            (str, bytes, bytearray),
+        ):
+            return ""
+        for item in list(results)[:3]:
+            if not isinstance(item, Mapping):
+                continue
+            title = str(item.get("title", "")).strip()[:300]
+            snippet = str(item.get("snippet", "")).strip()[:800]
+            url = str(item.get("url", "")).strip()[:1_000]
+            if title or snippet:
+                pieces.append(f"SEARCH: {title}\n{snippet}\n{url}".strip())
+    elif normalized in {"fetch_url", "fetch", "open_page", "open_url"}:
+        content = raw.get("content") or raw.get("page_content")
+        if not isinstance(content, str) or not content.strip():
+            return ""
+        title = str(raw.get("title", "")).strip()[:300]
+        url = str(raw.get("url") or raw.get("requested_url") or "").strip()[:1_000]
+        pieces.append(f"FETCH: {title}\n{content.strip()[:2_500]}\n{url}".strip())
+    if not pieces:
+        return ""
+    sanitized = sanitize_trace_value(
+        "\n\n".join(pieces),
+        max_text_chars=6_000,
+    )
+    return sanitized if isinstance(sanitized, str) else ""
+
+
 def _semantic_tool_failure(
     tool_name: str,
     result: JsonValue,
@@ -1313,16 +1634,71 @@ def _semantic_tool_failure(
     elif status == "fixture_not_found":
         failure_type = FailureType.FIXTURE_NOT_FOUND
     else:
-        failure_type = _tool_failure_type(tool_name)
+        failure_type = _semantic_failure_type(tool_name, result)
     raw_message = result.get("error") or result.get("message") or status
     message = str(raw_message).strip() or status
+    details: dict[str, JsonValue] = {"provider_status": status}
+    reason = result.get("reason")
+    if status == "budget_exceeded":
+        declared_resource = result.get("budget_resource")
+        if isinstance(declared_resource, str):
+            try:
+                details["budget_resource"] = BudgetResource(declared_resource).value
+            except ValueError:
+                declared_resource = None
+        if not isinstance(declared_resource, str):
+            details["budget_resource"] = (
+                BudgetResource.SUBQUESTION_SLICE.value
+                if reason in {"subquestion_budget_exceeded", "no_active_subquestion"}
+                else (
+                    BudgetResource.SEARCH.value
+                    if _tool_failure_type(tool_name) == FailureType.SEARCH_ERROR
+                    else BudgetResource.FETCH.value
+                )
+            )
+        for key in (
+            "active_subquestion_id",
+            "budget_snapshot",
+            "subquestion_limits",
+            "subquestion_usage",
+        ):
+            if key in result:
+                details[key] = cast("JsonValue", result[key])
+    taxonomy = result.get("failure_taxonomy") or result.get("failure_type")
+    if isinstance(taxonomy, str):
+        details["failure_taxonomy"] = taxonomy
     return FailureDetail(
         failure_type=failure_type,
         message=message,
         stage=tool_name,
         retryable=bool(result.get("retryable", False)),
-        details={"provider_status": status},
+        details=details,
     )
+
+
+def _semantic_failure_type(
+    tool_name: str,
+    result: Mapping[str, Any],
+) -> FailureType:
+    taxonomy = result.get("failure_taxonomy") or result.get("failure_type")
+    normalized = str(taxonomy or "").strip().casefold()
+    aliases = {
+        "access_blocked": FailureType.ACCESS_BLOCKED,
+        "http_403": FailureType.ACCESS_BLOCKED,
+        "rate_limited": FailureType.RATE_LIMITED,
+        "http_429": FailureType.RATE_LIMITED,
+        "network_timeout": FailureType.NETWORK_TIMEOUT,
+        "timeout": FailureType.NETWORK_TIMEOUT,
+        "dns_rejected": FailureType.DNS_REJECTED,
+        "dns_error": FailureType.DNS_REJECTED,
+        "dns_rebinding": FailureType.SECURITY_REJECTED,
+        "redirect_rejected": FailureType.SECURITY_REJECTED,
+        "security_rejected": FailureType.SECURITY_REJECTED,
+        "ssrf_rejected": FailureType.SECURITY_REJECTED,
+        "private_address": FailureType.SECURITY_REJECTED,
+        "userinfo_rejected": FailureType.SECURITY_REJECTED,
+    }
+    return aliases.get(normalized, _tool_failure_type(tool_name))
 
 
 def _tool_result_metadata(result: JsonValue) -> dict[str, JsonValue]:
@@ -1341,6 +1717,7 @@ def _tool_result_metadata(result: JsonValue) -> dict[str, JsonValue]:
         "retryable",
         "attempt_id",
         "source_id",
+        "budget_resource",
     ):
         value = result.get(key)
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -1357,6 +1734,17 @@ def _tool_failure_type(tool_name: str) -> FailureType:
     return FailureType.TOOL_ERROR
 
 
+def _is_external_retrieval_tool(tool_name: str) -> bool:
+    return tool_name.strip().casefold() in {
+        "web_search",
+        "search",
+        "fetch_url",
+        "fetch",
+        "open_page",
+        "open_url",
+    }
+
+
 def _completion_and_failure(
     *,
     caught: Exception | None,
@@ -1365,10 +1753,20 @@ def _completion_and_failure(
     deadline_exceeded: bool,
 ) -> tuple[CompletionStatus, FailureDetail | None]:
     if caught is not None:
-        failure = _failure_from_exception(
-            caught,
-            default_type=FailureType.RUNNER_ERROR,
-            stage="run",
+        failure = (
+            FailureDetail(
+                failure_type=FailureType.DEADLINE_EXCEEDED,
+                message=_safe_message(caught),
+                stage="run",
+                retryable=True,
+                details={"exception_type": type(caught).__name__},
+            )
+            if isinstance(caught, TimeoutError) and deadline_exceeded
+            else _failure_from_exception(
+                caught,
+                default_type=FailureType.RUNNER_ERROR,
+                stage="run",
+            )
         )
         if failure.failure_type == FailureType.BUDGET_EXHAUSTED:
             return CompletionStatus.BUDGET_EXHAUSTED, failure
@@ -1386,6 +1784,21 @@ def _completion_and_failure(
             ),
         )
     if runtime is not None and runtime.middleware.budget_denied:
+        denial = runtime.middleware.budget_failure
+        if denial is not None:
+            status = (
+                CompletionStatus.TIMED_OUT
+                if denial.resource == BudgetResource.DEADLINE
+                else CompletionStatus.BUDGET_EXHAUSTED
+            )
+            return (
+                status,
+                _failure_from_exception(
+                    denial,
+                    default_type=FailureType.BUDGET_EXHAUSTED,
+                    stage="run",
+                ),
+            )
         return (
             CompletionStatus.BUDGET_EXHAUSTED,
             FailureDetail(
@@ -1419,6 +1832,45 @@ def _completion_and_failure(
     return CompletionStatus.COMPLETED, None
 
 
+def _terminal_budget_observation(
+    *,
+    completion_status: CompletionStatus,
+    failure: FailureDetail | None,
+    caught: Exception | None,
+    runtime: PreparedRuntime | None,
+    execution_snapshot: BudgetSnapshot,
+) -> tuple[BudgetResource | None, BudgetSnapshot | None]:
+    """Return the exact denial captured when a terminal resource was refused."""
+
+    if completion_status not in {
+        CompletionStatus.BUDGET_EXHAUSTED,
+        CompletionStatus.TIMED_OUT,
+    }:
+        return None, None
+    if completion_status == CompletionStatus.TIMED_OUT:
+        if (
+            isinstance(caught, BudgetExceeded)
+            and caught.resource == BudgetResource.DEADLINE
+        ):
+            return BudgetResource.DEADLINE, caught.snapshot or execution_snapshot
+        return BudgetResource.DEADLINE, execution_snapshot
+    if isinstance(caught, BudgetExceeded):
+        return caught.resource, caught.snapshot or execution_snapshot
+    if isinstance(caught, GraphRecursionError):
+        return BudgetResource.RECURSION, execution_snapshot
+    if runtime is not None and runtime.middleware.budget_failure is not None:
+        denial = runtime.middleware.budget_failure
+        return denial.resource, denial.snapshot or execution_snapshot
+    if completion_status == CompletionStatus.BUDGET_EXHAUSTED and failure is not None:
+        raw = failure.details.get("budget_resource")
+        if isinstance(raw, str):
+            try:
+                return BudgetResource(raw), execution_snapshot
+            except ValueError:
+                pass
+    return None, None
+
+
 def _failure_from_exception(
     exc: Exception,
     *,
@@ -1428,12 +1880,15 @@ def _failure_from_exception(
     if isinstance(exc, BudgetExceeded):
         failure_type = (
             FailureType.DEADLINE_EXCEEDED
-            if "deadline" in exc.resource
+            if exc.resource == BudgetResource.DEADLINE
             else FailureType.BUDGET_EXHAUSTED
         )
         retryable = False
+    elif isinstance(exc, GraphRecursionError):
+        failure_type = FailureType.BUDGET_EXHAUSTED
+        retryable = False
     elif isinstance(exc, TimeoutError):
-        failure_type = FailureType.DEADLINE_EXCEEDED
+        failure_type = default_type
         retryable = True
     elif type(exc).__name__ == "FixtureFormatError":
         failure_type = FailureType.INVALID_OUTPUT
@@ -1441,12 +1896,27 @@ def _failure_from_exception(
     else:
         failure_type = default_type
         retryable = False
+    details: dict[str, JsonValue] = {"exception_type": type(exc).__name__}
+    if isinstance(exc, BudgetExceeded):
+        details["budget_resource"] = exc.resource.value
+        if exc.snapshot is not None:
+            details["budget_snapshot"] = cast(
+                "JsonValue",
+                exc.snapshot.model_dump(mode="json"),
+            )
+        if exc.attempted:
+            details["attempted"] = cast(
+                "JsonValue",
+                sanitize_trace_value(exc.attempted),
+            )
+    elif isinstance(exc, GraphRecursionError):
+        details["budget_resource"] = BudgetResource.RECURSION.value
     return FailureDetail(
         failure_type=failure_type,
         message=_safe_message(exc),
         stage=stage,
         retryable=retryable,
-        details={"exception_type": type(exc).__name__},
+        details=details,
     )
 
 
@@ -1483,6 +1953,27 @@ def _content_text(content: Any) -> str | None:
         joined = "\n".join(part.strip() for part in parts if part.strip())
         return joined or None
     return None
+
+
+def _remove_final_answer_lines(value: str) -> str:
+    return re.sub(
+        r"(?im)^[ \t]*FINAL_ANSWER[ \t]*:[^\n\r]*(?:\r?\n)?",
+        "",
+        value,
+    ).strip()
+
+
+def _strict_final_marker(value: str | None) -> str:
+    status, answer = extract_answer_contract(value)
+    if status.value == "answer" and answer is not None:
+        return f"FINAL_ANSWER: {answer}"
+    return "FINAL_ANSWER: ABSTAIN"
+
+
+def _attach_final_marker(draft: str | None, value: str) -> str:
+    prefix = _remove_final_answer_lines(draft or "")
+    marker = f"FINAL_ANSWER: {value}"
+    return f"{prefix}\n\n{marker}".lstrip() if prefix else marker
 
 
 def write_intermediate_artifacts(

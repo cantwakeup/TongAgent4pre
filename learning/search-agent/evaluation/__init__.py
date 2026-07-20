@@ -2,6 +2,7 @@
 
 from .budget import (
     BudgetExceeded,
+    BudgetResource,
     BudgetSnapshot,
     ExecutionBudget,
     ModelCallReservation,
@@ -22,6 +23,7 @@ from .judging import (
     register_evaluation_judge,
 )
 from .schema import (
+    AnswerStatus,
     Citation,
     CompletionStatus,
     EvalTask,
@@ -41,8 +43,10 @@ from .tracing import TraceCollector, sanitize_trace_value
 
 __all__ = [
     "BudgetExceeded",
+    "BudgetResource",
     "BudgetLimits",
     "BudgetSnapshot",
+    "AnswerStatus",
     "Citation",
     "CompletionStatus",
     "EvalTask",

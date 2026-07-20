@@ -77,10 +77,12 @@ def test_frames_pilot_config_caps_fifteen_run_token_cost(tmp_path: Path) -> None
     }
     assert all(config.budget.max_total_tokens == 50_000 for config in configs)
     assert all(config.budget.max_total_tool_calls == 12 for config in configs)
-    assert all(config.model.max_output_tokens == 5_000 for config in configs)
+    # FRAMES uses a fair evaluation-only provider cap; Stage 03D's underlying
+    # medium effort policy remains unchanged.
+    assert all(config.model.max_output_tokens == 1_024 for config in configs)
     options, policy = _resolve_options(configs[2])
     assert options["effort"] == "medium"
     assert options["mode"] == "single"
     assert options["strategy"] == "adaptive"
     assert options["max_escalations"] == 2
-    assert policy.max_output_tokens == configs[2].model.max_output_tokens
+    assert policy.max_output_tokens == 5_000

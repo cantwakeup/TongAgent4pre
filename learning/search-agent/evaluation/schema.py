@@ -6,7 +6,7 @@ import re
 import unicodedata
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -18,10 +18,12 @@ from pydantic import (
     model_validator,
 )
 
+from .budget import BudgetResource, BudgetSnapshot
 from .config import ResolvedConfig
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_FINAL_ANSWER_LINE = re.compile(r"(?im)^[ \t]*FINAL_ANSWER[ \t]*:[ \t]*(.*?)[ \t]*$")
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
@@ -112,7 +114,9 @@ class FailureType(StrEnum):
     """Stable, aggregate-friendly failure classes."""
 
     BUDGET_EXHAUSTED = "budget_exhausted"
+    ACCESS_BLOCKED = "access_blocked"
     DEADLINE_EXCEEDED = "deadline_exceeded"
+    DNS_REJECTED = "dns_rejected"
     FETCH_ERROR = "fetch_error"
     FIXTURE_NOT_FOUND = "fixture_not_found"
     INTERRUPTED = "interrupted"
@@ -120,8 +124,11 @@ class FailureType(StrEnum):
     INVALID_TASK = "invalid_task"
     JUDGE_ERROR = "judge_error"
     MODEL_ERROR = "model_error"
+    NETWORK_TIMEOUT = "network_timeout"
+    RATE_LIMITED = "rate_limited"
     RUNNER_ERROR = "runner_error"
     SEARCH_ERROR = "search_error"
+    SECURITY_REJECTED = "security_rejected"
     TOOL_ERROR = "tool_error"
 
 
@@ -134,6 +141,14 @@ class CompletionStatus(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     TIMED_OUT = "timed_out"
     INTERRUPTED = "interrupted"
+
+
+class AnswerStatus(StrEnum):
+    """Whether the strict final-answer contract yielded a candidate."""
+
+    ANSWER = "answer"
+    ABSTAIN = "abstain"
+    EMPTY = "empty"
 
 
 class ToolCallStatus(StrEnum):
@@ -195,7 +210,10 @@ class ToolCall(StrictModel):
         if self.status == ToolCallStatus.ERROR and self.failure is None:
             msg = "error tool calls require failure details"
             raise ValueError(msg)
-        if self.status != ToolCallStatus.ERROR and self.failure is not None:
+        if (
+            self.status not in {ToolCallStatus.ERROR, ToolCallStatus.BUDGET_EXCEEDED}
+            and self.failure is not None
+        ):
             msg = "non-error tool calls cannot contain failure details"
             raise ValueError(msg)
         return self
@@ -274,8 +292,12 @@ class RunResult(StrictModel):
     finished_at: datetime
     wall_time_seconds: NonNegativeFloat
     final_answer: str | None
+    extracted_answer: str | None = None
+    answer_status: AnswerStatus = AnswerStatus.EMPTY
     citations: list[Citation] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    external_retrieval_calls: NonNegativeInt | None = None
+    internal_tool_calls: NonNegativeInt | None = None
     search_calls: NonNegativeInt | None
     fetch_calls: NonNegativeInt | None
     relevant_searches: NonNegativeInt | None
@@ -286,6 +308,9 @@ class RunResult(StrictModel):
     completion_status: CompletionStatus
     failure_type: FailureType | None
     failure: FailureDetail | None = None
+    budget_resource: BudgetResource | None = None
+    budget_snapshot: BudgetSnapshot | None = None
+    budget_accounting_version: Literal[2] | None = None
     artifact_directory: NonEmptyString
     fixture_smoke: bool
     normalized_exact_match: bool | None
@@ -346,7 +371,144 @@ class RunResult(StrictModel):
         ):
             msg = "relevant_searches cannot exceed search_calls"
             raise ValueError(msg)
+        if (
+            self.external_retrieval_calls is not None
+            and self.search_calls is not None
+            and self.fetch_calls is not None
+            and self.external_retrieval_calls != self.search_calls + self.fetch_calls
+        ):
+            msg = "external_retrieval_calls must equal search_calls + fetch_calls"
+            raise ValueError(msg)
+        parsed_status, parsed_answer = extract_answer_contract(self.final_answer)
+        if (
+            "answer_status" in self.model_fields_set
+            and self.answer_status != parsed_status
+        ):
+            raise ValueError("answer_status must match the FINAL_ANSWER contract")
+        if (
+            "extracted_answer" in self.model_fields_set
+            and self.extracted_answer != parsed_answer
+        ):
+            raise ValueError("extracted_answer must match the FINAL_ANSWER contract")
+        self.answer_status = parsed_status
+        self.extracted_answer = parsed_answer
+        if (
+            self.completion_status == CompletionStatus.BUDGET_EXHAUSTED
+            and self.failure_type != FailureType.BUDGET_EXHAUSTED
+        ):
+            raise ValueError(
+                "budget_exhausted completion requires budget_exhausted failure_type"
+            )
+        if (
+            self.completion_status == CompletionStatus.TIMED_OUT
+            and self.failure_type != FailureType.DEADLINE_EXCEEDED
+        ):
+            raise ValueError(
+                "timed_out completion requires deadline_exceeded failure_type"
+            )
+        budget_terminal = self.completion_status in {
+            CompletionStatus.BUDGET_EXHAUSTED,
+            CompletionStatus.TIMED_OUT,
+        }
+        if not budget_terminal and (
+            self.budget_resource is not None or self.budget_snapshot is not None
+        ):
+            raise ValueError(
+                "budget resource fields are only valid for budget/deadline terminals"
+            )
+        if (
+            self.budget_accounting_version == 2
+            and self.completion_status == CompletionStatus.BUDGET_EXHAUSTED
+            and (self.budget_resource is None or self.budget_snapshot is None)
+        ):
+            msg = "budget_exhausted runs require budget_resource and budget_snapshot"
+            raise ValueError(msg)
+        if self.budget_accounting_version == 2 and (
+            self.external_retrieval_calls is None or self.internal_tool_calls is None
+        ):
+            msg = "budget accounting v2 requires external/internal tool counters"
+            raise ValueError(msg)
+        if self.budget_accounting_version == 2 and (
+            self.search_calls is None or self.fetch_calls is None
+        ):
+            raise ValueError("budget accounting v2 requires search/fetch counters")
+        if self.budget_accounting_version == 2 and any(
+            call.status == ToolCallStatus.BUDGET_EXCEEDED and call.failure is None
+            for call in self.tool_calls
+        ):
+            raise ValueError("v2 budget-exceeded tool calls require failure details")
+        if (
+            self.budget_accounting_version == 2
+            and self.completion_status == CompletionStatus.BUDGET_EXHAUSTED
+            and self.budget_resource == BudgetResource.DEADLINE
+        ):
+            raise ValueError("deadline exhaustion must use timed_out completion status")
+        if (
+            self.budget_accounting_version == 2
+            and self.completion_status == CompletionStatus.TIMED_OUT
+            and (
+                self.budget_resource != BudgetResource.DEADLINE
+                or self.budget_snapshot is None
+            )
+        ):
+            raise ValueError("v2 timed_out runs require deadline resource and snapshot")
+        if (
+            self.budget_accounting_version == 2
+            and self.completion_status == CompletionStatus.TIMED_OUT
+            and self.budget_snapshot is not None
+            and not self.budget_snapshot.deadline_exceeded
+        ):
+            raise ValueError("v2 timed_out runs require a deadline-exceeded snapshot")
+        if self.budget_accounting_version == 2 and self.budget_snapshot is not None:
+            snapshot = self.budget_snapshot
+            observed = (
+                self.search_calls,
+                self.fetch_calls,
+                self.external_retrieval_calls,
+                self.internal_tool_calls,
+            )
+            denied_at = (
+                snapshot.search_calls,
+                snapshot.fetch_calls,
+                snapshot.external_retrieval_calls,
+                snapshot.internal_tool_calls,
+            )
+            if observed != denied_at:
+                raise ValueError(
+                    "top-level tool counters must match the denial-time snapshot"
+                )
         return self
+
+
+def extract_answer_contract(
+    final_answer: object,
+) -> tuple[AnswerStatus, str | None]:
+    """Parse exactly one explicit ``FINAL_ANSWER:`` line.
+
+    Explanations and limitation text outside the marker are never promoted to
+    candidate answers.
+    """
+
+    if not isinstance(final_answer, str) or not final_answer.strip():
+        return AnswerStatus.EMPTY, None
+    matches = _FINAL_ANSWER_LINE.findall(final_answer)
+    if len(matches) != 1:
+        return AnswerStatus.EMPTY, None
+    value = matches[0].strip()
+    if not value:
+        return AnswerStatus.EMPTY, None
+    if value.casefold() == "abstain":
+        return AnswerStatus.ABSTAIN, None
+    return AnswerStatus.ANSWER, value
+
+
+def answer_for_exact_match(final_answer: str | None) -> str | None:
+    """Use strict extracted answers while retaining legacy fixture behavior."""
+
+    status, answer = extract_answer_contract(final_answer)
+    if _FINAL_ANSWER_LINE.search(final_answer or "") is not None:
+        return answer if status == AnswerStatus.ANSWER else None
+    return final_answer
 
 
 def normalize_exact_match_text(value: str) -> str:
@@ -373,9 +535,10 @@ def normalized_exact_match(
 
     if reference_answer is None:
         return None
-    if prediction is None:
+    scoring_prediction = answer_for_exact_match(prediction)
+    if scoring_prediction is None:
         return False
-    return normalize_exact_match_text(prediction) == normalize_exact_match_text(
+    return normalize_exact_match_text(scoring_prediction) == normalize_exact_match_text(
         reference_answer
     )
 

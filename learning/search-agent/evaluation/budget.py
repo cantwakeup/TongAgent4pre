@@ -5,10 +5,11 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from threading import RLock
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .config import BudgetLimits, FrozenStrictModel
 
@@ -17,11 +18,26 @@ Clock = Callable[[], float]
 T = TypeVar("T")
 
 
+class BudgetResource(StrEnum):
+    """Stable machine-readable resource that denied an attempted action."""
+
+    SEARCH = "search"
+    FETCH = "fetch"
+    TOTAL_TOOL = "total_tool"
+    MODEL_CALL = "model_call"
+    TOKEN = "token"
+    DEADLINE = "deadline"
+    RECURSION = "recursion"
+    SUBQUESTION_SLICE = "subquestion_slice"
+
+
 class BudgetSnapshot(FrozenStrictModel):
     """Serializable point-in-time view of an execution budget."""
 
     search_calls: int = Field(ge=0)
     fetch_calls: int = Field(ge=0)
+    external_retrieval_calls: int = Field(ge=0)
+    internal_tool_calls: int = Field(ge=0)
     total_tool_calls: int = Field(ge=0)
     model_calls: int = Field(ge=0)
     # Provider-reported actual usage only.
@@ -37,17 +53,53 @@ class BudgetSnapshot(FrozenStrictModel):
     deadline_exceeded: bool
     remaining_search_calls: int = Field(ge=0)
     remaining_fetch_calls: int = Field(ge=0)
+    remaining_external_retrieval_calls: int = Field(ge=0)
+    remaining_internal_tool_calls: int = Field(ge=0)
     remaining_total_tool_calls: int = Field(ge=0)
     remaining_model_calls: int = Field(ge=0)
     remaining_total_tokens: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_counter_coherence(self) -> BudgetSnapshot:
+        """Reject snapshots whose internal/external accounting disagrees."""
+
+        if self.external_retrieval_calls != self.search_calls + self.fetch_calls:
+            raise ValueError(
+                "external_retrieval_calls must equal search_calls + fetch_calls"
+            )
+        if (
+            self.total_tool_calls
+            != self.external_retrieval_calls + self.internal_tool_calls
+        ):
+            raise ValueError(
+                "total_tool_calls must equal external_retrieval_calls + "
+                "internal_tool_calls"
+            )
+        if self.remaining_total_tool_calls != self.remaining_external_retrieval_calls:
+            raise ValueError(
+                "remaining_total_tool_calls must equal "
+                "remaining_external_retrieval_calls"
+            )
+        return self
 
 
 class BudgetExceeded(RuntimeError):
     """Raised by ``require_*`` helpers when a shared limit denies work."""
 
-    def __init__(self, resource: str) -> None:
-        self.resource = resource
-        super().__init__(f"evaluation budget exhausted: {resource}")
+    def __init__(
+        self,
+        resource: BudgetResource | str,
+        *,
+        snapshot: BudgetSnapshot | None = None,
+        attempted: dict[str, Any] | None = None,
+    ) -> None:
+        self.resource = BudgetResource(resource)
+        self.snapshot = snapshot
+        self.attempted = dict(attempted or {})
+        display = (
+            "tokens" if self.resource == BudgetResource.TOKEN else self.resource.value
+        )
+        super().__init__(f"evaluation budget exhausted: {display}")
 
 
 @dataclass(frozen=True)
@@ -86,6 +138,10 @@ class ExecutionBudget:
         clock: Clock = time.monotonic,
     ) -> None:
         self._limits = limits
+        # Internal plan/state/evidence calls do not consume the external
+        # retrieval aggregate. The already-fingerprinted recursion ceiling is
+        # also a conservative loop cap for those internal calls.
+        self._max_internal_tool_calls = limits.recursion_limit
         self._clock = clock
         self._lock = RLock()
         started = float(clock())
@@ -93,6 +149,8 @@ class ExecutionBudget:
         self._last_now = started
         self._search_calls = 0
         self._fetch_calls = 0
+        self._external_retrieval_calls = 0
+        self._internal_tool_calls = 0
         self._total_tool_calls = 0
         self._model_calls = 0
         self._total_tokens = 0
@@ -108,31 +166,76 @@ class ExecutionBudget:
         return self._limits
 
     def try_reserve_tool(self, tool_name: str) -> bool:
-        """Reserve one total tool call and its search/fetch sub-budget."""
+        """Reserve one tool call without exposing denial details."""
+
+        try:
+            self.require_tool(tool_name)
+        except BudgetExceeded:
+            return False
+        return True
+
+    def require_tool(self, tool_name: str) -> None:
+        """Reserve a tool call or raise a typed budget exception."""
+
         kind = _tool_kind(tool_name)
+        attempted = {"tool_name": tool_name, "tool_kind": kind}
         with self._lock:
             if self._deadline_exceeded_locked():
-                return False
-            if self._total_tool_calls >= self._limits.max_total_tool_calls:
-                return False
-            if kind == "search" and (
-                self._search_calls >= self._limits.max_search_calls
-            ):
-                return False
-            if kind == "fetch" and self._fetch_calls >= self._limits.max_fetch_calls:
-                return False
+                self._raise_locked(
+                    BudgetResource.DEADLINE,
+                    attempted=attempted,
+                )
+            if kind == "unknown_tool":
+                self._raise_locked(
+                    BudgetResource.TOTAL_TOOL,
+                    attempted={**attempted, "reason": "unknown_tool"},
+                )
+            if kind == "search":
+                if self._search_calls >= self._limits.max_search_calls:
+                    self._raise_locked(
+                        BudgetResource.SEARCH,
+                        attempted=attempted,
+                    )
+                if self._external_retrieval_calls >= self._limits.max_total_tool_calls:
+                    self._raise_locked(
+                        BudgetResource.TOTAL_TOOL,
+                        attempted={
+                            **attempted,
+                            "scope": "external_retrieval",
+                        },
+                    )
+            elif kind == "fetch":
+                if self._fetch_calls >= self._limits.max_fetch_calls:
+                    self._raise_locked(
+                        BudgetResource.FETCH,
+                        attempted=attempted,
+                    )
+                if self._external_retrieval_calls >= self._limits.max_total_tool_calls:
+                    self._raise_locked(
+                        BudgetResource.TOTAL_TOOL,
+                        attempted={
+                            **attempted,
+                            "scope": "external_retrieval",
+                        },
+                    )
+            elif self._internal_tool_calls >= self._max_internal_tool_calls:
+                self._raise_locked(
+                    BudgetResource.RECURSION,
+                    attempted={
+                        **attempted,
+                        "scope": "internal_tool_loop",
+                    },
+                )
 
             self._total_tool_calls += 1
             if kind == "search":
                 self._search_calls += 1
+                self._external_retrieval_calls += 1
             elif kind == "fetch":
                 self._fetch_calls += 1
-            return True
-
-    def require_tool(self, tool_name: str) -> None:
-        """Reserve a tool call or raise a typed budget exception."""
-        if not self.try_reserve_tool(tool_name):
-            raise BudgetExceeded(_tool_kind(tool_name))
+                self._external_retrieval_calls += 1
+            else:
+                self._internal_tool_calls += 1
 
     def try_reserve_model_call(
         self,
@@ -141,12 +244,31 @@ class ExecutionBudget:
     ) -> ModelCallReservation | None:
         """Reserve one model call and positive token allowance before provider I/O."""
 
+        try:
+            return self.require_model_call(token_reservation=token_reservation)
+        except BudgetExceeded:
+            return None
+
+    def require_model_call(
+        self,
+        *,
+        token_reservation: int,
+    ) -> ModelCallReservation:
+        """Reserve a model call or raise a typed budget exception."""
+
         _validate_positive(token_reservation, name="token_reservation")
+        attempted = {"token_reservation": token_reservation}
         with self._lock:
             if self._deadline_exceeded_locked():
-                return None
+                self._raise_locked(
+                    BudgetResource.DEADLINE,
+                    attempted=attempted,
+                )
             if self._model_calls >= self._limits.max_model_calls:
-                return None
+                self._raise_locked(
+                    BudgetResource.MODEL_CALL,
+                    attempted=attempted,
+                )
             available = (
                 self._limits.max_total_tokens
                 - self._total_tokens
@@ -155,7 +277,13 @@ class ExecutionBudget:
             )
             if available <= 0 or token_reservation > available:
                 self._token_budget_exhausted = True
-                return None
+                self._raise_locked(
+                    BudgetResource.TOKEN,
+                    attempted={
+                        **attempted,
+                        "available_tokens": max(0, available),
+                    },
+                )
             reservation = ModelCallReservation(
                 reservation_id=self._next_reservation_id,
                 reserved_tokens=token_reservation,
@@ -165,18 +293,6 @@ class ExecutionBudget:
             self._reserved_tokens += token_reservation
             self._model_reservations[reservation.reservation_id] = token_reservation
             return reservation
-
-    def require_model_call(
-        self,
-        *,
-        token_reservation: int,
-    ) -> ModelCallReservation:
-        """Reserve a model call or raise a typed budget exception."""
-
-        reservation = self.try_reserve_model_call(token_reservation=token_reservation)
-        if reservation is None:
-            raise BudgetExceeded("model_or_token")
-        return reservation
 
     def settle_model_call(
         self,
@@ -269,8 +385,28 @@ class ExecutionBudget:
 
     def require_tokens(self, tokens: int) -> None:
         """Reserve token consumption or raise a typed budget exception."""
-        if not self.try_reserve_tokens(tokens):
-            raise BudgetExceeded("tokens")
+
+        _validate_nonnegative(tokens, name="tokens")
+        attempted = {"tokens": tokens}
+        with self._lock:
+            if self._deadline_exceeded_locked():
+                self._raise_locked(
+                    BudgetResource.DEADLINE,
+                    attempted=attempted,
+                )
+            if (
+                self._total_tokens
+                + self._estimated_token_charges
+                + self._reserved_tokens
+                + tokens
+                > self._limits.max_total_tokens
+            ):
+                self._token_budget_exhausted = True
+                self._raise_locked(
+                    BudgetResource.TOKEN,
+                    attempted=attempted,
+                )
+            self._total_tokens += tokens
 
     def deadline_exceeded(self) -> bool:
         """Return whether the monotonic wall-time deadline has been reached."""
@@ -297,48 +433,72 @@ class ExecutionBudget:
     def snapshot(self) -> BudgetSnapshot:
         """Return an atomic snapshot suitable for trace and result artifacts."""
         with self._lock:
-            elapsed = self._elapsed_locked()
-            return BudgetSnapshot(
-                search_calls=self._search_calls,
-                fetch_calls=self._fetch_calls,
-                total_tool_calls=self._total_tool_calls,
-                model_calls=self._model_calls,
-                total_tokens=self._total_tokens,
-                estimated_token_charges=self._estimated_token_charges,
-                accounted_tokens=(self._total_tokens + self._estimated_token_charges),
-                reserved_tokens=self._reserved_tokens,
-                outstanding_model_reservations=len(self._model_reservations),
-                token_budget_exhausted=self._token_budget_exhausted,
-                elapsed_seconds=elapsed,
-                remaining_wall_time_seconds=max(
-                    0.0,
-                    self._limits.wall_time_seconds - elapsed,
-                ),
-                deadline_exceeded=elapsed >= self._limits.wall_time_seconds,
-                remaining_search_calls=max(
-                    0,
-                    self._limits.max_search_calls - self._search_calls,
-                ),
-                remaining_fetch_calls=max(
-                    0,
-                    self._limits.max_fetch_calls - self._fetch_calls,
-                ),
-                remaining_total_tool_calls=max(
-                    0,
-                    self._limits.max_total_tool_calls - self._total_tool_calls,
-                ),
-                remaining_model_calls=max(
-                    0,
-                    self._limits.max_model_calls - self._model_calls,
-                ),
-                remaining_total_tokens=max(
-                    0,
-                    self._limits.max_total_tokens
-                    - self._total_tokens
-                    - self._estimated_token_charges
-                    - self._reserved_tokens,
-                ),
-            )
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> BudgetSnapshot:
+        elapsed = self._elapsed_locked()
+        remaining_external = max(
+            0,
+            self._limits.max_total_tool_calls - self._external_retrieval_calls,
+        )
+        return BudgetSnapshot(
+            search_calls=self._search_calls,
+            fetch_calls=self._fetch_calls,
+            external_retrieval_calls=self._external_retrieval_calls,
+            internal_tool_calls=self._internal_tool_calls,
+            total_tool_calls=self._total_tool_calls,
+            model_calls=self._model_calls,
+            total_tokens=self._total_tokens,
+            estimated_token_charges=self._estimated_token_charges,
+            accounted_tokens=(self._total_tokens + self._estimated_token_charges),
+            reserved_tokens=self._reserved_tokens,
+            outstanding_model_reservations=len(self._model_reservations),
+            token_budget_exhausted=self._token_budget_exhausted,
+            elapsed_seconds=elapsed,
+            remaining_wall_time_seconds=max(
+                0.0,
+                self._limits.wall_time_seconds - elapsed,
+            ),
+            deadline_exceeded=elapsed >= self._limits.wall_time_seconds,
+            remaining_search_calls=max(
+                0,
+                self._limits.max_search_calls - self._search_calls,
+            ),
+            remaining_fetch_calls=max(
+                0,
+                self._limits.max_fetch_calls - self._fetch_calls,
+            ),
+            remaining_external_retrieval_calls=remaining_external,
+            remaining_internal_tool_calls=max(
+                0,
+                self._max_internal_tool_calls - self._internal_tool_calls,
+            ),
+            # Backward-compatible name for the external provider-facing total.
+            remaining_total_tool_calls=remaining_external,
+            remaining_model_calls=max(
+                0,
+                self._limits.max_model_calls - self._model_calls,
+            ),
+            remaining_total_tokens=max(
+                0,
+                self._limits.max_total_tokens
+                - self._total_tokens
+                - self._estimated_token_charges
+                - self._reserved_tokens,
+            ),
+        )
+
+    def _raise_locked(
+        self,
+        resource: BudgetResource,
+        *,
+        attempted: dict[str, Any],
+    ) -> None:
+        raise BudgetExceeded(
+            resource,
+            snapshot=self._snapshot_locked(),
+            attempted=attempted,
+        )
 
     def _deadline_exceeded_locked(self) -> bool:
         return self._elapsed_locked() >= self._limits.wall_time_seconds
@@ -356,7 +516,12 @@ def _tool_kind(tool_name: str) -> str:
         return "search"
     if normalized in {"fetch", "fetch_url", "open_page", "open_url"}:
         return "fetch"
-    return "other_tool"
+    if normalized == "other":
+        # Preserve the legacy contract that a deliberately unknown tool is
+        # rejected, while real plan/state/evidence tools receive their own
+        # internal loop allowance.
+        return "unknown_tool"
+    return "internal_tool"
 
 
 def _validate_nonnegative(value: int, *, name: str) -> None:
