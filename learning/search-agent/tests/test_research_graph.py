@@ -866,6 +866,15 @@ class ResearchPlanTests(unittest.TestCase):
         self.assertEqual(correction_payload["status"], "quote_mismatch")
         self.assertFalse(correction_payload["retryable"])
 
+        changed_claim = tool.func(
+            source_id="S1",
+            claim="The same source supports differently worded model prose.",
+            quote="Another rejected approximate quote that is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-4"),
+        )
+        changed_payload = json.loads(changed_claim.update["messages"][0].content)
+        self.assertFalse(changed_payload["retryable"])
+
 
 class ResearchGraphTests(unittest.TestCase):
     """Verify graph ordering, bounded retries, and cross-process recovery."""

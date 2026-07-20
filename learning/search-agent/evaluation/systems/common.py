@@ -215,6 +215,7 @@ class EvaluationMiddleware(AgentMiddleware):
         self._model_call_sequence = 0
         self._tools_since_model_call: list[str] = []
         self._model_calls_by_subquestion: dict[str, int] = {}
+        self._phase_model_calls: dict[str, int] = {}
         self._avoidable_model_calls = 0
         if reserve_final_synthesis:
             final_cap = self.stage_output_cap("final_extractor")
@@ -363,6 +364,7 @@ class EvaluationMiddleware(AgentMiddleware):
                 "model_calls_per_subquestion": dict(
                     sorted(self._model_calls_by_subquestion.items())
                 ),
+                "phase_model_calls": dict(sorted(self._phase_model_calls.items())),
                 "read_only_state_tool_calls": read_only_calls,
                 "avoidable_model_calls": self._avoidable_model_calls,
                 "duplicate_tool_retries": duplicate_retries,
@@ -990,6 +992,9 @@ class EvaluationMiddleware(AgentMiddleware):
                 self._model_calls_by_subquestion[active_subquestion_id] = (
                     self._model_calls_by_subquestion.get(active_subquestion_id, 0) + 1
                 )
+            self._phase_model_calls[str(stage)] = (
+                self._phase_model_calls.get(str(stage), 0) + 1
+            )
             if tools_since_previous_call and set(tools_since_previous_call).issubset(
                 _READ_ONLY_STATE_TOOLS
             ):
@@ -1904,8 +1909,15 @@ def _stage_for_model_request(request: ModelRequest[Any]) -> ModelStage:
         ),
         "",
     )
-    if last_tool in {"fetch_url", "record_evidence"}:
+    if last_tool in {
+        "fetch_url",
+        "record_evidence",
+        "select_search_result",
+        "legacy_fetch_url",
+    }:
         return "evidence_selection"
+    if last_tool in {"choose_search_query", "web_search", "propose_evidence"}:
+        return "research_step"
     if last_tool in {
         "get_research_plan",
         "get_source_ledger",

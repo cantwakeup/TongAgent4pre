@@ -257,3 +257,11 @@ class TongAgentState(DeepAgentState, total=False):
     report_markdown: str
     compact_checkpoints: list[dict[str, Any]]
     active_token_slice_exhausted: dict[str, Any] | None
+    # Code-owned per-subquestion retrieval state.  These fields deliberately
+    # keep the model out of the search -> fetch -> evidence dependency chain.
+    active_research_phase: str
+    active_search_scope: dict[str, Any]
+    active_fetch_scope: dict[str, Any]
+    active_evidence_attempts: dict[str, int]
+    phase_transition_log: list[dict[str, Any]]
+    phase_timings: list[dict[str, Any]]

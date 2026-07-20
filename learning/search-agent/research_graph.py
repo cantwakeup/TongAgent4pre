@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from hashlib import sha256
@@ -64,6 +65,590 @@ PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
 ControlRoute = Literal["select", "report"]
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
+RESEARCH_PHASES = frozenset(
+    {
+        "NEED_QUERY",
+        "NEED_RESULT_SELECTION",
+        "NEED_EVIDENCE",
+        "SQ_DONE",
+        "SQ_BLOCKED",
+    }
+)
+
+
+def _phase_event(
+    events: list[ResearchEvent],
+    *,
+    plan_id: str,
+    subquestion_id: str,
+    previous: str,
+    current: str,
+    action: str,
+    elapsed_seconds: float = 0.0,
+    details: dict[str, Any] | None = None,
+) -> list[ResearchEvent]:
+    """Persist one code-owned FSM transition in the normal audit stream."""
+
+    return append_research_event(
+        events,
+        "research_phase_transition",
+        plan_id=plan_id,
+        subquestion_id=subquestion_id,
+        details={
+            "from": previous,
+            "to": current,
+            "action": action,
+            "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            **(details or {}),
+        },
+    )
+
+
+def _phase_rejection(
+    runtime: ToolRuntime,
+    *,
+    tool_name: str,
+    expected: str,
+) -> Command:
+    """Reject a model action outside its one permitted FSM phase."""
+
+    actual = str(runtime.state.get("active_research_phase") or "NEED_QUERY")
+    events = list(runtime.state.get("research_events", []))
+    plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+    active_id = str(runtime.state.get("active_subquestion_id") or "")
+    events = append_research_event(
+        events,
+        "invalid_phase_action",
+        plan_id=str(plan.get("plan_id", "")),
+        subquestion_id=active_id,
+        details={"tool": tool_name, "expected_phase": expected, "actual_phase": actual},
+    )
+    return Command(
+        update={
+            "research_events": events,
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "rejected",
+                            "failure_type": "invalid_phase_action",
+                            "expected_phase": expected,
+                            "actual_phase": actual,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=runtime.tool_call_id,
+                    name=tool_name,
+                    status="error",
+                )
+            ],
+        }
+    )
+
+
+def _compact_quote_candidates(content: str, *, limit: int = 3) -> list[str]:
+    """Return real continuous excerpts; source text is never model-controlled."""
+
+    normalized = " ".join(content.split())
+    if not normalized:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    candidates: list[str] = []
+    for sentence in sentences:
+        excerpt = sentence.strip()
+        if len(excerpt) < 24:
+            continue
+        candidates.append(excerpt[:800])
+        if len(candidates) >= limit:
+            return candidates
+    return candidates or [normalized[: min(800, len(normalized))]]
+
+
+def build_phase_research_tools(
+    *,
+    search_tool: BaseTool,
+    fetch_tool: BaseTool,
+    evidence_record: EvidenceRecord,
+    budget_snapshot: BudgetSnapshot,
+    legacy_fixture_aliases: bool = False,
+) -> list[BaseTool]:
+    """Expose a guarded query -> selection -> evidence FSM to a research model.
+
+    The three public tools are intentionally *decisions*, rather than raw
+    retrieval primitives.  A LangGraph tool batch observes the same immutable
+    state, so only the action legal at the beginning of that batch can run;
+    dependent actions in that same model response are rejected before they can
+    reserve a network budget.
+    """
+
+    def transition(
+        runtime: ToolRuntime,
+        *,
+        previous: str,
+        current: str,
+        action: str,
+        elapsed_seconds: float = 0.0,
+        details: dict[str, Any] | None = None,
+        **updates: Any,
+    ) -> Command:
+        plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        prior_events = list(
+            updates.pop("research_events", runtime.state.get("research_events", []))
+        )
+        events = _phase_event(
+            prior_events,
+            plan_id=str(plan.get("plan_id", "")),
+            subquestion_id=active_id,
+            previous=previous,
+            current=current,
+            action=action,
+            elapsed_seconds=elapsed_seconds,
+            details=details,
+        )
+        timings = list(runtime.state.get("phase_timings", []))
+        timings.append(
+            {
+                "phase": action,
+                "subquestion_id": active_id,
+                "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            }
+        )
+        transition_log = list(runtime.state.get("phase_transition_log", []))
+        transition_log.append(
+            {
+                "subquestion_id": active_id,
+                "from": previous,
+                "to": current,
+                "action": action,
+            }
+        )
+        return Command(
+            update={
+                "active_research_phase": current,
+                "research_events": events,
+                "phase_timings": timings,
+                "phase_transition_log": transition_log,
+                **updates,
+            }
+        )
+
+    @tool("choose_search_query")
+    def choose_search_query(
+        query: str,
+        task_type: Literal[
+            "single_fact_lookup",
+            "list_or_enumeration",
+            "comparison",
+            "date_or_numeric_lookup",
+        ],
+        runtime: ToolRuntime,
+    ) -> str | Command:
+        """Choose one atomic query. Code executes the only allowed search."""
+        expected = "NEED_QUERY"
+        if str(runtime.state.get("active_research_phase") or expected) != expected:
+            return _phase_rejection(
+                runtime, tool_name="choose_search_query", expected=expected
+            )
+        normalized = " ".join(query.split())
+        if not normalized or len(normalized.split()) > 14:
+            return _phase_rejection(
+                runtime, tool_name="choose_search_query", expected=expected
+            )
+        started = time.perf_counter()
+        try:
+            payload = json.loads(
+                search_tool.invoke({"query": normalized, "max_results": 5})
+            )
+        except (
+            Exception
+        ) as exc:  # provider wrappers should be total, but preserve auditability.
+            payload = {"status": "error", "error": type(exc).__name__, "results": []}
+        raw_results = payload.get("results", []) if isinstance(payload, dict) else []
+        candidates = []
+        for index, result in enumerate(raw_results, start=1):
+            if not isinstance(result, dict) or not str(result.get("url", "")):
+                continue
+            tier = str(result.get("relevance_tier", "uncertain"))
+            if tier == "irrelevant":
+                continue
+            candidates.append(
+                {
+                    "result_id": f"R{index}",
+                    "title": str(result.get("title", "")),
+                    "url": str(result["url"]),
+                    "snippet": str(result.get("snippet", ""))[:500],
+                    "provider": str(result.get("provider", "")),
+                    "rank": int(result.get("final_rank", index) or index),
+                    "relevance": tier,
+                }
+            )
+        search_id = f"{runtime.state.get('active_subquestion_id')}-search-{len(runtime.state.get('phase_transition_log', [])) + 1}"
+        next_phase = "NEED_RESULT_SELECTION" if candidates else "SQ_BLOCKED"
+        visible = [
+            {key: item[key] for key in item if key != "url"} for item in candidates
+        ]
+        content = {
+            "status": "success" if candidates else "no_candidates",
+            "search_id": search_id,
+            "candidates": visible,
+            "search_quality": payload.get("search_quality")
+            if isinstance(payload, dict)
+            else None,
+        }
+        command = transition(
+            runtime,
+            previous=expected,
+            current=next_phase,
+            action="search",
+            elapsed_seconds=time.perf_counter() - started,
+            details={
+                "search_id": search_id,
+                "candidate_count": len(candidates),
+                "task_type": task_type,
+            },
+            active_search_scope={
+                "search_id": search_id,
+                "subquestion_id": runtime.state.get("active_subquestion_id"),
+                "candidates": candidates,
+            },
+        )
+        command.update["messages"] = [
+            ToolMessage(
+                content=json.dumps(content, ensure_ascii=False),
+                tool_call_id=runtime.tool_call_id,
+                name="choose_search_query",
+                status="success" if candidates else "error",
+            )
+        ]
+        return command
+
+    @tool("select_search_result")
+    def select_search_result(
+        result_id: str, reason: str, runtime: ToolRuntime
+    ) -> str | Command:
+        """Select an R# from the active search scope; code fetches it safely."""
+        del reason
+        expected = "NEED_RESULT_SELECTION"
+        if str(runtime.state.get("active_research_phase") or "") != expected:
+            return _phase_rejection(
+                runtime, tool_name="select_search_result", expected=expected
+            )
+        scope = runtime.state.get("active_search_scope", {})
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        candidates = (
+            [item for item in scope.get("candidates", []) if isinstance(item, dict)]
+            if isinstance(scope, dict) and scope.get("subquestion_id") == active_id
+            else []
+        )
+        selected = next(
+            (item for item in candidates if item.get("result_id") == result_id), None
+        )
+        if selected is None:
+            return _phase_rejection(
+                runtime, tool_name="select_search_result", expected=expected
+            )
+        started = time.perf_counter()
+        attempts: list[dict[str, Any]] = []
+        tried_hosts: set[str] = set()
+        ordered = [selected, *[item for item in candidates if item is not selected]][:2]
+        successful: dict[str, Any] | None = None
+        for candidate in ordered:
+            url = str(candidate["url"])
+            host = re.sub(r"^https?://([^/]+).*$", r"\1", url).casefold()
+            if host in tried_hosts:
+                continue
+            tried_hosts.add(host)
+            try:
+                payload = json.loads(
+                    fetch_tool.invoke({"url": url, "max_chars": 12_000})
+                )
+            except Exception as exc:
+                payload = {"status": "error", "error": type(exc).__name__, "url": url}
+            attempts.append(
+                {
+                    "result_id": candidate["result_id"],
+                    "url": url,
+                    "status": payload.get("status"),
+                }
+            )
+            if (
+                isinstance(payload, dict)
+                and payload.get("status") == "success"
+                and payload.get("source_id")
+            ):
+                successful = {**payload, "result_id": candidate["result_id"]}
+                break
+        if successful is None:
+            command = transition(
+                runtime,
+                previous=expected,
+                current="SQ_BLOCKED",
+                action="fetch",
+                elapsed_seconds=time.perf_counter() - started,
+                details={
+                    "search_id": scope.get("search_id"),
+                    "attempts": attempts,
+                    "fallback_count": max(0, len(attempts) - 1),
+                },
+            )
+            command.update["messages"] = [
+                ToolMessage(
+                    content=json.dumps(
+                        {"status": "fetch_failed", "attempts": attempts},
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=runtime.tool_call_id,
+                    name="select_search_result",
+                    status="error",
+                )
+            ]
+            return command
+        quotes = _compact_quote_candidates(str(successful.get("content", "")))
+        fetch_scope = {
+            "search_id": scope.get("search_id"),
+            "result_id": successful["result_id"],
+            "source_id": successful["source_id"],
+            "quote_candidates": {
+                f"Q{index}": quote for index, quote in enumerate(quotes, start=1)
+            },
+        }
+        command = transition(
+            runtime,
+            previous=expected,
+            current="NEED_EVIDENCE",
+            action="fetch",
+            elapsed_seconds=time.perf_counter() - started,
+            details={
+                "search_id": scope.get("search_id"),
+                "source_id": successful["source_id"],
+                "attempts": attempts,
+                "fallback_count": max(0, len(attempts) - 1),
+            },
+            active_fetch_scope=fetch_scope,
+        )
+        command.update["messages"] = [
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "source_id": successful["source_id"],
+                        "quote_candidates": list(fetch_scope["quote_candidates"]),
+                        "acquisition_method": successful.get("acquisition_method"),
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id=runtime.tool_call_id,
+                name="select_search_result",
+            )
+        ]
+        return command
+
+    @tool("propose_evidence")
+    def propose_evidence(
+        claim: str,
+        quote_id: str,
+        runtime: ToolRuntime,
+        stance: Literal["support", "contradict"] = "support",
+    ) -> str | Command:
+        """Propose one claim and Q#; code records the canonical literal quote."""
+        expected = "NEED_EVIDENCE"
+        if str(runtime.state.get("active_research_phase") or "") != expected:
+            return _phase_rejection(
+                runtime, tool_name="propose_evidence", expected=expected
+            )
+        scope = runtime.state.get("active_fetch_scope", {})
+        quotes = scope.get("quote_candidates", {}) if isinstance(scope, dict) else {}
+        source_id = str(scope.get("source_id", "")) if isinstance(scope, dict) else ""
+        quote = quotes.get(quote_id) if isinstance(quotes, dict) else None
+        if not source_id or not isinstance(quote, str):
+            return _phase_rejection(
+                runtime, tool_name="propose_evidence", expected=expected
+            )
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        requirement_id = f"{active_id}:{source_id}:primary"
+        attempts = dict(runtime.state.get("active_evidence_attempts", {}))
+        count = int(attempts.get(requirement_id, 0))
+        if count >= 2:
+            return _phase_rejection(
+                runtime, tool_name="propose_evidence", expected=expected
+            )
+        attempts[requirement_id] = count + 1
+        started = time.perf_counter()
+        try:
+            result = evidence_record(
+                source_id=source_id,
+                claim=claim,
+                quote=quote,
+                stance="supports" if stance == "support" else "contradicts",
+            )
+        except (EvidenceQuoteMismatch, ValueError) as exc:
+            next_phase = "NEED_EVIDENCE" if count == 0 else "SQ_BLOCKED"
+            command = transition(
+                runtime,
+                previous=expected,
+                current=next_phase,
+                action="record_evidence",
+                elapsed_seconds=time.perf_counter() - started,
+                details={
+                    "source_id": source_id,
+                    "requirement_id": requirement_id,
+                    "attempt": count + 1,
+                    "failure_type": type(exc).__name__,
+                },
+                active_evidence_attempts=attempts,
+            )
+            command.update["messages"] = [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "evidence_rejected",
+                            "retryable": count == 0,
+                            "quote_candidates": list(quotes),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=runtime.tool_call_id,
+                    name="propose_evidence",
+                    status="error",
+                )
+            ]
+            return command
+        snapshot = budget_snapshot()
+        events = list(runtime.state.get("research_events", []))
+        closed, events, unresolved = _auto_close_after_evidence(
+            runtime=runtime, snapshot=snapshot, events=events
+        )
+        # Use the normal transition path but retain the auto-closure event.
+        command = transition(
+            runtime,
+            previous=expected,
+            # A valid claim may still need corroboration.  Return to a fresh
+            # query phase instead of treating a single-source SQ as blocked.
+            current="SQ_DONE" if closed is not None else "NEED_QUERY",
+            action="record_evidence",
+            elapsed_seconds=time.perf_counter() - started,
+            details={
+                "source_id": source_id,
+                "requirement_id": requirement_id,
+                "attempt": count + 1,
+                "claim_id": result.get("claim", {}).get("claim_id"),
+                "unresolved": unresolved,
+            },
+            active_evidence_attempts=attempts,
+            research_events=events,
+        )
+        if closed is not None:
+            command.update["research_plan"] = closed
+        command.update["messages"] = [
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "claim_id": result.get("claim", {}).get("claim_id"),
+                        "source_id": source_id,
+                        "subquestion_auto_updated": closed is not None,
+                        "unresolved_requirements": unresolved,
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id=runtime.tool_call_id,
+                name="propose_evidence",
+            )
+        ]
+        return command
+
+    phase_tools = [choose_search_query, select_search_result, propose_evidence]
+    if not legacy_fixture_aliases:
+        return phase_tools
+
+    # Old deterministic fixture scripts name raw tools.  These aliases exist
+    # only in the offline fixture adapter; they delegate to the same guarded
+    # phase actions and never expose a raw retrieval primitive to live models.
+    @tool("web_search")
+    def legacy_web_search(query: str, runtime: ToolRuntime) -> str | Command:
+        """Fixture compatibility alias for the guarded query decision."""
+        return choose_search_query.func(
+            query=query,
+            task_type="single_fact_lookup",
+            runtime=runtime,
+        )
+
+    @tool("fetch_url")
+    def legacy_fetch_url(url: str, runtime: ToolRuntime) -> str | Command:
+        """Fixture compatibility alias selecting only a scoped candidate URL."""
+        scope = runtime.state.get("active_search_scope", {})
+        candidates = scope.get("candidates", []) if isinstance(scope, dict) else []
+        match = next(
+            (
+                item
+                for item in candidates
+                if isinstance(item, dict) and str(item.get("url")) == url
+            ),
+            None,
+        )
+        if match is None:
+            return _phase_rejection(
+                runtime, tool_name="fetch_url", expected="NEED_RESULT_SELECTION"
+            )
+        return select_search_result.func(
+            result_id=str(match["result_id"]),
+            reason="fixture scoped selection",
+            runtime=runtime,
+        )
+
+    @tool("record_evidence")
+    def legacy_record_evidence(
+        source_id: str,
+        claim: str,
+        quote: str,
+        runtime: ToolRuntime,
+        stance: Literal["supports", "contradicts"] = "supports",
+        claim_id: str = "",
+    ) -> str | Command:
+        """Fixture compatibility alias mapping an exact quote to its Q#."""
+        del claim_id
+        scope = runtime.state.get("active_fetch_scope", {})
+        candidates = (
+            scope.get("quote_candidates", {}) if isinstance(scope, dict) else {}
+        )
+        if not isinstance(scope, dict) or source_id != scope.get("source_id"):
+            return _phase_rejection(
+                runtime, tool_name="record_evidence", expected="NEED_EVIDENCE"
+            )
+        quote_id = next(
+            (key for key, value in candidates.items() if value == quote), None
+        )
+        if quote_id is None:
+            return _phase_rejection(
+                runtime, tool_name="record_evidence", expected="NEED_EVIDENCE"
+            )
+        return propose_evidence.func(
+            claim=claim,
+            quote_id=str(quote_id),
+            stance="support" if stance == "supports" else "contradict",
+            runtime=runtime,
+        )
+
+    @tool("update_subquestion")
+    def legacy_update_subquestion(
+        subquestion_id: str,
+        status: str,
+        evidence_source_ids: list[str],
+        note: str,
+        runtime: ToolRuntime,
+    ) -> str:
+        """Accept an obsolete fixture no-op after code has closed an SQ."""
+        del subquestion_id, status, evidence_source_ids, note, runtime
+        return json.dumps({"status": "ignored", "reason": "phase_fsm_auto_updates"})
+
+    return [
+        *phase_tools,
+        legacy_web_search,
+        legacy_fetch_url,
+        legacy_record_evidence,
+        legacy_update_subquestion,
+    ]
 
 
 class DraftSubquestion(BaseModel):
@@ -665,14 +1250,16 @@ def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
     return get_source_ledger
 
 
-def _evidence_retry_identity(source_id: str, claim: str, quote: str) -> tuple[str, str]:
-    """Return stable, content-safe identifiers for one evidence attempt."""
+def _evidence_retry_identity(
+    subquestion_id: str,
+    source_id: str,
+    requirement_id: str,
+    quote: str,
+) -> tuple[str, str]:
+    """Identify evidence attempts independently of model-mutated claim wording."""
 
-    claim_digest = sha256(
-        normalize_evidence_text(claim).casefold().encode()
-    ).hexdigest()
     quote_digest = sha256(normalize_evidence_text(quote).encode()).hexdigest()
-    evidence_key = f"{source_id}:{claim_digest}"
+    evidence_key = f"{subquestion_id}:{source_id}:{requirement_id}"
     return evidence_key, f"{evidence_key}:{quote_digest}:quote_mismatch"
 
 
@@ -813,7 +1400,13 @@ def build_evidence_graph_tools(
                 claim_id=claim_id,
             )
         except EvidenceQuoteMismatch as exc:
-            evidence_key, signature = _evidence_retry_identity(source_id, claim, quote)
+            active_id = str(runtime.state.get("active_subquestion_id") or "")
+            evidence_key, signature = _evidence_retry_identity(
+                active_id,
+                source_id,
+                "primary",
+                quote,
+            )
             prior_failures = [
                 item
                 for item in events
@@ -1673,6 +2266,16 @@ def build_research_graph(
                 list(state.get("compact_checkpoints", [])) if resuming_plan else []
             ),
             "active_token_slice_exhausted": None,
+            "active_research_phase": "NEED_QUERY",
+            "active_search_scope": {},
+            "active_fetch_scope": {},
+            "active_evidence_attempts": {},
+            "phase_transition_log": (
+                list(state.get("phase_transition_log", [])) if resuming_plan else []
+            ),
+            "phase_timings": list(state.get("phase_timings", []))
+            if resuming_plan
+            else [],
         }
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
@@ -1787,6 +2390,10 @@ def build_research_graph(
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
             "active_token_slice_exhausted": None,
+            "active_research_phase": "NEED_QUERY" if active else "SQ_DONE",
+            "active_search_scope": {},
+            "active_fetch_scope": {},
+            "active_evidence_attempts": {},
         }
 
     def route_after_select(state: TongAgentState) -> Route:
@@ -1812,6 +2419,7 @@ def build_research_graph(
             token_budget_snapshot() if token_budget_snapshot is not None else {}
         )
         event_summary = _compact_research_history(state)
+        phase = str(state.get("active_research_phase") or "NEED_QUERY")
         delegation_instruction = (
             "MULTI MODE: your very next tool call MUST be task with "
             "subagent_type='researcher' and its description MUST start exactly "
@@ -1832,8 +2440,9 @@ RESEARCH EVENT SUMMARY:
 {event_summary}
 
 Query strategy: {_query_task_guidance(active_context.query_task_type)}
+CURRENT CODE-OWNED PHASE: {phase}
 
-{delegation_instruction}Research only this active subquestion. The compact context above is authoritative for normal execution; do not call get_research_plan, get_source_ledger, or get_evidence_graph unless it is internally inconsistent. Every web_search query must target one atomic fact, normally `entity name + attribute`, use roughly 8-12 English words or fewer, and must not copy the full subquestion or include the final multi-hop calculation. Search different entities in separate calls. After each successful fetch, call record_evidence for every factual proposition you may report, copying an exact 12-800 character excerpt from that fetched page. The claim argument must itself be a self-contained report-ready sentence with subject and predicate, never a label such as "official name" or "contact email"; quote is the separate exact page excerpt that supports it. OMIT claim_id when creating a new claim: the tool assigns C#. Pass claim_id only to add evidence to a C# already returned by a successful record_evidence call; never invent C#. On quote_mismatch, use at most one returned candidate quote correction; never resubmit an identical rejected call. A successful record_evidence deterministically updates coverage when the minimum gates are met. If it returns subquestion_auto_updated=true, stop this research turn immediately without reading state or calling update_subquestion. A source alone cannot cover an SQ. Search snippets never receive source IDs or evidence units. If no supported claim can be registered within the reserved budget, end the turn so the bounded controller can route it. Do not write the final report during this step."""
+{delegation_instruction}Research only this active subquestion through the phase-decision tools. Never call or invent a URL, source ID, or quote. In NEED_QUERY call only choose_search_query with one atomic query. In NEED_RESULT_SELECTION call only select_search_result with one displayed R#; the URL remains code-owned. In NEED_EVIDENCE call only propose_evidence with one displayed Q# and a report-ready claim; the literal quote remains code-owned. Do not issue dependent actions in one response: code rejects them before they consume network budget. If the tool reports SQ_DONE or SQ_BLOCKED, end the turn. Do not write the final report during this step."""
         message_id = (
             f"research-step-{state['research_plan']['plan_id']}-{active['id']}-"
             f"{active['attempts']}"
@@ -1884,11 +2493,19 @@ Query strategy: {_query_task_guidance(active_context.query_task_type)}
             if int(item.get("sequence", 0)) >= first_attempt_sequence
         ]
         token_slice_exhausted = state.get("active_token_slice_exhausted")
+        active_phase = str(state.get("active_research_phase") or "NEED_QUERY")
         if active_id:
             active = next(
                 item for item in plan["subquestions"] if item["id"] == active_id
             )
-            if active["status"] == "researching":
+            if active["status"] == "researching" and active_phase == "SQ_BLOCKED":
+                plan = transition_subquestion(
+                    plan,
+                    active_id,
+                    "blocked",
+                    note="The code-enforced research phase could not produce canonical evidence.",
+                )
+            elif active["status"] == "researching":
                 active_claims = [
                     dict(item)
                     for item in budget.get("claims", [])

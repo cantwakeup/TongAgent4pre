@@ -167,6 +167,7 @@ class TongAgentRunner:
                 model_budget_snapshot=lambda: execution_budget.snapshot().model_dump(
                     mode="json"
                 ),
+                phase_fixture_compatibility=(resolved_config.backend_kind == "fixture"),
             )
             thread_id = f"eval-{run_id}"
             with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
@@ -768,6 +769,19 @@ def _write_tongagent_artifacts(
     _atomic_json(directory / "control.json", control)
     _atomic_json(directory / "token_control.json", token_control)
     _atomic_json(directory / "orchestration.json", orchestration)
+    _atomic_json(
+        directory / "phase_state.json",
+        (
+            {
+                "current_phase": native_state.get("active_research_phase"),
+                "active_subquestion_id": native_state.get("active_subquestion_id"),
+                "transitions": list(native_state.get("phase_transition_log", [])),
+                "timings": list(native_state.get("phase_timings", [])),
+            }
+            if native_state is not None
+            else {}
+        ),
+    )
     _atomic_json(
         directory / "compact_checkpoints.json",
         (

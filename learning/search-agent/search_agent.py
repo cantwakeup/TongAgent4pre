@@ -71,6 +71,7 @@ from research_graph import (
     Planner,
     build_evidence_graph_tools,
     build_model_planner,
+    build_phase_research_tools,
     build_research_graph,
     build_research_state_tools,
     build_source_ledger_tool,
@@ -3141,6 +3142,7 @@ class AgentRuntimeDependencies:
     token_budget_snapshot: Callable[[], dict[str, Any]] | None = None
     token_budget_can_start: Callable[[str], bool] | None = None
     model_budget_snapshot: Callable[[], dict[str, Any]] | None = None
+    phase_fixture_compatibility: bool = False
 
 
 _REGISTERED_HARNESS_KEYS: set[str] = set()
@@ -3345,6 +3347,22 @@ def build_agent(
         budget.snapshot,
         auto_update_subquestion=topology == "single",
     )
+    by_network_name = {item.name: item for item in network_tools}
+    phase_research_tools = (
+        build_phase_research_tools(
+            search_tool=by_network_name["web_search"],
+            fetch_tool=by_network_name["fetch_url"],
+            evidence_record=budget.record_evidence,
+            budget_snapshot=budget.snapshot,
+            legacy_fixture_aliases=(
+                runtime_dependencies.phase_fixture_compatibility
+                if runtime_dependencies is not None
+                else False
+            ),
+        )
+        if {"web_search", "fetch_url"}.issubset(by_network_name)
+        else []
+    )
     _disable_general_purpose_subagent(model)
     subagents = _build_subagents(
         topology=topology,
@@ -3384,12 +3402,14 @@ def build_agent(
         if topology == "single"
         else [item for item in evidence_tools if item.name == "get_evidence_graph"]
     )
-    main_tools = [
-        *state_tools,
-        source_ledger_tool,
-        *parent_evidence_tools,
-        *(network_tools if topology == "single" else []),
-    ]
+    # In single topology the model sees only phase decisions.  The code-owned
+    # tools execute search, scoped fetch, and evidence registration in order;
+    # raw network tools are deliberately not exposed together to the model.
+    main_tools = (
+        [source_ledger_tool, evidence_tools[1], *phase_research_tools]
+        if topology == "single" and phase_research_tools
+        else [*state_tools, source_ledger_tool, *parent_evidence_tools]
+    )
     research_inner_agent = create_deep_agent(
         model=model,
         tools=main_tools,
