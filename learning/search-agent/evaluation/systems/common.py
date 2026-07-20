@@ -83,6 +83,13 @@ from ..schema import (
     normalized_exact_match,
 )
 from ..tracing import TraceCollector, sanitize_trace_value
+from ..token_control import (
+    DEFAULT_TONGAGENT_STAGE_OUTPUT_CAPS,
+    ModelStage,
+    PartitionDenial,
+    PartitionReservation,
+    StageTokenController,
+)
 
 
 SYSTEM_SIMPLE_REACT = "simple_react"
@@ -93,6 +100,8 @@ _HEX_SHA = re.compile(r"^[0-9a-f]{7,64}$")
 SemanticStrategy = Literal["fixed", "adaptive"]
 _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE = 4_096
 _FINAL_SYNTHESIS_DRAFT_CHARS = 6_000
+_TONGAGENT_PAGE_CONTEXT_CHARS = 3_500
+_TONGAGENT_SEARCH_SNIPPET_CHARS = 320
 
 
 class _BaselineNoEvidenceState:
@@ -157,11 +166,34 @@ class EvaluationMiddleware(AgentMiddleware):
         *,
         max_output_tokens: int,
         reserve_final_synthesis: bool = False,
+        stage_output_caps: Mapping[ModelStage, int] | None = None,
+        enable_context_compaction: bool = False,
+        enable_token_partitions: bool = False,
     ) -> None:
         super().__init__()
         self.execution_budget = execution_budget
         self.trace = trace
         self._max_output_tokens = max_output_tokens
+        self._stage_output_caps: dict[ModelStage, int] = {}
+        if stage_output_caps is not None:
+            configured_caps = dict(DEFAULT_TONGAGENT_STAGE_OUTPUT_CAPS)
+            configured_caps.update(stage_output_caps)
+            self._stage_output_caps = {
+                stage: min(max_output_tokens, cap)
+                for stage, cap in configured_caps.items()
+            }
+        self._enable_context_compaction = enable_context_compaction
+        self._token_controller = (
+            StageTokenController(
+                total_token_limit=execution_budget.limits.max_total_tokens,
+                stage_output_caps=cast(
+                    "Mapping[ModelStage, int]",
+                    self._stage_output_caps,
+                ),
+            )
+            if enable_token_partitions
+            else None
+        )
         self._lock = RLock()
         self._tool_calls: list[ToolCall] = []
         self._failures: list[FailureDetail] = []
@@ -175,16 +207,31 @@ class EvaluationMiddleware(AgentMiddleware):
         self._budget_failure: BudgetExceeded | None = None
         self._final_evidence_fragments: list[str] = []
         self._final_synthesis_reservation: ModelCallReservation | None = None
+        self._partition_reservations: dict[int, PartitionReservation] = {}
+        self._reservation_context: dict[int, dict[str, Any]] = {}
+        self._model_call_sequence = 0
+        self._tools_since_model_call: list[str] = []
         if reserve_final_synthesis:
-            token_reservation = max_output_tokens + _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE
+            final_cap = self.stage_output_cap("final_extractor")
+            token_reservation = final_cap + _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE
+            partition = self._reserve_partition(
+                stage="final_extractor",
+                token_reservation=token_reservation,
+                active_subquestion_id=None,
+            )
             reservation = execution_budget.require_model_call(
                 token_reservation=token_reservation
             )
+            if partition is not None:
+                self._partition_reservations[reservation.reservation_id] = partition
             self._final_synthesis_reservation = reservation
             self.trace.record(
                 "final_synthesis_reserved",
                 token_reservation=token_reservation,
+                stage="final_extractor",
+                stage_output_cap=final_cap,
                 budget=execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
             )
 
     @property
@@ -251,11 +298,71 @@ class EvaluationMiddleware(AgentMiddleware):
             }
         return TokenUsage.model_validate(values)
 
+    def stage_output_cap(self, stage: ModelStage) -> int:
+        """Return the auditable cap used for one TongAgent model stage."""
+
+        return int(self._stage_output_caps.get(stage, self._max_output_tokens))
+
+    def configure_token_partitions(self, subquestion_ids: Sequence[str]) -> None:
+        """Partition the global token ceiling after a durable plan exists."""
+
+        controller = self._token_controller
+        if controller is None:
+            return
+        controller.configure(subquestion_ids)
+        self.trace.record(
+            "token_partitions_configured",
+            subquestion_ids=list(subquestion_ids),
+            token_partition=controller.snapshot(),
+        )
+
+    def activate_token_subquestion(self, subquestion_id: str | None) -> None:
+        """Select the SQ bucket used by subsequent model reservations."""
+
+        controller = self._token_controller
+        if controller is None:
+            return
+        controller.activate(subquestion_id)
+        self.trace.record(
+            "token_partition_activated",
+            active_subquestion_id=subquestion_id,
+            token_partition=controller.snapshot(),
+        )
+
+    def can_start_token_subquestion(self, subquestion_id: str) -> bool:
+        controller = self._token_controller
+        return (
+            True
+            if controller is None
+            else controller.can_start_subquestion(subquestion_id)
+        )
+
+    def token_partition_snapshot(self) -> dict[str, Any]:
+        controller = self._token_controller
+        return {} if controller is None else controller.snapshot()
+
+    def model_for_stage(
+        self,
+        model: BaseChatModel,
+        stage: ModelStage,
+    ) -> BaseChatModel:
+        """Clone models that expose a max-token field for out-of-stack calls."""
+
+        cap = self.stage_output_cap(stage)
+        fields = getattr(type(model), "model_fields", {})
+        if "max_tokens" not in fields:
+            return model
+        return cast(
+            "BaseChatModel",
+            model.model_copy(update={"max_tokens": cap}, deep=False),
+        )
+
     def reserve_external_model_call(
         self,
         *,
         label: str,
         request_payload: Any,
+        stage: ModelStage | None = None,
     ) -> ModelCallReservation:
         """Reserve a model call made outside a LangChain agent middleware stack.
 
@@ -263,9 +370,18 @@ class EvaluationMiddleware(AgentMiddleware):
         successful reservation with :meth:`record_external_model_response`.
         """
 
+        resolved_stage = stage or _stage_for_external_label(label)
+        context = _external_context_profile(request_payload)
         return self._reserve_model_call(
             label=label,
             estimated_input_tokens=_estimate_external_input_tokens(request_payload),
+            stage=resolved_stage,
+            active_subquestion_id=(
+                self._token_controller.active_subquestion_id
+                if self._token_controller is not None
+                else None
+            ),
+            context_profile=context,
         )
 
     def cancel_external_model_call(
@@ -277,11 +393,17 @@ class EvaluationMiddleware(AgentMiddleware):
         """Release a planner reservation after provider failure."""
 
         settlement = self.execution_budget.cancel_model_call(reservation)
+        self._cancel_partition_reservation(reservation)
+        context = self._reservation_context.pop(reservation.reservation_id, {})
         self.trace.record(
             "model_call_cancelled",
             label=label,
+            call_sequence=context.get("call_sequence"),
+            stage=context.get("stage"),
+            active_subquestion_id=context.get("active_subquestion_id"),
             settlement=settlement,
             budget=self.execution_budget.snapshot(),
+            token_partition=self.token_partition_snapshot(),
         )
 
     def record_external_model_response(
@@ -341,6 +463,8 @@ class EvaluationMiddleware(AgentMiddleware):
         *,
         question: str,
         draft: str | None,
+        required_evidence_complete: bool = True,
+        missing_subquestions: Sequence[str] = (),
     ) -> str:
         """Use the held common reservation for one strict final synthesis."""
 
@@ -351,6 +475,26 @@ class EvaluationMiddleware(AgentMiddleware):
             return draft or ""
 
         clean_draft = _remove_final_answer_lines(draft or "")
+        if not required_evidence_complete:
+            settlement = self.execution_budget.cancel_model_call(reservation)
+            self._cancel_partition_reservation(reservation)
+            missing = ", ".join(item for item in missing_subquestions if item) or (
+                "one or more required subquestions"
+            )
+            self.trace.record(
+                "final_synthesis_skipped",
+                stage="final_extractor",
+                reason="required_subquestions_incomplete",
+                missing_subquestions=list(missing_subquestions),
+                settlement=settlement,
+                budget=self.execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
+            )
+            explanation = (
+                f"INSUFFICIENT_EVIDENCE: missing required subquestions: {missing}"
+            )
+            return f"{explanation}\nFINAL_ANSWER: ABSTAIN"
+
         with self._lock:
             evidence_context = "\n\n".join(self._final_evidence_fragments)
         prompt = (
@@ -368,9 +512,51 @@ class EvaluationMiddleware(AgentMiddleware):
             "information as the candidate answer."
         )
         label = "evaluation.final_synthesis"
+        stage: ModelStage = "final_extractor"
+        cap = self.stage_output_cap(stage)
+        context = _external_context_profile(
+            [
+                SystemMessage(content="strict answer extractor"),
+                HumanMessage(content=prompt),
+            ]
+        )
+        reservation_context = self._reservation_context.setdefault(
+            reservation.reservation_id,
+            {},
+        )
+        self._model_call_sequence += 1
+        reservation_context.update(
+            {
+                "call_sequence": self._model_call_sequence,
+                "stage": stage,
+                "active_subquestion_id": None,
+                "stage_output_cap": cap,
+                "context": context,
+                "tools_since_previous_call": self._consume_tools_since_model_call(),
+            }
+        )
+        self.trace.record(
+            "model_call_started",
+            label=label,
+            call_sequence=self._model_call_sequence,
+            stage=stage,
+            active_subquestion_id=None,
+            estimated_input_tokens=_estimate_external_input_tokens(
+                [
+                    SystemMessage(content="strict answer extractor"),
+                    HumanMessage(content=prompt),
+                ]
+            ),
+            max_output_tokens=cap,
+            token_reservation=reservation.reserved_tokens,
+            context=context,
+            tools_since_previous_call=reservation_context["tools_since_previous_call"],
+            budget=self.execution_budget.snapshot(),
+            token_partition=self.token_partition_snapshot(),
+        )
         started = time.perf_counter()
         try:
-            response = model.invoke(
+            response = self.model_for_stage(model, stage).invoke(
                 [
                     SystemMessage(
                         content=(
@@ -400,9 +586,12 @@ class EvaluationMiddleware(AgentMiddleware):
         marker = _strict_final_marker(_message_text(response))
         self.trace.record(
             "final_synthesis_finished",
+            call_sequence=self._model_call_sequence,
+            stage=stage,
             duration_seconds=duration,
             marker=marker,
             budget=self.execution_budget.snapshot(),
+            token_partition=self.token_partition_snapshot(),
         )
         prefix = clean_draft.rstrip()
         return f"{prefix}\n\n{marker}".lstrip() if prefix else marker
@@ -415,15 +604,36 @@ class EvaluationMiddleware(AgentMiddleware):
         """Reserve, trace, and account one synchronous model call."""
 
         label = _model_label(request)
+        stage = _stage_for_model_request(request)
+        active_subquestion_id = _active_subquestion_id(request)
+        original_context = _model_context_profile(request)
+        effective_request = (
+            _compact_tongagent_model_request(request)
+            if self._enable_context_compaction
+            else request
+        )
+        cap = self.stage_output_cap(stage)
+        model_settings = dict(effective_request.model_settings)
+        model_settings["max_tokens"] = cap
+        effective_request = effective_request.override(model_settings=model_settings)
+        effective_context = _model_context_profile(effective_request)
         reservation = self._reserve_model_call(
             label=label,
-            estimated_input_tokens=_estimate_model_request_input_tokens(request),
+            estimated_input_tokens=_estimate_model_request_input_tokens(
+                effective_request
+            ),
+            stage=stage,
+            active_subquestion_id=active_subquestion_id,
+            context_profile=effective_context,
+            original_context_profile=original_context,
         )
         started = time.perf_counter()
         try:
-            response = handler(request)
+            response = handler(effective_request)
         except Exception as exc:
             settlement = self.execution_budget.cancel_model_call(reservation)
+            self._cancel_partition_reservation(reservation)
+            context = self._reservation_context.pop(reservation.reservation_id, {})
             duration = max(0.0, time.perf_counter() - started)
             failure = _failure_from_exception(
                 exc,
@@ -434,13 +644,20 @@ class EvaluationMiddleware(AgentMiddleware):
             self.trace.record(
                 "model_call_failed",
                 label=label,
+                call_sequence=context.get("call_sequence"),
+                stage=stage,
+                active_subquestion_id=active_subquestion_id,
                 duration_seconds=duration,
                 failure=failure,
                 settlement=settlement,
                 budget=self.execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
             )
             raise
         duration = max(0.0, time.perf_counter() - started)
+        reservation_context = dict(
+            self._reservation_context.get(reservation.reservation_id, {})
+        )
         try:
             self._record_model_response(
                 response,
@@ -458,8 +675,16 @@ class EvaluationMiddleware(AgentMiddleware):
         self.trace.record(
             "model_call_finished",
             label=label,
+            call_sequence=reservation_context.get("call_sequence"),
+            stage=stage,
+            active_subquestion_id=active_subquestion_id,
             duration_seconds=duration,
             token_usage=_usage_from_response(response),
+            context=effective_context,
+            original_context=original_context,
+            stage_output_cap=cap,
+            budget=self.execution_budget.snapshot(),
+            token_partition=self.token_partition_snapshot(),
         )
         return response
 
@@ -513,6 +738,7 @@ class EvaluationMiddleware(AgentMiddleware):
                 },
             )
             self._append_tool_call(tool_call)
+            self._record_tool_since_model_call(tool_name)
             self.trace.record(
                 "tool_call_budget_exceeded",
                 call_id=call_id,
@@ -565,6 +791,7 @@ class EvaluationMiddleware(AgentMiddleware):
             )
             self._append_tool_call(tool_call)
             self._append_failure(failure)
+            self._record_tool_since_model_call(tool_name)
             self.trace.record(
                 "tool_call_failed",
                 call_id=call_id,
@@ -633,6 +860,7 @@ class EvaluationMiddleware(AgentMiddleware):
             metadata=metadata,
         )
         self._append_tool_call(tool_call)
+        self._record_tool_since_model_call(tool_name)
         if semantic_failure is not None:
             self._append_failure(semantic_failure)
         self.trace.record(
@@ -652,13 +880,60 @@ class EvaluationMiddleware(AgentMiddleware):
         *,
         label: str,
         estimated_input_tokens: int,
+        stage: ModelStage,
+        active_subquestion_id: str | None,
+        context_profile: Mapping[str, Any],
+        original_context_profile: Mapping[str, Any] | None = None,
     ) -> ModelCallReservation:
-        token_reservation = estimated_input_tokens + self._max_output_tokens
+        stage_output_cap = self.stage_output_cap(stage)
+        token_reservation = estimated_input_tokens + stage_output_cap
+        tools_since_previous_call = self._consume_tools_since_model_call()
+        partition: PartitionReservation | None = None
+        controller = self._token_controller
+        if controller is not None:
+            partition_result = controller.reserve(
+                stage=stage,
+                token_reservation=token_reservation,
+                subquestion_id=active_subquestion_id,
+            )
+            if isinstance(partition_result, PartitionDenial):
+                snapshot = self.execution_budget.snapshot()
+                attempted = {
+                    "token_reservation": token_reservation,
+                    "available_tokens": partition_result.available_tokens,
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "max_output_tokens": stage_output_cap,
+                    "stage": stage,
+                    "active_subquestion_id": active_subquestion_id,
+                    "partition_bucket": partition_result.bucket,
+                    "token_partition": partition_result.snapshot,
+                }
+                self.trace.record(
+                    "model_call_partition_exceeded",
+                    label=label,
+                    stage=stage,
+                    active_subquestion_id=active_subquestion_id,
+                    budget_resource=BudgetResource.SUBQUESTION_SLICE,
+                    attempted=attempted,
+                    context=context_profile,
+                    original_context=original_context_profile,
+                    tools_since_previous_call=tools_since_previous_call,
+                    budget=snapshot,
+                    token_partition=partition_result.snapshot,
+                )
+                raise BudgetExceeded(
+                    BudgetResource.SUBQUESTION_SLICE,
+                    snapshot=snapshot,
+                    attempted=attempted,
+                )
+            partition = partition_result
         try:
             reservation = self.execution_budget.require_model_call(
                 token_reservation=token_reservation
             )
         except BudgetExceeded as exc:
+            if partition is not None and controller is not None:
+                controller.cancel(partition)
             with self._lock:
                 self._budget_denied = True
                 self._budget_failure = exc
@@ -670,19 +945,49 @@ class EvaluationMiddleware(AgentMiddleware):
                 attempted={
                     **exc.attempted,
                     "estimated_input_tokens": estimated_input_tokens,
-                    "max_output_tokens": self._max_output_tokens,
+                    "max_output_tokens": stage_output_cap,
+                    "stage": stage,
+                    "active_subquestion_id": active_subquestion_id,
                 },
+                context=context_profile,
+                original_context=original_context_profile,
+                tools_since_previous_call=tools_since_previous_call,
                 budget=snapshot,
+                token_partition=self.token_partition_snapshot(),
             )
             raise
         else:
+            self._model_call_sequence += 1
+            call_sequence = self._model_call_sequence
+            if partition is not None:
+                self._partition_reservations[reservation.reservation_id] = partition
+            self._reservation_context[reservation.reservation_id] = {
+                "call_sequence": call_sequence,
+                "stage": stage,
+                "active_subquestion_id": active_subquestion_id,
+                "stage_output_cap": stage_output_cap,
+                "context": dict(context_profile),
+                "original_context": (
+                    dict(original_context_profile)
+                    if original_context_profile is not None
+                    else None
+                ),
+                "tools_since_previous_call": tools_since_previous_call,
+            }
             self.trace.record(
                 "model_call_started",
                 label=label,
+                call_sequence=call_sequence,
+                stage=stage,
+                active_subquestion_id=active_subquestion_id,
                 estimated_input_tokens=estimated_input_tokens,
-                max_output_tokens=self._max_output_tokens,
+                max_output_tokens=stage_output_cap,
                 token_reservation=token_reservation,
+                context=context_profile,
+                original_context=original_context_profile,
+                tools_since_previous_call=tools_since_previous_call,
                 budget=self.execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
             )
             return reservation
 
@@ -693,6 +998,7 @@ class EvaluationMiddleware(AgentMiddleware):
         label: str,
         reservation: ModelCallReservation,
     ) -> None:
+        context = dict(self._reservation_context.get(reservation.reservation_id, {}))
         usage = _usage_from_response(response)
         if usage is None:
             settlement = self.execution_budget.settle_model_call(
@@ -700,12 +1006,22 @@ class EvaluationMiddleware(AgentMiddleware):
                 actual_tokens=None,
                 charge_reservation_if_unknown=True,
             )
+            self._settle_partition_reservation(
+                reservation,
+                actual_tokens=None,
+                charge_reservation_if_unknown=True,
+            )
             self.trace.record(
                 "model_token_usage_unavailable",
                 label=label,
+                call_sequence=context.get("call_sequence"),
+                stage=context.get("stage"),
+                active_subquestion_id=context.get("active_subquestion_id"),
                 settlement=settlement,
                 budget=self.execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
             )
+            self._reservation_context.pop(reservation.reservation_id, None)
             return
         self._merge_usage(usage)
         accounted_total = usage.get("total_tokens")
@@ -720,25 +1036,49 @@ class EvaluationMiddleware(AgentMiddleware):
                 actual_tokens=None,
                 charge_reservation_if_unknown=True,
             )
+            self._settle_partition_reservation(
+                reservation,
+                actual_tokens=None,
+                charge_reservation_if_unknown=True,
+            )
             self.trace.record(
                 "model_token_budget_unverifiable",
                 label=label,
+                call_sequence=context.get("call_sequence"),
+                stage=context.get("stage"),
+                active_subquestion_id=context.get("active_subquestion_id"),
                 usage=usage,
                 settlement=settlement,
                 budget=self.execution_budget.snapshot(),
+                token_partition=self.token_partition_snapshot(),
             )
+            self._reservation_context.pop(reservation.reservation_id, None)
             return
         settlement = self.execution_budget.settle_model_call(
             reservation,
             actual_tokens=accounted_total,
         )
+        self._settle_partition_reservation(
+            reservation,
+            actual_tokens=accounted_total,
+            charge_reservation_if_unknown=False,
+        )
         self.trace.record(
             "model_token_settled",
             label=label,
+            call_sequence=context.get("call_sequence"),
+            stage=context.get("stage"),
+            active_subquestion_id=context.get("active_subquestion_id"),
+            stage_output_cap=context.get("stage_output_cap"),
+            context=context.get("context"),
+            original_context=context.get("original_context"),
+            tools_since_previous_call=context.get("tools_since_previous_call", []),
             usage=usage,
             settlement=settlement,
             budget=self.execution_budget.snapshot(),
+            token_partition=self.token_partition_snapshot(),
         )
+        self._reservation_context.pop(reservation.reservation_id, None)
         if not settlement.token_budget_exceeded:
             return
         with self._lock:
@@ -770,6 +1110,64 @@ class EvaluationMiddleware(AgentMiddleware):
                     continue
                 self._known_usage_fields.add(field_name)
                 setattr(self, attribute, int(getattr(self, attribute)) + value)
+
+    def _reserve_partition(
+        self,
+        *,
+        stage: ModelStage,
+        token_reservation: int,
+        active_subquestion_id: str | None,
+    ) -> PartitionReservation | None:
+        controller = self._token_controller
+        if controller is None:
+            return None
+        result = controller.reserve(
+            stage=stage,
+            token_reservation=token_reservation,
+            subquestion_id=active_subquestion_id,
+        )
+        if isinstance(result, PartitionDenial):
+            raise ValueError(f"initial {stage} reservation exceeds token partition")
+        return result
+
+    def _cancel_partition_reservation(
+        self,
+        reservation: ModelCallReservation,
+    ) -> None:
+        partition = self._partition_reservations.pop(
+            reservation.reservation_id,
+            None,
+        )
+        if partition is not None and self._token_controller is not None:
+            self._token_controller.cancel(partition)
+
+    def _settle_partition_reservation(
+        self,
+        reservation: ModelCallReservation,
+        *,
+        actual_tokens: int | None,
+        charge_reservation_if_unknown: bool,
+    ) -> None:
+        partition = self._partition_reservations.pop(
+            reservation.reservation_id,
+            None,
+        )
+        if partition is not None and self._token_controller is not None:
+            self._token_controller.settle(
+                partition,
+                actual_tokens=actual_tokens,
+                charge_reservation_if_unknown=charge_reservation_if_unknown,
+            )
+
+    def _record_tool_since_model_call(self, tool_name: str) -> None:
+        with self._lock:
+            self._tools_since_model_call.append(tool_name)
+
+    def _consume_tools_since_model_call(self) -> list[str]:
+        with self._lock:
+            tools = list(self._tools_since_model_call)
+            self._tools_since_model_call.clear()
+            return tools
 
     def _append_tool_call(self, tool_call: ToolCall) -> None:
         with self._lock:
@@ -812,9 +1210,13 @@ class _AccountedSummaryModel(BaseChatModel):
         reservation = self.evaluation_middleware.reserve_external_model_call(
             label=self.label,
             request_payload=input,
+            stage="control_status",
         )
         try:
-            response = self.wrapped_model.invoke(
+            response = self.evaluation_middleware.model_for_stage(
+                self.wrapped_model,
+                "control_status",
+            ).invoke(
                 input,
                 config=config,
                 stop=stop,
@@ -844,9 +1246,13 @@ class _AccountedSummaryModel(BaseChatModel):
         reservation = self.evaluation_middleware.reserve_external_model_call(
             label=self.label,
             request_payload=input,
+            stage="control_status",
         )
         try:
-            response = await self.wrapped_model.ainvoke(
+            response = await self.evaluation_middleware.model_for_stage(
+                self.wrapped_model,
+                "control_status",
+            ).ainvoke(
                 input,
                 config=config,
                 stop=stop,
@@ -951,6 +1357,9 @@ def prepare_runtime(
     semantic_policy: EffortPolicy | None = None,
     semantic_strategy: SemanticStrategy = "fixed",
     enable_tongagent_evidence_state: bool = False,
+    enable_tongagent_token_control: bool = False,
+    enable_tongagent_context_compaction: bool = False,
+    search_query_normalizer: Callable[[str], str] | None = None,
 ) -> PreparedRuntime:
     """Resolve model and raw providers, then install shared semantic wrappers."""
 
@@ -986,6 +1395,13 @@ def prepare_runtime(
         trace,
         max_output_tokens=resolved_config.model.max_output_tokens or 1,
         reserve_final_synthesis=resolved_config.backend_kind == "live",
+        stage_output_caps=(
+            DEFAULT_TONGAGENT_STAGE_OUTPUT_CAPS
+            if enable_tongagent_token_control
+            else None
+        ),
+        enable_context_compaction=enable_tongagent_context_compaction,
+        enable_token_partitions=enable_tongagent_token_control,
     )
     semantic_tools, research_budget = _semantic_network_tools(
         resolved_config,
@@ -994,6 +1410,7 @@ def prepare_runtime(
         strategy=semantic_strategy,
         enable_tongagent_evidence_state=enable_tongagent_evidence_state,
         external_guard=middleware.external_tool_guard,
+        search_query_normalizer=search_query_normalizer,
     )
     trace.record(
         "runtime_prepared",
@@ -1370,6 +1787,7 @@ def _semantic_network_tools(
     strategy: SemanticStrategy = "fixed",
     enable_tongagent_evidence_state: bool = False,
     external_guard: Callable[[str], Mapping[str, Any] | None] | None = None,
+    search_query_normalizer: Callable[[str], str] | None = None,
 ) -> tuple[list[BaseTool], Any]:
     by_name = {item.name: item for item in raw_tools}
     raw_search = by_name.get("web_search")
@@ -1420,7 +1838,462 @@ def _semantic_network_tools(
         raw_fetch_tool=raw_fetch,
         budget=budget,
         external_guard=external_guard,
+        search_query_normalizer=search_query_normalizer,
     )
+
+
+def _stage_for_external_label(label: str) -> ModelStage:
+    normalized = label.casefold()
+    if "planner" in normalized:
+        return "planner"
+    if "summar" in normalized:
+        return "control_status"
+    if "final" in normalized:
+        return "final_extractor"
+    return "control_status"
+
+
+def _stage_for_model_request(request: ModelRequest[Any]) -> ModelStage:
+    human_marker = ""
+    for message in reversed(request.messages):
+        if isinstance(message, HumanMessage):
+            human_marker = str(message.id or "")
+            break
+    if human_marker.startswith("report-step-"):
+        return "final_synthesis"
+    last_tool = next(
+        (
+            str(message.name or "")
+            for message in reversed(request.messages)
+            if isinstance(message, ToolMessage)
+        ),
+        "",
+    )
+    if last_tool in {"fetch_url", "record_evidence"}:
+        return "evidence_selection"
+    if last_tool in {
+        "get_research_plan",
+        "get_source_ledger",
+        "get_evidence_graph",
+        "update_subquestion",
+    }:
+        return "control_status"
+    return "research_step"
+
+
+def _active_subquestion_id(request: ModelRequest[Any]) -> str | None:
+    state = request.state
+    if not isinstance(state, Mapping):
+        return None
+    value = state.get("active_subquestion_id")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def _external_context_profile(payload: Any) -> dict[str, int]:
+    chars = _stable_payload_chars(payload)
+    message_count = (
+        len(payload)
+        if isinstance(payload, Sequence)
+        and not isinstance(payload, (str, bytes, bytearray))
+        else 1
+    )
+    return {
+        "message_count": message_count,
+        "input_chars": chars,
+        "system_prompt_chars": 0,
+        "plan_chars": 0,
+        "event_chars": 0,
+        "ledger_chars": 0,
+        "evidence_graph_chars": 0,
+        "page_content_chars": 0,
+        "tool_message_chars": 0,
+        "other_history_chars": chars,
+        "tool_schema_chars": 0,
+    }
+
+
+def _model_context_profile(request: ModelRequest[Any]) -> dict[str, int]:
+    system_prompt_chars = (
+        _stable_payload_chars(request.system_message.content)
+        if request.system_message is not None
+        else 0
+    )
+    tool_message_chars = sum(
+        _stable_payload_chars(message)
+        for message in request.messages
+        if isinstance(message, ToolMessage)
+    )
+    other_history_chars = sum(
+        _stable_payload_chars(message)
+        for message in request.messages
+        if not isinstance(message, ToolMessage)
+    )
+    tool_schema_chars = sum(_stable_payload_chars(tool) for tool in request.tools)
+    page_content_chars = sum(
+        _fetch_tool_message_content_chars(message)
+        for message in request.messages
+        if isinstance(message, ToolMessage) and message.name == "fetch_url"
+    )
+    plan_chars = sum(
+        _stable_payload_chars(message.content)
+        for message in request.messages
+        if isinstance(message, ToolMessage)
+        and message.name in {"get_research_plan", "update_subquestion"}
+    )
+    ledger_chars = sum(
+        _stable_payload_chars(message.content)
+        for message in request.messages
+        if isinstance(message, ToolMessage) and message.name == "get_source_ledger"
+    )
+    evidence_graph_chars = sum(
+        _stable_payload_chars(message.content)
+        for message in request.messages
+        if isinstance(message, ToolMessage)
+        and message.name in {"get_evidence_graph", "record_evidence"}
+    )
+    event_chars = 0
+    for message in request.messages:
+        if not isinstance(message, HumanMessage) or not isinstance(
+            message.content, str
+        ):
+            continue
+        plan_chars += _marked_section_chars(
+            message.content,
+            "PLAN:\n",
+            "\n\nCANONICAL SOURCE LEDGER:",
+        )
+        ledger_chars += _marked_section_chars(
+            message.content,
+            "CANONICAL SOURCE LEDGER:\n",
+            "\n\nCANONICAL EVIDENCE GRAPH:",
+        )
+        evidence_graph_chars += _marked_section_chars(
+            message.content,
+            "CANONICAL EVIDENCE GRAPH:\n",
+            "\n\nALLOWED CAVEAT LINES:",
+        )
+        event_chars += _marked_section_chars(
+            message.content,
+            "RESEARCH EVENT SUMMARY:\n",
+            "\n\n",
+        )
+    payload: list[Any] = []
+    if request.system_message is not None:
+        payload.append(request.system_message)
+    payload.extend(request.messages)
+    payload.extend(request.tools)
+    if request.response_format is not None:
+        payload.append(request.response_format)
+    return {
+        "message_count": len(request.messages),
+        "input_chars": _stable_payload_chars(payload),
+        "system_prompt_chars": system_prompt_chars,
+        "plan_chars": plan_chars,
+        "event_chars": event_chars,
+        "ledger_chars": ledger_chars,
+        "evidence_graph_chars": evidence_graph_chars,
+        "page_content_chars": page_content_chars,
+        "tool_message_chars": tool_message_chars,
+        "other_history_chars": other_history_chars,
+        "tool_schema_chars": tool_schema_chars,
+    }
+
+
+def _marked_section_chars(content: str, start: str, end: str) -> int:
+    start_index = content.find(start)
+    if start_index < 0:
+        return 0
+    value_start = start_index + len(start)
+    end_index = content.find(end, value_start)
+    if end_index < 0:
+        end_index = len(content)
+    return max(0, end_index - value_start)
+
+
+def _compact_tongagent_model_request(
+    request: ModelRequest[Any],
+) -> ModelRequest[Any]:
+    active_question = _active_subquestion_question(request.state)
+    messages = list(request.messages)
+    if not isinstance(request.model, FixtureChatModel):
+        marker_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[index], HumanMessage)
+                and (
+                    str(messages[index].id or "").startswith("research-step-")
+                    or str(messages[index].id or "").startswith("report-step-")
+                )
+            ),
+            0,
+        )
+        messages = messages[marker_index:]
+    compacted: list[AnyMessage] = []
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            content = _compact_tool_message_content(
+                message.name or "",
+                message.content,
+                state=request.state,
+                active_question=active_question,
+            )
+            compacted.append(message.model_copy(update={"content": content}))
+            continue
+        if isinstance(message, AIMessage) and message.tool_calls:
+            calls = []
+            for call in message.tool_calls:
+                args = dict(call.get("args", {}))
+                for key, limit in (("quote", 500), ("claim", 500), ("content", 500)):
+                    if isinstance(args.get(key), str) and len(args[key]) > limit:
+                        args[key] = args[key][:limit]
+                calls.append({**call, "args": args})
+            compacted.append(message.model_copy(update={"tool_calls": calls}))
+            continue
+        compacted.append(message)
+    return request.override(messages=compacted)
+
+
+def _compact_tool_message_content(
+    tool_name: str,
+    content: Any,
+    *,
+    state: Mapping[str, Any],
+    active_question: str,
+) -> Any:
+    if not isinstance(content, str):
+        return content
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if not isinstance(payload, Mapping):
+        return content
+    if tool_name == "web_search":
+        results = []
+        for item in payload.get("results", [])[:5]:
+            if not isinstance(item, Mapping):
+                continue
+            results.append(
+                {
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "snippet": str(item.get("snippet", ""))[
+                        :_TONGAGENT_SEARCH_SNIPPET_CHARS
+                    ],
+                    "provider": item.get("provider"),
+                    "provider_rank": item.get("provider_rank"),
+                    "relevance_score": item.get("relevance_score"),
+                    "relevance_tier": item.get("relevance_tier"),
+                    "relevance_reason": item.get("relevance_reason"),
+                }
+            )
+        compact = {
+            "status": payload.get("status"),
+            "query": payload.get("query"),
+            "original_query": payload.get("original_query"),
+            "normalized_query": payload.get("normalized_query"),
+            "search_quality": payload.get("search_quality"),
+            "provider_success": payload.get("provider_success"),
+            "relevant_results": payload.get("relevant_results"),
+            "uncertain_results": payload.get("uncertain_results"),
+            "results": results,
+        }
+        return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if tool_name == "fetch_url":
+        page = str(payload.get("content", ""))
+        excerpt = _select_relevant_page_excerpt(page, active_question)
+        compact = {
+            key: payload.get(key)
+            for key in (
+                "status",
+                "source_id",
+                "title",
+                "url",
+                "original_url",
+                "final_url",
+                "acquisition_method",
+                "content_provider",
+                "evidence_quality",
+                "failure_taxonomy",
+            )
+            if key in payload
+        }
+        compact.update(
+            {
+                "content": excerpt,
+                "content_chars": len(excerpt),
+                "original_content_chars": payload.get("content_chars", len(page)),
+                "content_compacted_for_model": len(excerpt) < len(page),
+            }
+        )
+        return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if tool_name == "get_research_plan":
+        plan = payload
+        if isinstance(plan, Mapping):
+            active_id = state.get("active_subquestion_id")
+            subquestions = [
+                {
+                    "id": item.get("id"),
+                    "question": item.get("question"),
+                    "status": item.get("status"),
+                    "depends_on": item.get("depends_on", []),
+                    "evidence_source_ids": item.get("evidence_source_ids", []),
+                    "claim_ids": item.get("claim_ids", []),
+                    "note": item.get("note", ""),
+                    "active": item.get("id") == active_id,
+                }
+                for item in plan.get("subquestions", [])
+                if isinstance(item, Mapping)
+            ]
+            return json.dumps(
+                {
+                    "plan_id": plan.get("plan_id"),
+                    "objective": plan.get("objective"),
+                    "status": plan.get("status"),
+                    "structural_subquestion_coverage": plan.get(
+                        "structural_subquestion_coverage"
+                    ),
+                    "subquestions": subquestions,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+    if tool_name == "get_source_ledger":
+        ledger = payload
+        if isinstance(ledger, Mapping):
+            active_id = ledger.get(
+                "active_subquestion_id",
+                state.get("active_subquestion_id"),
+            )
+            sources = [
+                {
+                    "source_id": item.get("source_id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "evidence_quality": item.get("evidence_quality"),
+                    "acquisition_method": item.get("acquisition_method"),
+                }
+                for item in ledger.get("successful_sources", [])
+                if isinstance(item, Mapping)
+            ]
+            return json.dumps(
+                {
+                    "active_subquestion_id": active_id,
+                    "successful_sources": sources,
+                    "subquestion_limits": ledger.get("subquestion_limits", {}),
+                    "subquestion_usage": ledger.get("subquestion_usage", {}),
+                    "evidence_graph_counts": ledger.get(
+                        "evidence_graph_counts",
+                        {},
+                    ),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+    if tool_name == "get_evidence_graph":
+        ledger = payload
+        if isinstance(ledger, Mapping):
+            active_id = state.get("active_subquestion_id")
+            claims = [
+                item
+                for item in ledger.get("claims", [])
+                if isinstance(item, Mapping) and item.get("subquestion_id") == active_id
+            ]
+            claim_ids = {str(item.get("claim_id")) for item in claims}
+            evidence = [
+                item
+                for item in ledger.get("evidence_units", [])
+                if isinstance(item, Mapping) and str(item.get("claim_id")) in claim_ids
+            ]
+            conflicts = [
+                item
+                for item in ledger.get("conflicts", [])
+                if isinstance(item, Mapping) and str(item.get("claim_id")) in claim_ids
+            ]
+            return json.dumps(
+                {
+                    "claims": claims,
+                    "evidence_units": evidence,
+                    "conflicts": conflicts,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+    return content
+
+
+def _active_subquestion_question(state: Mapping[str, Any]) -> str:
+    active_id = state.get("active_subquestion_id")
+    plan = state.get("research_plan", {})
+    if not isinstance(plan, Mapping):
+        return ""
+    for item in plan.get("subquestions", []):
+        if isinstance(item, Mapping) and item.get("id") == active_id:
+            return str(item.get("question", ""))
+    return ""
+
+
+def _select_relevant_page_excerpt(content: str, query: str) -> str:
+    if len(content) <= _TONGAGENT_PAGE_CONTEXT_CHARS:
+        return content
+    terms = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", query)
+        if token.casefold()
+        not in {
+            "the",
+            "and",
+            "for",
+            "from",
+            "that",
+            "this",
+            "what",
+            "when",
+            "which",
+            "with",
+            "into",
+            "does",
+            "were",
+            "was",
+        }
+    }
+    fragments = [
+        item.strip()
+        for item in re.split(r"\n{2,}|(?<=[.!?])\s+(?=[A-Z0-9])", content)
+        if item.strip()
+    ]
+    ranked = sorted(
+        enumerate(fragments),
+        key=lambda pair: (
+            -sum(term in pair[1].casefold() for term in terms),
+            pair[0],
+        ),
+    )
+    selected: list[tuple[int, str]] = []
+    used = 0
+    for index, fragment in ranked:
+        if used >= _TONGAGENT_PAGE_CONTEXT_CHARS:
+            break
+        remaining = _TONGAGENT_PAGE_CONTEXT_CHARS - used
+        piece = fragment[:remaining]
+        if not piece:
+            continue
+        selected.append((index, piece))
+        used += len(piece) + 1
+    if not selected:
+        return content[:_TONGAGENT_PAGE_CONTEXT_CHARS]
+    return "\n".join(piece for _, piece in sorted(selected))
+
+
+def _fetch_tool_message_content_chars(message: ToolMessage) -> int:
+    if not isinstance(message.content, str):
+        return 0
+    try:
+        payload = json.loads(message.content)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    return len(str(payload.get("content", ""))) if isinstance(payload, Mapping) else 0
 
 
 def _model_label(request: ModelRequest[Any]) -> str:

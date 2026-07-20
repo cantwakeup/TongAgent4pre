@@ -116,6 +116,29 @@ _GENERIC_SEARCH_TERMS = frozenset(
     }
 )
 
+_ATOMIC_ATTRIBUTE_CANONICAL = {
+    "album": "discography",
+    "albums": "discography",
+    "apprehended": "imprisonment",
+    "birth": "birthplace",
+    "birthplace": "birthplace",
+    "born": "birthplace",
+    "building": "building",
+    "deepest": "depth",
+    "depth": "depth",
+    "discography": "discography",
+    "height": "height",
+    "hometown": "hometown",
+    "imprisoned": "imprisonment",
+    "imprisonment": "imprisonment",
+    "incarcerated": "imprisonment",
+    "jail": "imprisonment",
+    "prison": "imprisonment",
+    "release": "release",
+    "released": "release",
+    "tallest": "height",
+}
+
 
 def _host_matches_domain(host: str, domain: str) -> bool:
     normalized_host = host.casefold().rstrip(".").removeprefix("www.")
@@ -200,6 +223,8 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
     query_terms = list(dict.fromkeys(_meaningful_terms(query_without_site)))
     haystack_term_sequence = _meaningful_terms(raw_haystack)
     haystack_terms = set(haystack_term_sequence)
+    title_url_text = " ".join(str(result.get(key, "")) for key in ("title", "url"))
+    title_url_terms = _meaningful_terms(title_url_text)
     matched_terms = [term for term in query_terms if term in haystack_terms]
 
     entities = _entity_phrases(query_without_site)
@@ -218,6 +243,14 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
         if _contains_token_phrase(
             _meaningful_terms(entity),
             haystack_term_sequence,
+        )
+    ]
+    title_url_entities = [
+        entity
+        for entity in entities
+        if _contains_token_phrase(
+            _meaningful_terms(entity),
+            title_url_terms,
         )
     ]
 
@@ -318,6 +351,19 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
                 gate = "cjk_pair_coverage"
 
     bounded_score = min(score, 100)
+    if (
+        entities
+        and entity_gate
+        and not title_url_entities
+        and gate != "cjk_pair_coverage"
+    ):
+        # A snippet can mention the queried person or organization while the
+        # page itself is about a film, war, concert, or unrelated biography.
+        # Keep such candidates available for verification, but never allow
+        # snippet-only entity coverage to clear the relevant gate.
+        bounded_score = min(bounded_score, MIN_SEARCH_RELEVANCE_SCORE - 1)
+        gate = "snippet_only_entity_coverage"
+        entity_gate = False
     if bounded_score >= MIN_SEARCH_RELEVANCE_SCORE and (
         entity_gate or gate == "cjk_pair_coverage"
     ):
@@ -341,6 +387,7 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
         "rejection_reason": rejection_reason,
         "matched_terms": matched_terms,
         "matched_entity_terms": matched_entity_terms,
+        "title_url_entities": title_url_entities,
         "matched_years": matched_years,
         "matched_numbers": matched_numbers,
         "provider_rank_adjustment": provider_rank_adjustment,
@@ -375,10 +422,72 @@ def deterministic_query_rewrite(query: str) -> str:
     return rewritten or " ".join(query.split())
 
 
+def normalize_atomic_search_query(query: str, *, max_words: int = 12) -> str:
+    """Reduce one generated query to an entity-plus-attribute lookup.
+
+    The transform is deterministic and deliberately does not infer an answer.
+    It keeps at most one entity phrase, a small set of canonical attributes,
+    and up to two year constraints. This prevents a whole multi-hop reasoning
+    description from becoming one over-constrained provider query.
+    """
+
+    normalized = " ".join(query.split())
+    if not normalized:
+        return normalized
+    if max_words < 4:
+        raise ValueError("max_words must be at least four")
+
+    site_operators = [f"site:{item}" for item in _SITE.findall(normalized)[:1]]
+    without_site = _SITE.sub(" ", normalized)
+    entities = _entity_phrases(without_site)
+    entity = entities[0] if entities else ""
+    entity_terms = set(_meaningful_terms(entity))
+    raw_tokens = [item.casefold() for item in _ASCII_TOKEN.findall(without_site)]
+
+    attributes: list[str] = []
+    for token in raw_tokens:
+        canonical = _ATOMIC_ATTRIBUTE_CANONICAL.get(token)
+        if canonical and canonical not in attributes:
+            attributes.append(canonical)
+    if not attributes:
+        attributes = [
+            term
+            for term in dict.fromkeys(_meaningful_terms(without_site))
+            if term not in entity_terms and term not in _GENERIC_SEARCH_TERMS
+        ][:3]
+
+    if not entity:
+        fallback_terms = [
+            term
+            for term in dict.fromkeys(_meaningful_terms(without_site))
+            if term not in set(attributes) and term not in _GENERIC_SEARCH_TERMS
+        ]
+        entity = " ".join(fallback_terms[:3])
+
+    years = list(dict.fromkeys(_YEAR.findall(without_site)))[:2]
+    pieces: list[str] = list(site_operators)
+    if entity:
+        pieces.append(f'"{" ".join(entity.split())}"')
+    pieces.extend(attributes[:3])
+    pieces.extend(years)
+
+    output: list[str] = []
+    used_words = 0
+    for piece in pieces:
+        piece_words = max(1, len(_ASCII_TOKEN.findall(piece)))
+        if output and used_words + piece_words > max_words:
+            continue
+        output.append(piece)
+        used_words += piece_words
+    compact = " ".join(output).strip()
+    return compact or normalized
+
+
 __all__ = [
     "MIN_SEARCH_RELEVANCE_SCORE",
     "MIN_UNCERTAIN_RELEVANCE_SCORE",
     "assess_search_relevance",
     "deterministic_query_rewrite",
+    "normalize_atomic_search_query",
     "search_relevance_score",
 ]

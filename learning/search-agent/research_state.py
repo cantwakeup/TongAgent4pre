@@ -255,3 +255,5 @@ class TongAgentState(DeepAgentState, total=False):
     research_cycles: int
     max_research_cycles: int
     report_markdown: str
+    compact_checkpoints: list[dict[str, Any]]
+    active_token_slice_exhausted: dict[str, Any] | None

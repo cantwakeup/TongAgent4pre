@@ -37,6 +37,7 @@
     {
       "case_id": "frames-0664-mandela-imprisonment",
       "query": "Nelson Mandela imprisoned years 1964 1990 prison release date",
+      "historical_long_query": "Nelson Mandela entered prison date 1962 27 years released 1990 February 11 exact date prison released",
       "drift_results": [
         {
           "title": "Nelson learning resources",
@@ -54,6 +55,23 @@
           "title": "Nelson Mandela imprisonment chronology",
           "url": "https://history-evidence.example/nelson-mandela-imprisonment",
           "snippet": "Mandela was sentenced in 1964 and released from prison in 1990."
+        }
+      ],
+      "weak_association_results": [
+        {
+          "title": "Angolan Civil War",
+          "url": "https://history-noise.invalid/angolan-civil-war",
+          "snippet": "An Angola retrospective briefly mentions Nelson Mandela in a broad conflict history."
+        },
+        {
+          "title": "George Michael",
+          "url": "https://music-noise.invalid/george-michael",
+          "snippet": "The singer participated in the Nelson Mandela 70th Birthday Tribute."
+        },
+        {
+          "title": "Invictus",
+          "url": "https://film-noise.invalid/invictus",
+          "snippet": "A film page notes that an actor portrays Nelson Mandela in a rugby story."
         }
       ],
       "numeric_mismatch_result": {

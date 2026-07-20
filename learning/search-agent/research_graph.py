@@ -52,6 +52,8 @@ BudgetActivate = Callable[[str | None], None]
 BudgetGrant = Callable[..., dict[str, Any]]
 ReportRead = Callable[[], str]
 ReportClear = Callable[[], None]
+TokenBudgetSnapshot = Callable[[], dict[str, Any]]
+TokenBudgetCanStart = Callable[[str], bool]
 EvidenceRecord = Callable[..., dict[str, Any]]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
@@ -1143,6 +1145,39 @@ def build_research_state_tools(
     return [get_research_plan, update_subquestion]
 
 
+def _compact_research_history(
+    state: TongAgentState,
+    *,
+    max_chars: int = 480,
+) -> str:
+    """Summarize durable control history without replaying prior SQ messages."""
+
+    events = list(state.get("research_events", []))
+    recent_events = [
+        {
+            "event": item.get("event"),
+            "subquestion_id": item.get("subquestion_id"),
+        }
+        for item in events[-4:]
+    ]
+    decisions = list(state.get("adaptive_control", {}).get("decision_history", []))
+    last_decision = decisions[-1] if decisions else {}
+    summary = json.dumps(
+        {
+            "event_count": len(events),
+            "recent_events": recent_events,
+            "last_control": {
+                "action": last_decision.get("action"),
+                "reason_codes": list(last_decision.get("reason_codes", []))[:4],
+            },
+            "compact_checkpoint_count": len(state.get("compact_checkpoints", [])),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return summary[:max_chars]
+
+
 def build_research_graph(
     *,
     research_agent: Any,
@@ -1165,6 +1200,8 @@ def build_research_graph(
     pinned_model: str = "",
     pinned_topology: str = "",
     max_escalations: int = 0,
+    token_budget_snapshot: TokenBudgetSnapshot | None = None,
+    token_budget_can_start: TokenBudgetCanStart | None = None,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
@@ -1278,6 +1315,10 @@ def build_research_graph(
             "research_cycles": 0,
             "max_research_cycles": max_research_cycles,
             "report_markdown": "",
+            "compact_checkpoints": (
+                list(state.get("compact_checkpoints", [])) if resuming_plan else []
+            ),
+            "active_token_slice_exhausted": None,
         }
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
@@ -1294,6 +1335,23 @@ def build_research_graph(
                 note="Covered state rejected: " + "; ".join(reasons),
             )
         plan, active = select_next_subquestion(audited_plan)
+        token_blocked: list[str] = []
+        while (
+            active
+            and token_budget_can_start is not None
+            and not token_budget_can_start(active)
+        ):
+            token_blocked.append(active)
+            plan = transition_subquestion(
+                plan,
+                active,
+                "blocked",
+                note=(
+                    "The required subquestion token partition has insufficient "
+                    "capacity for another compact research turn."
+                ),
+            )
+            plan, active = select_next_subquestion(plan)
         if budget_activate is not None:
             budget_activate(active)
         budget = budget_snapshot()
@@ -1337,6 +1395,20 @@ def build_research_graph(
                 "budget_limits": budget.get("subquestion_limits", {}).get(active, {}),
             },
         )
+        for subquestion_id in token_blocked:
+            events = append_research_event(
+                events,
+                "subquestion_token_partition_exhausted",
+                plan_id=plan["plan_id"],
+                subquestion_id=subquestion_id,
+                details={
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    )
+                },
+            )
         sources = budget.get("successful_sources", [])
         source_ids = [str(item.get("source_id", "")) for item in sources]
         evidence_ids = [
@@ -1360,6 +1432,7 @@ def build_research_graph(
             ),
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
+            "active_token_slice_exhausted": None,
         }
 
     def route_after_select(state: TongAgentState) -> Route:
@@ -1375,6 +1448,10 @@ def build_research_graph(
         budget = budget_snapshot()
         limits = budget.get("subquestion_limits", {}).get(active_id, {})
         usage = budget.get("subquestion_usage", {}).get(active_id, {})
+        token_partition = (
+            token_budget_snapshot() if token_budget_snapshot is not None else {}
+        )
+        event_summary = _compact_research_history(state)
         delegation_instruction = (
             "MULTI MODE: your very next tool call MUST be task with "
             "subagent_type='researcher' and its description MUST start exactly "
@@ -1390,14 +1467,19 @@ Root question: {state["research_plan"]["question"]}
 Active subquestion: {active["id"]} — {active["question"]}
 Rationale: {active["rationale"] or "Required for plan coverage."}
 Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ensure_ascii=False)}
+Token partition for this SQ: {json.dumps(token_partition.get("buckets", {}).get(f"sq:{active_id}", {}), ensure_ascii=False)}
+RESEARCH EVENT SUMMARY:
+{event_summary}
 
-{delegation_instruction}Research only this active subquestion. Read the explicit plan with get_research_plan when useful. After each successful fetch, call record_evidence for every factual proposition you may report, copying an exact 12-800 character excerpt from that fetched page. The claim argument must itself be a self-contained report-ready sentence with subject and predicate, never a label such as "official name" or "contact email"; quote is the separate exact page excerpt that supports it. OMIT claim_id when creating a new claim: the tool assigns C#. Pass claim_id only to add evidence to a C# already returned by a successful record_evidence call; never invent C#. If a tool call fails, read its error, correct the arguments, and retry within budget. Then call get_evidence_graph and pass update_subquestion exactly the [S#] IDs linked to this SQ's canonical [C#] claims. The final covered update also enforces the policy's minimum relevant-search and corroborating source-group counts; if it reports either minimum is unmet, continue researching and retry instead of blocking. A source alone cannot cover an SQ. Search snippets never receive source IDs or evidence units. If no supported claim can be registered within the reserved budget, mark the SQ blocked. Do not write the final report during this step."""
+{delegation_instruction}Research only this active subquestion. Every web_search query must target one atomic fact, normally `entity name + attribute`, use roughly 8-12 English words or fewer, and must not copy the full subquestion or include the final multi-hop calculation. Search different entities in separate calls. Read the explicit plan only when the active instruction is ambiguous. After each successful fetch, call record_evidence for every factual proposition you may report, copying an exact 12-800 character excerpt from that fetched page. The claim argument must itself be a self-contained report-ready sentence with subject and predicate, never a label such as "official name" or "contact email"; quote is the separate exact page excerpt that supports it. OMIT claim_id when creating a new claim: the tool assigns C#. Pass claim_id only to add evidence to a C# already returned by a successful record_evidence call; never invent C#. If a tool call fails, read its error, correct the arguments, and retry within budget. As soon as the active SQ has a relevant search and the minimum usable canonical evidence needed to answer it, call update_subquestion with exactly the linked [S#] IDs and end this research turn; do not keep polishing an already supported SQ. If update_subquestion reports a concrete missing quality gate, address only that gate and retry. A source alone cannot cover an SQ. Search snippets never receive source IDs or evidence units. If no supported claim can be registered within the reserved budget, mark the SQ blocked. Do not write the final report during this step."""
         message_id = (
             f"research-step-{state['research_plan']['plan_id']}-{active['id']}-"
             f"{active['attempts']}"
         )
         return {
-            "messages": [HumanMessage(content=content, id=message_id)],
+            "messages": [
+                HumanMessage(content=content, id=message_id),
+            ],
             "workflow_phase": "researching",
         }
 
@@ -1439,12 +1521,75 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
             for item in budget.get("tool_attempts", [])
             if int(item.get("sequence", 0)) >= first_attempt_sequence
         ]
+        token_slice_exhausted = state.get("active_token_slice_exhausted")
         if active_id:
             active = next(
                 item for item in plan["subquestions"] if item["id"] == active_id
             )
             if active["status"] == "researching":
-                if strategy == "fixed" and active["attempts"] >= active["max_attempts"]:
+                active_claims = [
+                    dict(item)
+                    for item in budget.get("claims", [])
+                    if item.get("subquestion_id") == active_id
+                    and item.get("status") in {"supported", "contested"}
+                ]
+                active_claim_ids = {
+                    str(item.get("claim_id", "")) for item in active_claims
+                }
+                active_evidence = [
+                    dict(item)
+                    for item in budget.get("evidence_units", [])
+                    if str(item.get("claim_id", "")) in active_claim_ids
+                ]
+                active_source_ids = list(
+                    dict.fromkeys(
+                        str(item.get("source_id", ""))
+                        for item in active_evidence
+                        if item.get("source_id")
+                    )
+                )
+                active_conflict_ids = [
+                    str(item.get("conflict_id", ""))
+                    for item in budget.get("conflicts", [])
+                    if str(item.get("claim_id", "")) in active_claim_ids
+                ]
+                active_relevant = int(
+                    budget.get("subquestion_usage", {})
+                    .get(active_id, {})
+                    .get("relevant_searches")
+                    or 0
+                )
+                if (
+                    token_slice_exhausted
+                    and active_claim_ids
+                    and active_source_ids
+                    and active_relevant >= 1
+                ):
+                    plan = transition_subquestion(
+                        plan,
+                        active_id,
+                        "covered",
+                        evidence_source_ids=active_source_ids,
+                        claim_ids=sorted(active_claim_ids),
+                        conflict_ids=active_conflict_ids,
+                        note=(
+                            "The local token slice ended after the minimum "
+                            "canonical evidence for this subquestion was recorded."
+                        ),
+                    )
+                elif token_slice_exhausted:
+                    plan = transition_subquestion(
+                        plan,
+                        active_id,
+                        "blocked",
+                        note=(
+                            "The local token slice ended before minimum canonical "
+                            "evidence could be recorded."
+                        ),
+                    )
+                elif (
+                    strategy == "fixed" and active["attempts"] >= active["max_attempts"]
+                ):
                     plan = transition_subquestion(
                         plan,
                         active_id,
@@ -1531,6 +1676,54 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                 "cycle": cycles,
             },
         )
+        if token_slice_exhausted:
+            events = append_research_event(
+                events,
+                "subquestion_token_slice_stopped",
+                plan_id=plan["plan_id"],
+                subquestion_id=active_id or "",
+                details={
+                    "denial": token_slice_exhausted,
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    ),
+                },
+            )
+        compact_checkpoints = list(state.get("compact_checkpoints", []))
+        active_after = next(
+            (item for item in plan["subquestions"] if item.get("id") == active_id),
+            {},
+        )
+        compact_checkpoints.append(
+            {
+                "cycle": cycles,
+                "subquestion_id": active_id,
+                "status": active_after.get("status"),
+                "source_ids": list(active_after.get("evidence_source_ids", [])),
+                "claim_ids": list(active_after.get("claim_ids", [])),
+                "conflict_ids": list(active_after.get("conflict_ids", [])),
+                "new_source_ids": new_ids,
+                "new_claim_ids": new_claim_ids,
+                "new_evidence_ids": new_evidence_ids,
+                "token_partition": (
+                    token_budget_snapshot() if token_budget_snapshot is not None else {}
+                ),
+            }
+        )
+        events = append_research_event(
+            events,
+            "subquestion_compact_checkpoint",
+            plan_id=plan["plan_id"],
+            subquestion_id=active_id or "",
+            details={
+                "cycle": cycles,
+                "status": active_after.get("status"),
+                "source_ids": list(active_after.get("evidence_source_ids", [])),
+                "claim_ids": list(active_after.get("claim_ids", [])),
+            },
+        )
         return {
             "research_plan": plan,
             "research_events": events,
@@ -1539,6 +1732,8 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
             "active_subquestion_id": None,
             "research_cycles": cycles,
             "workflow_phase": "evaluating",
+            "compact_checkpoints": compact_checkpoints,
+            "active_token_slice_exhausted": None,
         }
 
     def route_after_evaluate(state: TongAgentState) -> str:
@@ -1782,18 +1977,82 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                 "integrity_errors": integrity_errors,
             },
         )
-        plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
+        report_plan = {
+            "plan_id": plan.get("plan_id"),
+            "question": plan.get("question"),
+            "objective": plan.get("objective"),
+            "status": plan.get("status"),
+            "structural_subquestion_coverage": plan.get(
+                "structural_subquestion_coverage"
+            ),
+            "subquestions": [
+                {
+                    "id": item.get("id"),
+                    "question": item.get("question"),
+                    "status": item.get("status"),
+                    "evidence_source_ids": item.get("evidence_source_ids", []),
+                    "claim_ids": item.get("claim_ids", []),
+                    "conflict_ids": item.get("conflict_ids", []),
+                    "note": item.get("note", ""),
+                }
+                for item in plan.get("subquestions", [])
+            ],
+        }
+        plan_json = json.dumps(report_plan, ensure_ascii=False, separators=(",", ":"))
         report_sources = (
-            [] if integrity_fail_closed else budget.get("successful_sources", [])
+            []
+            if integrity_fail_closed
+            else [
+                {
+                    "source_id": item.get("source_id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "evidence_quality": item.get("evidence_quality"),
+                    "quality_reason": item.get("quality_reason", ""),
+                    "acquisition_method": item.get("acquisition_method"),
+                }
+                for item in budget.get("successful_sources", [])
+                if isinstance(item, dict)
+            ]
         )
         ledger_json = json.dumps(report_sources, ensure_ascii=False, indent=2)
         report_graph = (
             {"claims": [], "evidence_units": [], "conflicts": []}
             if integrity_fail_closed
             else {
-                "claims": budget.get("claims", []),
-                "evidence_units": budget.get("evidence_units", []),
-                "conflicts": budget.get("conflicts", []),
+                "claims": [
+                    {
+                        "claim_id": item.get("claim_id"),
+                        "subquestion_id": item.get("subquestion_id"),
+                        "text": item.get("text"),
+                        "status": item.get("status"),
+                        "source_ids": item.get("source_ids", []),
+                    }
+                    for item in budget.get("claims", [])
+                    if isinstance(item, dict)
+                ],
+                "evidence_units": [
+                    {
+                        "evidence_id": item.get("evidence_id"),
+                        "claim_id": item.get("claim_id"),
+                        "subquestion_id": item.get("subquestion_id"),
+                        "source_id": item.get("source_id"),
+                        "stance": item.get("stance"),
+                        "quote": item.get("quote"),
+                    }
+                    for item in budget.get("evidence_units", [])
+                    if isinstance(item, dict)
+                ],
+                "conflicts": [
+                    {
+                        "conflict_id": item.get("conflict_id"),
+                        "claim_id": item.get("claim_id"),
+                        "status": item.get("status"),
+                        "source_ids": item.get("source_ids", []),
+                    }
+                    for item in budget.get("conflicts", [])
+                    if isinstance(item, dict)
+                ],
             }
         )
         evidence_graph_json = json.dumps(
@@ -1870,11 +2129,38 @@ ALLOWED CAVEAT LINES:
         state: TongAgentState, config: RunnableConfig
     ) -> dict[str, Any]:
         """Run the uncheckpointed inner graph and atomically expose its ledger."""
-        result = research_agent.invoke(state, config=config)
+        try:
+            result = research_agent.invoke(state, config=config)
+        except Exception as exc:
+            resource = getattr(exc, "resource", None)
+            resource_value = getattr(resource, "value", resource)
+            if str(resource_value) != "subquestion_slice":
+                raise
+            events = append_research_event(
+                list(state.get("research_events", [])),
+                "subquestion_token_slice_exhausted",
+                plan_id=state["research_plan"]["plan_id"],
+                subquestion_id=str(state.get("active_subquestion_id") or ""),
+                details={
+                    "attempted": getattr(exc, "attempted", {}),
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    ),
+                },
+            )
+            return {
+                "research_events": events,
+                "budget_state": cast("BudgetState", budget_snapshot()),
+                "report_markdown": "",
+                "active_token_slice_exhausted": getattr(exc, "attempted", {}),
+            }
         return {
             **result,
             "budget_state": cast("BudgetState", budget_snapshot()),
             "report_markdown": "",
+            "active_token_slice_exhausted": None,
         }
 
     def invoke_report_agent(

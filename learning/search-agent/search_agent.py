@@ -2810,6 +2810,7 @@ def build_budgeted_tools(
     raw_fetch_tool: BaseTool | None = None,
     budget: ResearchBudget | None = None,
     external_guard: Callable[[str], Mapping[str, Any] | None] | None = None,
+    search_query_normalizer: Callable[[str], str] | None = None,
 ) -> tuple[list[BaseTool], ResearchBudget]:
     """Wrap raw search/fetch tools with one shared semantic and budget ledger."""
     if budget is None:
@@ -2858,15 +2859,29 @@ def build_budgeted_tools(
     @tool("web_search")
     def limited_web_search(query: str, max_results: int = 5) -> str:
         """Search the public web within the active run budget."""
+        original_query = " ".join(query.split())
+        normalized_query = (
+            " ".join(search_query_normalizer(original_query).split())
+            if search_query_normalizer is not None
+            else original_query
+        )
+        if not normalized_query:
+            normalized_query = original_query
+        query_metadata = {
+            "query": normalized_query,
+            "original_query": original_query,
+            "normalized_query": normalized_query,
+            "query_normalized": normalized_query != original_query,
+        }
         if not budget.reserve_search():
             payload = {
                 "status": "budget_exceeded",
                 "tool": "web_search",
-                "query": query,
+                **query_metadata,
                 **budget.budget_denial("search"),
             }
             attempt = budget.record_tool_attempt(
-                tool_name="web_search", target=query, payload=payload
+                tool_name="web_search", target=normalized_query, payload=payload
             )
             payload.update(
                 {
@@ -2893,10 +2908,11 @@ def build_budgeted_tools(
         denial = external_denial("web_search")
         if denial is not None:
             budget.cancel_tool_reservation("search")
-            denial.setdefault("query", query)
+            for key, value in query_metadata.items():
+                denial.setdefault(key, value)
             attempt = budget.record_tool_attempt(
                 tool_name="web_search",
-                target=query,
+                target=normalized_query,
                 payload=denial,
             )
             denial.update(
@@ -2925,7 +2941,7 @@ def build_budgeted_tools(
         try:
             raw_payload = json.loads(
                 (search_provider or web_search).invoke(
-                    {"query": query, "max_results": result_limit}
+                    {"query": normalized_query, "max_results": result_limit}
                 )
             )
             if not isinstance(raw_payload, dict):
@@ -2938,11 +2954,13 @@ def build_budgeted_tools(
         except Exception as exc:
             payload = provider_error_payload(
                 tool_name="web_search",
-                target=query,
+                target=normalized_query,
                 error=exc,
             )
+        for key, value in query_metadata.items():
+            payload[key] = value
         attempt = budget.record_tool_attempt(
-            tool_name="web_search", target=query, payload=payload
+            tool_name="web_search", target=normalized_query, payload=payload
         )
         payload.update(
             {
@@ -3077,6 +3095,10 @@ For every research request:
 1. Follow the explicit research plan and focus on the active subquestion selected by the outer workflow.
 2. Use get_research_plan, get_source_ledger, and get_evidence_graph to inspect durable plan and provenance state.
 3. Use meaningfully different web_search queries within the active subquestion's reserved budget. Prefer `relevant` results. When only `uncertain` candidates are returned, fetch the best one to verify it; deterministic provider fallback and fusion have already run.
+   Each query must resolve one atomic fact, normally `entity name + attribute`.
+   Keep English queries to roughly 8-12 words or fewer, search different
+   entities separately, and never copy a whole multi-hop question or its final
+   calculation into one query.
 4. Select and fetch relevant pages. Prefer primary and official sources. Search snippets are discovery hints only. A `limited` source is a short page accepted only because its host is anchored by full evidence; use it for narrow facts and disclose the limitation.
 5. After fetching, call record_evidence for each proposition you may report. `claim` must be a self-contained report-ready sentence with a subject and predicate, never a label like "official name" or "contact email"; `quote` is the separate exact page excerpt. Omit claim_id when creating a new claim: code assigns the C#. Pass claim_id only to reuse a C# returned by a successful earlier call, such as when adding contradictory evidence. Never invent C# IDs. If registration fails, read the tool error, correct the call, and retry.
 6. Base factual claims only on supported or contested [C#] records. Cite them as `[C#][S#]`; never invent or locally renumber claim, evidence, or source IDs.
@@ -3114,6 +3136,10 @@ class AgentRuntimeDependencies:
     budget: ResearchBudget
     planner: Planner
     middleware: Sequence[AgentMiddleware[Any, Any]] = ()
+    token_budget_configure: Callable[[Sequence[str]], None] | None = None
+    token_budget_activate: Callable[[str | None], None] | None = None
+    token_budget_snapshot: Callable[[], dict[str, Any]] | None = None
+    token_budget_can_start: Callable[[str], bool] | None = None
 
 
 _REGISTERED_HARNESS_KEYS: set[str] = set()
@@ -3282,6 +3308,10 @@ def build_agent(
         reviewer_model = create_chat_model(worker_model_name)
         planner = build_model_planner(model)
         middleware: Sequence[AgentMiddleware[Any, Any]] = ()
+        token_budget_configure = None
+        token_budget_activate = None
+        token_budget_snapshot = None
+        token_budget_can_start = None
     else:
         if (
             runtime_dependencies.budget.policy != policy
@@ -3298,6 +3328,10 @@ def build_agent(
         reviewer_model = runtime_dependencies.reviewer_model
         planner = runtime_dependencies.planner
         middleware = tuple(runtime_dependencies.middleware)
+        token_budget_configure = runtime_dependencies.token_budget_configure
+        token_budget_activate = runtime_dependencies.token_budget_activate
+        token_budget_snapshot = runtime_dependencies.token_budget_snapshot
+        token_budget_can_start = runtime_dependencies.token_budget_can_start
 
     state_tools = build_research_state_tools(
         budget.snapshot, require_researcher=topology == "multi"
@@ -3379,14 +3413,27 @@ def build_agent(
         name="learning-search-report-agent",
     )
     max_subquestions = policy.max_subquestions
+
+    def configure_budgets(subquestion_ids: list[str]) -> None:
+        budget.configure_subquestions(subquestion_ids)
+        if token_budget_configure is not None:
+            token_budget_configure(subquestion_ids)
+
+    def activate_budgets(subquestion_id: str | None) -> None:
+        budget.activate_subquestion(subquestion_id)
+        if token_budget_activate is not None:
+            token_budget_activate(subquestion_id)
+
     agent = build_research_graph(
         research_agent=research_inner_agent,
         report_agent=report_inner_agent,
         planner=planner,
         budget_snapshot=budget.snapshot,
-        budget_configure=budget.configure_subquestions,
-        budget_activate=budget.activate_subquestion,
+        budget_configure=configure_budgets,
+        budget_activate=activate_budgets,
         budget_grant=budget.grant_subquestion,
+        token_budget_snapshot=token_budget_snapshot,
+        token_budget_can_start=token_budget_can_start,
         report_read=lambda: report_path.read_text() if report_path.is_file() else "",
         report_clear=lambda: report_path.unlink(missing_ok=True),
         checkpointer=checkpointer,

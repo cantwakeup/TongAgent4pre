@@ -232,12 +232,14 @@ def test_real_tongagent_graph_completes_with_native_exact_quote_provenance(
         native / "tool_calls.json",
         native / "trace.jsonl",
         tongagent / "checkpoint.sqlite",
+        tongagent / "compact_checkpoints.json",
         tongagent / "control.json",
         tongagent / "evidence.json",
         tongagent / "events.jsonl",
         tongagent / "plan.json",
         tongagent / "report.md",
         tongagent / "sources.json",
+        tongagent / "token_control.json",
         tongagent / "validation.json",
     }
     assert all(path.is_file() for path in expected)
@@ -256,6 +258,17 @@ def test_real_tongagent_graph_completes_with_native_exact_quote_provenance(
     actions = [item["action"] for item in control["decision_history"]]
     assert "expand_budget" in actions
     assert actions[-1] == "finish_success"
+    token_control = json.loads((tongagent / "token_control.json").read_text())
+    assert token_control["configured"] is True
+    assert token_control["stage_output_caps"]["planner"] <= (
+        config.model.max_output_tokens
+    )
+    assert token_control["buckets"]["sq:SQ1"]["actual_tokens"] > 0
+    compact_checkpoints = json.loads(
+        (tongagent / "compact_checkpoints.json").read_text()
+    )
+    assert compact_checkpoints
+    assert compact_checkpoints[-1]["subquestion_id"] == "SQ1"
     assert json.loads((tongagent / "validation.json").read_text()) == {
         "completeness_errors": [],
         "fatal_errors": [],

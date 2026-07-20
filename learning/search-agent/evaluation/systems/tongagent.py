@@ -39,6 +39,7 @@ from research_graph import (
     fallback_research_plan,
     invalid_covered_subquestions,
 )
+from retrieval_quality import normalize_atomic_search_query
 from search_agent import (
     AgentRuntimeDependencies,
     _adaptive_audit_errors,
@@ -135,6 +136,9 @@ class TongAgentRunner:
                 semantic_policy=policy,
                 semantic_strategy=_STRATEGY,
                 enable_tongagent_evidence_state=True,
+                enable_tongagent_token_control=True,
+                enable_tongagent_context_compaction=True,
+                search_query_normalizer=normalize_atomic_search_query,
             )
             planner = _build_accounted_planner(
                 task=task,
@@ -156,6 +160,10 @@ class TongAgentRunner:
                 budget=runtime.research_budget,
                 planner=planner,
                 middleware=(runtime.middleware, summarization),
+                token_budget_configure=runtime.middleware.configure_token_partitions,
+                token_budget_activate=runtime.middleware.activate_token_subquestion,
+                token_budget_snapshot=runtime.middleware.token_partition_snapshot,
+                token_budget_can_start=runtime.middleware.can_start_token_subquestion,
             )
             thread_id = f"eval-{run_id}"
             with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
@@ -251,11 +259,14 @@ class TongAgentRunner:
         }
         final_answer_override: str | None = None
         if runtime is not None and resolved_config.backend_kind == "live":
+            missing_subquestions = _missing_required_subquestions(plan)
             try:
                 final_answer_override = runtime.middleware.finalize_answer(
                     runtime.model,
                     question=task.question,
                     draft=report or None,
+                    required_evidence_complete=not missing_subquestions,
+                    missing_subquestions=missing_subquestions,
                 )
             except Exception as exc:
                 if caught is None:
@@ -324,6 +335,11 @@ class TongAgentRunner:
             fatal_errors=fatal_errors,
             completeness_errors=completeness_errors,
             source_section_canonicalized=canonicalized,
+            token_control=(
+                runtime.middleware.token_partition_snapshot()
+                if runtime is not None
+                else {}
+            ),
         )
         return result
 
@@ -384,9 +400,13 @@ User question: {topic}"""
                 "prompt": prompt,
                 "response_schema": PlanDraft.model_json_schema(),
             },
+            stage="planner",
         )
         try:
-            structured = runtime.model.with_structured_output(
+            structured = runtime.middleware.model_for_stage(
+                runtime.model,
+                "planner",
+            ).with_structured_output(
                 PlanDraft,
                 include_raw=True,
             )
@@ -714,6 +734,7 @@ def _write_tongagent_artifacts(
     fatal_errors: list[str],
     completeness_errors: list[str],
     source_section_canonicalized: bool,
+    token_control: dict[str, Any],
 ) -> None:
     """Persist the native Stage 03D state beside its SQLite checkpoint."""
 
@@ -736,6 +757,15 @@ def _write_tongagent_artifacts(
         else {}
     )
     _atomic_json(directory / "control.json", control)
+    _atomic_json(directory / "token_control.json", token_control)
+    _atomic_json(
+        directory / "compact_checkpoints.json",
+        (
+            list(native_state.get("compact_checkpoints", []))
+            if native_state is not None
+            else []
+        ),
+    )
     _atomic_json(directory / "sources.json", ledger)
     _atomic_json(
         directory / "evidence.json",
@@ -788,6 +818,21 @@ def _native_plan(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
         return None
     value = state.get("research_plan")
     return dict(value) if isinstance(value, Mapping) else None
+
+
+def _missing_required_subquestions(plan: Mapping[str, Any] | None) -> list[str]:
+    """Return stable identifiers for required SQs lacking canonical closure."""
+
+    if plan is None:
+        return ["research_plan"]
+    missing: list[str] = []
+    for item in _mapping_list(plan.get("subquestions")):
+        if item.get("status") == "covered":
+            continue
+        subquestion_id = str(item.get("id", "")).strip() or "unknown"
+        question = " ".join(str(item.get("question", "")).split())
+        missing.append(f"{subquestion_id}: {question}" if question else subquestion_id)
+    return missing
 
 
 def _native_messages(state: Mapping[str, Any] | None) -> list[BaseMessage]:

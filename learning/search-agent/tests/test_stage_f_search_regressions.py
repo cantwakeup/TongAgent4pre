@@ -14,6 +14,7 @@ from retrieval_quality import (
     MIN_SEARCH_RELEVANCE_SCORE,
     assess_search_relevance,
     deterministic_query_rewrite,
+    normalize_atomic_search_query,
     search_relevance_score,
 )
 from search_agent import (
@@ -157,6 +158,83 @@ class StageFSearchRegressionTests(unittest.TestCase):
                         any(term.casefold() in rewritten for term in alternatives),
                         f"rewrite lost required terms {alternatives!r}: {first!r}",
                     )
+
+    def test_historical_long_query_is_reduced_to_one_atomic_lookup(self) -> None:
+        case = next(
+            item
+            for item in self.cases
+            if item["case_id"] == "frames-0664-mandela-imprisonment"
+        )
+
+        normalized = normalize_atomic_search_query(case["historical_long_query"])
+
+        self.assertIn('"Nelson Mandela"', normalized)
+        self.assertIn("imprisonment", normalized)
+        self.assertLessEqual(len(normalized.split()), 8)
+        self.assertNotIn("February 11 exact date prison released", normalized)
+        self.assertEqual(
+            normalized,
+            normalize_atomic_search_query(case["historical_long_query"]),
+        )
+
+    def test_historical_weak_associations_never_become_relevant(self) -> None:
+        case = next(
+            item
+            for item in self.cases
+            if item["case_id"] == "frames-0664-mandela-imprisonment"
+        )
+
+        for result in case["weak_association_results"]:
+            assessment = assess_search_relevance(
+                case["historical_long_query"],
+                result,
+            )
+            with self.subTest(title=result["title"]):
+                self.assertNotEqual(assessment["tier"], "relevant")
+                self.assertLess(
+                    assessment["score"],
+                    MIN_SEARCH_RELEVANCE_SCORE,
+                )
+                self.assertEqual(
+                    assessment["gate"],
+                    "snippet_only_entity_coverage",
+                )
+
+    def test_budgeted_search_records_original_and_atomic_query(self) -> None:
+        case = next(
+            item
+            for item in self.cases
+            if item["case_id"] == "frames-0664-mandela-imprisonment"
+        )
+        provider_queries: list[str] = []
+
+        class Provider:
+            name = "fixture_provider"
+
+            def invoke(self, arguments: dict[str, object]) -> str:
+                query = str(arguments["query"])
+                provider_queries.append(query)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "query": query,
+                        "results": case["relevant_results"],
+                    }
+                )
+
+        tools, _ = build_budgeted_tools(
+            EFFORT_POLICIES["low"],
+            raw_search_tool=Provider(),
+            search_query_normalizer=normalize_atomic_search_query,
+        )
+        search = next(item for item in tools if item.name == "web_search")
+
+        payload = json.loads(search.invoke({"query": case["historical_long_query"]}))
+
+        self.assertEqual(provider_queries, [payload["normalized_query"]])
+        self.assertEqual(payload["original_query"], case["historical_long_query"])
+        self.assertTrue(payload["query_normalized"])
+        self.assertLessEqual(len(payload["normalized_query"].split()), 8)
 
     def test_search_agent_uses_the_entity_aware_scorer(self) -> None:
         for case in self.cases:
