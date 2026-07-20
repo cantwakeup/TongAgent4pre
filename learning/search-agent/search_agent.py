@@ -3140,6 +3140,7 @@ class AgentRuntimeDependencies:
     token_budget_activate: Callable[[str | None], None] | None = None
     token_budget_snapshot: Callable[[], dict[str, Any]] | None = None
     token_budget_can_start: Callable[[str], bool] | None = None
+    model_budget_snapshot: Callable[[], dict[str, Any]] | None = None
 
 
 _REGISTERED_HARNESS_KEYS: set[str] = set()
@@ -3312,6 +3313,7 @@ def build_agent(
         token_budget_activate = None
         token_budget_snapshot = None
         token_budget_can_start = None
+        model_budget_snapshot = None
     else:
         if (
             runtime_dependencies.budget.policy != policy
@@ -3332,12 +3334,17 @@ def build_agent(
         token_budget_activate = runtime_dependencies.token_budget_activate
         token_budget_snapshot = runtime_dependencies.token_budget_snapshot
         token_budget_can_start = runtime_dependencies.token_budget_can_start
+        model_budget_snapshot = runtime_dependencies.model_budget_snapshot
 
     state_tools = build_research_state_tools(
         budget.snapshot, require_researcher=topology == "multi"
     )
     source_ledger_tool = build_source_ledger_tool(budget.snapshot)
-    evidence_tools = build_evidence_graph_tools(budget.record_evidence, budget.snapshot)
+    evidence_tools = build_evidence_graph_tools(
+        budget.record_evidence,
+        budget.snapshot,
+        auto_update_subquestion=topology == "single",
+    )
     _disable_general_purpose_subagent(model)
     subagents = _build_subagents(
         topology=topology,
@@ -3357,7 +3364,12 @@ def build_agent(
         f"{policy.min_successful_sources} valid cited sources. Only the final synthesis may call write_file for "
         "/report.md."
         if topology == "multi"
-        else "Work directly on each active subquestion without delegating. Update its explicit status before continuing."
+        else (
+            "Work directly on each active subquestion without delegating. The "
+            "record_evidence tool deterministically updates a supported active "
+            "subquestion; stop the turn when it reports "
+            "subquestion_auto_updated=true."
+        )
     )
     adaptive_prompt = (
         "Stage 03D adaptive control is active. The effort policy is a hard ceiling, "
@@ -3434,6 +3446,7 @@ def build_agent(
         budget_grant=budget.grant_subquestion,
         token_budget_snapshot=token_budget_snapshot,
         token_budget_can_start=token_budget_can_start,
+        model_budget_snapshot=model_budget_snapshot,
         report_read=lambda: report_path.read_text() if report_path.is_file() else "",
         report_clear=lambda: report_path.unlink(missing_ok=True),
         checkpointer=checkpointer,

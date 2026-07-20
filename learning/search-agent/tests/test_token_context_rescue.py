@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest,
+)
 from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
@@ -121,7 +125,13 @@ def test_middleware_reserves_with_the_active_stage_cap() -> None:
         model=FakeListChatModel(responses=["unused"]),
         messages=[
             HumanMessage(
-                content="[RESEARCH STEP]\nActive subquestion: SQ1",
+                content=(
+                    "[RESEARCH STEP]\n"
+                    "ACTIVE RESEARCH CONTEXT:\n"
+                    '{"plan_id":"p","canonical_claims":[{"claim_id":"C1"}],'
+                    '"relevant_sources":[{"source_id":"S1"}]}\n\n'
+                    "Token partition for this SQ: {}"
+                ),
                 id="research-step-plan-SQ1-0",
             )
         ],
@@ -157,6 +167,12 @@ def test_middleware_reserves_with_the_active_stage_cap() -> None:
     assert started.payload["stage"] == "research_step"
     assert started.payload["max_output_tokens"] == 1_800
     assert started.payload["active_subquestion_id"] == "SQ1"
+    assert started.payload["context"]["active_context_chars"] > 0
+    assert started.payload["context"]["active_context_claim_count"] == 1
+    assert started.payload["context"]["active_context_source_count"] == 1
+    assert middleware.orchestration_snapshot()["model_calls_per_subquestion"] == {
+        "SQ1": 1
+    }
     partition = middleware.token_partition_snapshot()
     assert partition["stage_usage"]["research_step"]["actual_tokens"] == 60
 
@@ -249,6 +265,142 @@ def test_research_history_summary_is_fixed_length_and_delta_only() -> None:
     assert '"action":"continue"' in summary
     assert "x" * 100 not in summary
     assert "y" * 100 not in summary
+
+
+def test_orchestration_metrics_count_read_roundtrips_and_duplicate_retries() -> None:
+    middleware = EvaluationMiddleware(
+        ExecutionBudget(_limits()),
+        TraceCollector(),
+        max_output_tokens=1_024,
+    )
+
+    def call_tool(name: str, payload: dict[str, object]) -> None:
+        request = ToolCallRequest(
+            tool_call={
+                "name": name,
+                "args": {},
+                "id": f"{name}-call",
+                "type": "tool_call",
+            },
+            tool=None,
+            state={},
+            runtime=None,  # type: ignore[arg-type]
+        )
+        middleware.wrap_tool_call(
+            request,
+            lambda _: ToolMessage(
+                content=json.dumps(payload),
+                tool_call_id=f"{name}-call",
+                name=name,
+                status=(
+                    "error"
+                    if payload.get("status") == "duplicate_retry_blocked"
+                    else "success"
+                ),
+            ),
+        )
+
+    call_tool("get_source_ledger", {"status": "success"})
+    model_request = ModelRequest(
+        model=FakeListChatModel(responses=["unused"]),
+        messages=[HumanMessage(content="continue")],
+        state={"active_subquestion_id": "SQ1"},
+    )
+    middleware.wrap_model_call(
+        model_request,
+        lambda _: ModelResponse(
+            result=[
+                AIMessage(
+                    content="continue",
+                    usage_metadata={
+                        "input_tokens": 5,
+                        "output_tokens": 2,
+                        "total_tokens": 7,
+                    },
+                )
+            ]
+        ),
+    )
+    call_tool(
+        "record_evidence",
+        {"status": "duplicate_retry_blocked", "retryable": False},
+    )
+
+    metrics = middleware.orchestration_snapshot()
+    assert metrics["read_only_state_tool_calls"] == 1
+    assert metrics["avoidable_model_calls"] == 1
+    assert metrics["duplicate_tool_retries"] == 1
+
+
+def test_two_sq_normal_orchestration_budget_is_four_calls_each() -> None:
+    middleware = EvaluationMiddleware(
+        ExecutionBudget(_limits()),
+        TraceCollector(),
+        max_output_tokens=1_024,
+    )
+    sequence = 0
+
+    def model_call(subquestion_id: str) -> None:
+        nonlocal sequence
+        sequence += 1
+        request = ModelRequest(
+            model=FakeListChatModel(responses=["unused"]),
+            messages=[
+                HumanMessage(
+                    content=f"[RESEARCH STEP]\n{subquestion_id}",
+                    id=f"research-step-plan-{subquestion_id}-1",
+                )
+            ],
+            state={"active_subquestion_id": subquestion_id},
+        )
+        middleware.wrap_model_call(
+            request,
+            lambda _: ModelResponse(
+                result=[
+                    AIMessage(
+                        content=f"step {sequence}",
+                        usage_metadata={
+                            "input_tokens": 5,
+                            "output_tokens": 2,
+                            "total_tokens": 7,
+                        },
+                    )
+                ]
+            ),
+        )
+
+    def tool_call(name: str, subquestion_id: str) -> None:
+        call_id = f"{subquestion_id}-{name}"
+        request = ToolCallRequest(
+            tool_call={
+                "name": name,
+                "args": {},
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=None,
+            state={"active_subquestion_id": subquestion_id},
+            runtime=None,  # type: ignore[arg-type]
+        )
+        middleware.wrap_tool_call(
+            request,
+            lambda _: ToolMessage(
+                content=json.dumps({"status": "success"}),
+                tool_call_id=call_id,
+                name=name,
+            ),
+        )
+
+    for subquestion_id in ("SQ1", "SQ2"):
+        model_call(subquestion_id)
+        for tool_name in ("web_search", "fetch_url", "record_evidence"):
+            tool_call(tool_name, subquestion_id)
+            model_call(subquestion_id)
+
+    metrics = middleware.orchestration_snapshot()
+    assert metrics["model_calls_per_subquestion"] == {"SQ1": 4, "SQ2": 4}
+    assert metrics["read_only_state_tool_calls"] == 0
+    assert metrics["avoidable_model_calls"] == 0
 
 
 def test_ledger_compaction_uses_fresh_tool_delta_not_stale_outer_state() -> None:

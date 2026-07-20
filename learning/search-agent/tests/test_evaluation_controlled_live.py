@@ -46,7 +46,7 @@ def test_controlled_live_config_has_shared_hard_boundaries(tmp_path: Path) -> No
     assert all(config.budget.max_search_calls == 4 for config in configs)
     assert all(config.budget.max_fetch_calls == 6 for config in configs)
     assert all(config.budget.max_total_tool_calls == 12 for config in configs)
-    assert all(config.budget.max_model_calls == 12 for config in configs)
+    assert all(config.budget.max_model_calls == 16 for config in configs)
     assert all(config.budget.max_total_tokens == 100_000 for config in configs)
     assert all(config.budget.wall_time_seconds <= 600 for config in configs)
     _, policy = _resolve_options(configs[2])

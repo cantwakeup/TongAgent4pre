@@ -13,6 +13,7 @@ from retrieval_providers import ProviderSearchResponse, SearchResult
 from retrieval_quality import (
     MIN_SEARCH_RELEVANCE_SCORE,
     assess_search_relevance,
+    classify_query_task_type,
     deterministic_query_rewrite,
     normalize_atomic_search_query,
     search_relevance_score,
@@ -176,6 +177,32 @@ class StageFSearchRegressionTests(unittest.TestCase):
             normalized,
             normalize_atomic_search_query(case["historical_long_query"]),
         )
+
+    def test_enumeration_query_targets_overview_before_a_single_member(self) -> None:
+        question = (
+            "List all studio albums in the artist's discography and count which "
+            "were released during the stated period."
+        )
+        query = "Red Hot Chili Peppers albums discography list all release chronology"
+
+        self.assertEqual(classify_query_task_type(question), "list_or_enumeration")
+        normalized = normalize_atomic_search_query(query)
+        self.assertIn("discography", normalized)
+        self.assertIn("overview", normalized)
+        self.assertNotIn("One Hot Minute", normalized)
+        self.assertLessEqual(len(normalized.split()), 12)
+
+    def test_query_task_types_are_deterministic_and_general(self) -> None:
+        cases = {
+            "Where was the scientist born?": "single_fact_lookup",
+            "Compare the heights of the two towers.": "comparison",
+            "What is the trench depth in metres?": "date_or_numeric_lookup",
+            "Which works are in the complete list?": "list_or_enumeration",
+        }
+
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(classify_query_task_type(question), expected)
 
     def test_historical_weak_associations_never_become_relevant(self) -> None:
         case = next(

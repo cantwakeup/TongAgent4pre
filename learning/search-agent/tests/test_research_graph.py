@@ -15,8 +15,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph import MessagesState
 
-from evidence_graph import text_sha256
+from evidence_graph import EvidenceQuoteMismatch, text_sha256
 from research_graph import (
+    build_active_research_context,
+    build_evidence_graph_tools,
     DraftSubquestion,
     build_model_planner,
     build_research_graph,
@@ -715,6 +717,154 @@ class ResearchPlanTests(unittest.TestCase):
             ),
         )
         self.assertEqual(accepted.update["research_plan"]["coverage"], 0.5)
+
+    def test_active_context_is_current_sq_only_and_classifies_enumeration(self) -> None:
+        plan = create_research_plan(
+            "Count releases in a time window",
+            [
+                DraftSubquestion(question="Establish the time window"),
+                DraftSubquestion(
+                    question=(
+                        "Which albums are in the complete discography and how many "
+                        "were released during that window?"
+                    ),
+                    depends_on=[1],
+                ),
+            ],
+            plan_id_factory=lambda: "plan-context",
+        )
+        plan["subquestions"][0]["status"] = "covered"
+        plan["subquestions"][1]["status"] = "researching"
+        ledger = _FakeLedger()
+        ledger.add_source("SQ1")
+        snapshot = ledger.snapshot()
+        snapshot["subquestion_limits"] = {"SQ2": {"max_searches": 2, "max_fetches": 3}}
+        snapshot["subquestion_usage"]["SQ2"] = {
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "relevant_searches": 0,
+        }
+
+        context = build_active_research_context(
+            plan=plan,
+            active_subquestion_id="SQ2",
+            budget=snapshot,
+            model_budget={"remaining_model_calls": 11},
+        )
+
+        self.assertEqual(context.query_task_type, "list_or_enumeration")
+        self.assertEqual(context.remaining_search_budget, 2)
+        self.assertEqual(context.remaining_fetch_budget, 3)
+        self.assertEqual(context.remaining_model_calls, 11)
+        self.assertEqual(context.canonical_claims, [])
+        self.assertEqual(context.relevant_sources, [])
+        self.assertEqual(context.active_subquestion["id"], "SQ2")
+
+    def test_record_evidence_auto_updates_sq_without_read_or_update_tool(self) -> None:
+        ledger = _FakeLedger()
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+
+        def record(**_kwargs: Any) -> dict[str, Any]:
+            ledger.add_source("SQ1")
+            return {
+                "claim": dict(ledger.claims[-1]),
+                "evidence": dict(ledger.evidence_units[-1]),
+                "conflict": None,
+            }
+
+        tool = build_evidence_graph_tools(
+            record,
+            ledger.snapshot,
+            auto_update_subquestion=True,
+        )[0]
+        runtime = ToolRuntime(
+            state={
+                "research_plan": plan,
+                "research_events": [],
+                "active_subquestion_id": active,
+            },
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id="auto-evidence",
+            store=None,
+        )
+
+        result = tool.func(
+            source_id="S1",
+            claim="The primary fact is supported by the canonical source.",
+            quote="Exact evidence quote for SQ1.",
+            runtime=runtime,
+        )
+        payload = json.loads(result.update["messages"][0].content)
+
+        self.assertTrue(payload["subquestion_auto_updated"])
+        self.assertEqual(payload["next_state"], "covered")
+        self.assertEqual(
+            result.update["research_plan"]["subquestions"][0]["status"],
+            "covered",
+        )
+        self.assertIn(
+            "subquestion_updated",
+            [item["event"] for item in result.update["research_events"]],
+        )
+
+    def test_quote_mismatch_allows_one_correction_and_blocks_duplicate(self) -> None:
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+
+        def reject(**_kwargs: Any) -> dict[str, Any]:
+            raise EvidenceQuoteMismatch(
+                "S1",
+                candidate_quotes=["A literal canonical candidate quote from the page."],
+                normalized_similarity=0.91,
+            )
+
+        tool = build_evidence_graph_tools(reject, _FakeLedger().snapshot)[0]
+
+        def runtime(events: list[dict[str, Any]], call_id: str) -> ToolRuntime:
+            return ToolRuntime(
+                state={
+                    "research_plan": plan,
+                    "research_events": events,
+                    "active_subquestion_id": active,
+                },
+                context=None,
+                config={},
+                stream_writer=lambda _value: None,
+                tool_call_id=call_id,
+                store=None,
+            )
+
+        first = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A rejected approximate quote that is not on the page.",
+            runtime=runtime([], "quote-1"),
+        )
+        first_payload = json.loads(first.update["messages"][0].content)
+        self.assertEqual(first_payload["status"], "quote_mismatch")
+        self.assertTrue(first_payload["retryable"])
+        self.assertEqual(len(first_payload["candidate_quotes"]), 1)
+
+        duplicate = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A rejected approximate quote that is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-2"),
+        )
+        duplicate_payload = json.loads(duplicate.update["messages"][0].content)
+        self.assertEqual(duplicate_payload["status"], "duplicate_retry_blocked")
+        self.assertFalse(duplicate_payload["retryable"])
+
+        second_correction = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A different rejected correction that also is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-3"),
+        )
+        correction_payload = json.loads(second_correction.update["messages"][0].content)
+        self.assertEqual(correction_payload["status"], "quote_mismatch")
+        self.assertFalse(correction_payload["retryable"])
 
 
 class ResearchGraphTests(unittest.TestCase):

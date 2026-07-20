@@ -102,6 +102,9 @@ _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE = 4_096
 _FINAL_SYNTHESIS_DRAFT_CHARS = 6_000
 _TONGAGENT_PAGE_CONTEXT_CHARS = 3_500
 _TONGAGENT_SEARCH_SNIPPET_CHARS = 320
+_READ_ONLY_STATE_TOOLS = frozenset(
+    {"get_research_plan", "get_source_ledger", "get_evidence_graph"}
+)
 
 
 class _BaselineNoEvidenceState:
@@ -211,6 +214,8 @@ class EvaluationMiddleware(AgentMiddleware):
         self._reservation_context: dict[int, dict[str, Any]] = {}
         self._model_call_sequence = 0
         self._tools_since_model_call: list[str] = []
+        self._model_calls_by_subquestion: dict[str, int] = {}
+        self._avoidable_model_calls = 0
         if reserve_final_synthesis:
             final_cap = self.stage_output_cap("final_extractor")
             token_reservation = final_cap + _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE
@@ -340,6 +345,28 @@ class EvaluationMiddleware(AgentMiddleware):
     def token_partition_snapshot(self) -> dict[str, Any]:
         controller = self._token_controller
         return {} if controller is None else controller.snapshot()
+
+    def orchestration_snapshot(self) -> dict[str, Any]:
+        """Return compact model/tool efficiency telemetry for this run."""
+
+        with self._lock:
+            read_only_calls = sum(
+                item.tool_name in _READ_ONLY_STATE_TOOLS for item in self._tool_calls
+            )
+            duplicate_retries = sum(
+                item.tool_name == "record_evidence"
+                and isinstance(item.result, Mapping)
+                and item.result.get("status") == "duplicate_retry_blocked"
+                for item in self._tool_calls
+            )
+            return {
+                "model_calls_per_subquestion": dict(
+                    sorted(self._model_calls_by_subquestion.items())
+                ),
+                "read_only_state_tool_calls": read_only_calls,
+                "avoidable_model_calls": self._avoidable_model_calls,
+                "duplicate_tool_retries": duplicate_retries,
+            }
 
     def model_for_stage(
         self,
@@ -959,6 +986,14 @@ class EvaluationMiddleware(AgentMiddleware):
         else:
             self._model_call_sequence += 1
             call_sequence = self._model_call_sequence
+            if active_subquestion_id:
+                self._model_calls_by_subquestion[active_subquestion_id] = (
+                    self._model_calls_by_subquestion.get(active_subquestion_id, 0) + 1
+                )
+            if tools_since_previous_call and set(tools_since_previous_call).issubset(
+                _READ_ONLY_STATE_TOOLS
+            ):
+                self._avoidable_model_calls += 1
             if partition is not None:
                 self._partition_reservations[reservation.reservation_id] = partition
             self._reservation_context[reservation.reservation_id] = {
@@ -1909,6 +1944,9 @@ def _external_context_profile(payload: Any) -> dict[str, int]:
         "tool_message_chars": 0,
         "other_history_chars": chars,
         "tool_schema_chars": 0,
+        "active_context_chars": 0,
+        "active_context_claim_count": 0,
+        "active_context_source_count": 0,
     }
 
 
@@ -1952,6 +1990,9 @@ def _model_context_profile(request: ModelRequest[Any]) -> dict[str, int]:
         and message.name in {"get_evidence_graph", "record_evidence"}
     )
     event_chars = 0
+    active_context_chars = 0
+    active_context_claim_count = 0
+    active_context_source_count = 0
     for message in request.messages:
         if not isinstance(message, HumanMessage) or not isinstance(
             message.content, str
@@ -1977,6 +2018,24 @@ def _model_context_profile(request: ModelRequest[Any]) -> dict[str, int]:
             "RESEARCH EVENT SUMMARY:\n",
             "\n\n",
         )
+        active_payload = _marked_section_payload(
+            message.content,
+            "ACTIVE RESEARCH CONTEXT:\n",
+            "\n\nToken partition for this SQ:",
+        )
+        if active_payload is not None:
+            active_context_chars += len(active_payload)
+            try:
+                parsed_active = json.loads(active_payload)
+            except json.JSONDecodeError:
+                parsed_active = {}
+            if isinstance(parsed_active, Mapping):
+                active_context_claim_count += len(
+                    parsed_active.get("canonical_claims", [])
+                )
+                active_context_source_count += len(
+                    parsed_active.get("relevant_sources", [])
+                )
     payload: list[Any] = []
     if request.system_message is not None:
         payload.append(request.system_message)
@@ -1996,6 +2055,9 @@ def _model_context_profile(request: ModelRequest[Any]) -> dict[str, int]:
         "tool_message_chars": tool_message_chars,
         "other_history_chars": other_history_chars,
         "tool_schema_chars": tool_schema_chars,
+        "active_context_chars": active_context_chars,
+        "active_context_claim_count": active_context_claim_count,
+        "active_context_source_count": active_context_source_count,
     }
 
 
@@ -2008,6 +2070,17 @@ def _marked_section_chars(content: str, start: str, end: str) -> int:
     if end_index < 0:
         end_index = len(content)
     return max(0, end_index - value_start)
+
+
+def _marked_section_payload(content: str, start: str, end: str) -> str | None:
+    start_index = content.find(start)
+    if start_index < 0:
+        return None
+    value_start = start_index + len(start)
+    end_index = content.find(end, value_start)
+    if end_index < 0:
+        end_index = len(content)
+    return content[value_start:end_index]
 
 
 def _compact_tongagent_model_request(
@@ -2437,6 +2510,23 @@ def _tool_response_value(response: ToolMessage | Command[Any]) -> JsonValue:
                 pass
     else:
         raw = response
+        update = getattr(response, "update", None)
+        if isinstance(update, Mapping):
+            messages = update.get("messages")
+            if isinstance(messages, Sequence) and not isinstance(
+                messages,
+                (str, bytes, bytearray),
+            ):
+                tool_messages = [
+                    item for item in messages if isinstance(item, ToolMessage)
+                ]
+                if tool_messages:
+                    raw = tool_messages[-1].content
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except json.JSONDecodeError:
+                            pass
     return sanitize_trace_value(raw)
 
 

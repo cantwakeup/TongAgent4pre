@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from difflib import SequenceMatcher
+from html import unescape
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -42,11 +44,136 @@ INTEGRITY_FAILURE_CAVEAT = (
     "- Evidence integrity validation failed; no canonical facts are reported."
 )
 NO_CANONICAL_CLAIM_CAVEAT = "- No canonical claim passed the evidence gate."
+_EVIDENCE_PUNCTUATION_TRANSLATION = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u201f": '"',
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+    }
+)
+
+
+class EvidenceQuoteMismatch(ValueError):
+    """Describe a failed exact quote with canonical retry candidates."""
+
+    def __init__(
+        self,
+        source_id: str,
+        *,
+        candidate_quotes: list[str],
+        normalized_similarity: float,
+    ) -> None:
+        super().__init__(
+            f"Evidence quote is not an exact excerpt of canonical source {source_id}"
+        )
+        self.source_id = source_id
+        self.candidate_quotes = candidate_quotes
+        self.normalized_similarity = normalized_similarity
 
 
 def normalize_evidence_text(value: str) -> str:
-    """Collapse whitespace so copied excerpts survive HTML line boundaries."""
+    """Collapse whitespace without changing persisted canonical text hashes."""
     return " ".join(value.split())
+
+
+def _normalize_evidence_match_text(value: str) -> str:
+    """Normalize harmless typography only for locating a canonical page span."""
+
+    return " ".join(
+        unescape(value).translate(_EVIDENCE_PUNCTUATION_TRANSLATION).split()
+    )
+
+
+def _canonical_equivalent_quote(page: str, quote: str) -> str | None:
+    """Map a typographically equivalent quote back to literal page text."""
+
+    page_words = normalize_evidence_text(page).split()
+    match_page_words = _normalize_evidence_match_text(page).split()
+    match_quote_words = _normalize_evidence_match_text(quote).split()
+    if (
+        not match_quote_words
+        or len(page_words) != len(match_page_words)
+        or len(match_quote_words) > len(match_page_words)
+    ):
+        return None
+    width = len(match_quote_words)
+    folded_quote = [item.casefold() for item in match_quote_words]
+    for start in range(len(match_page_words) - width + 1):
+        candidate = [
+            item.casefold() for item in match_page_words[start : start + width]
+        ]
+        if candidate == folded_quote:
+            return " ".join(page_words[start : start + width])
+    return None
+
+
+def closest_evidence_quotes(
+    page: str,
+    quote: str,
+    *,
+    limit: int = 3,
+) -> tuple[list[str], float]:
+    """Return exact page spans nearest to a rejected normalized quote.
+
+    Candidates are selected deterministically from the normalized canonical
+    page. They remain literal contiguous substrings of that page; similarity
+    is advisory and never upgrades a mismatch into accepted evidence.
+    """
+
+    normalized_page = normalize_evidence_text(page)
+    normalized_quote = _normalize_evidence_match_text(quote)
+    if not normalized_page or not normalized_quote or limit < 1:
+        return [], 0.0
+    quote_words = normalized_quote.split()
+    page_words = normalized_page.split()
+    if not quote_words or not page_words:
+        return [], 0.0
+    target_width = min(len(quote_words), len(page_words))
+    widths = sorted(
+        {
+            max(1, min(len(page_words), target_width + delta))
+            for delta in (-4, -2, 0, 2, 4)
+        }
+    )
+    scored: list[tuple[float, int, str]] = []
+    stride = max(1, target_width // 8)
+    for width in widths:
+        final_start = max(0, len(page_words) - width)
+        starts = list(range(0, final_start + 1, stride))
+        if final_start not in starts:
+            starts.append(final_start)
+        for start in starts:
+            candidate = " ".join(page_words[start : start + width])
+            similarity = SequenceMatcher(
+                None,
+                normalized_quote.casefold(),
+                _normalize_evidence_match_text(candidate).casefold(),
+                autojunk=False,
+            ).ratio()
+            scored.append((similarity, start, candidate))
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1], item[2]))
+    candidates: list[str] = []
+    best = ranked[0][0] if ranked else 0.0
+    for _, _, candidate in ranked:
+        if candidate in candidates:
+            continue
+        candidates.append(candidate)
+        if len(candidates) == limit:
+            break
+    return candidates, round(best, 4)
 
 
 def allowed_report_caveat_lines(
@@ -362,8 +489,8 @@ class EvidenceGraphStore:
                 "normalized characters"
             )
             raise ValueError(msg)
-        normalized_quote = normalize_evidence_text(quote)
-        if not MIN_QUOTE_CHARS <= len(normalized_quote) <= MAX_QUOTE_CHARS:
+        requested_quote = normalize_evidence_text(quote)
+        if not MIN_QUOTE_CHARS <= len(requested_quote) <= MAX_QUOTE_CHARS:
             msg = (
                 f"Evidence quotes must contain {MIN_QUOTE_CHARS}-{MAX_QUOTE_CHARS} "
                 "normalized characters"
@@ -377,9 +504,17 @@ class EvidenceGraphStore:
                 "canonical URL before recording evidence"
             )
             raise ValueError(msg)
-        if normalized_quote not in page:
-            msg = f"Evidence quote is not an exact excerpt of canonical source {source_id}"
-            raise ValueError(msg)
+        if requested_quote in page:
+            normalized_quote = requested_quote
+        else:
+            normalized_quote = _canonical_equivalent_quote(page, requested_quote)
+            if normalized_quote is None:
+                candidates, similarity = closest_evidence_quotes(page, requested_quote)
+                raise EvidenceQuoteMismatch(
+                    source_id,
+                    candidate_quotes=candidates,
+                    normalized_similarity=similarity,
+                )
         if stance not in {"supports", "contradicts"}:
             msg = "Evidence stance must be supports or contradicts"
             raise ValueError(msg)

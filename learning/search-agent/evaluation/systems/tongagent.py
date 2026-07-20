@@ -164,6 +164,9 @@ class TongAgentRunner:
                 token_budget_activate=runtime.middleware.activate_token_subquestion,
                 token_budget_snapshot=runtime.middleware.token_partition_snapshot,
                 token_budget_can_start=runtime.middleware.can_start_token_subquestion,
+                model_budget_snapshot=lambda: execution_budget.snapshot().model_dump(
+                    mode="json"
+                ),
             )
             thread_id = f"eval-{run_id}"
             with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
@@ -337,6 +340,11 @@ class TongAgentRunner:
             source_section_canonicalized=canonicalized,
             token_control=(
                 runtime.middleware.token_partition_snapshot()
+                if runtime is not None
+                else {}
+            ),
+            orchestration=(
+                runtime.middleware.orchestration_snapshot()
                 if runtime is not None
                 else {}
             ),
@@ -735,6 +743,7 @@ def _write_tongagent_artifacts(
     completeness_errors: list[str],
     source_section_canonicalized: bool,
     token_control: dict[str, Any],
+    orchestration: dict[str, Any],
 ) -> None:
     """Persist the native Stage 03D state beside its SQLite checkpoint."""
 
@@ -758,6 +767,7 @@ def _write_tongagent_artifacts(
     )
     _atomic_json(directory / "control.json", control)
     _atomic_json(directory / "token_control.json", token_control)
+    _atomic_json(directory / "orchestration.json", orchestration)
     _atomic_json(
         directory / "compact_checkpoints.json",
         (

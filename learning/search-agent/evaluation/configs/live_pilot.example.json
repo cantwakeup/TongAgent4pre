@@ -22,7 +22,7 @@
     "max_search_calls": 4,
     "max_fetch_calls": 6,
     "max_total_tool_calls": 12,
-    "max_model_calls": 12,
+    "max_model_calls": 16,
     "max_total_tokens": 100000,
     "wall_time_seconds": 120.0,
     "max_results_per_search": 5,

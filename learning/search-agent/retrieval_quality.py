@@ -138,6 +138,40 @@ _ATOMIC_ATTRIBUTE_CANONICAL = {
     "released": "release",
     "tallest": "height",
 }
+_ENUMERATION_TERMS = frozenset(
+    {
+        "all",
+        "albums",
+        "chronology",
+        "count",
+        "discography",
+        "enumerate",
+        "list",
+        "members",
+        "overview",
+        "table",
+        "timeline",
+        "which",
+    }
+)
+_COMPARISON_TERMS = frozenset(
+    {"compare", "comparison", "difference", "higher", "lower", "ratio", "versus", "vs"}
+)
+_NUMERIC_LOOKUP_TERMS = frozenset(
+    {
+        "date",
+        "dates",
+        "depth",
+        "height",
+        "how",
+        "many",
+        "meters",
+        "metres",
+        "feet",
+        "year",
+        "years",
+    }
+)
 
 
 def _host_matches_domain(host: str, domain: str) -> bool:
@@ -422,6 +456,25 @@ def deterministic_query_rewrite(query: str) -> str:
     return rewritten or " ".join(query.split())
 
 
+def classify_query_task_type(question: str) -> str:
+    """Classify one SQ for deterministic query-shape guidance."""
+
+    tokens = {item.casefold() for item in _ASCII_TOKEN.findall(question)}
+    normalized = " ".join(question.casefold().split())
+    if tokens.intersection(_ENUMERATION_TERMS) or (
+        "how many" in normalized
+        and bool(tokens.intersection({"album", "albums", "items", "members", "works"}))
+    ):
+        return "list_or_enumeration"
+    if tokens.intersection(_COMPARISON_TERMS) or any(
+        marker in normalized for marker in ("compared with", "compared to")
+    ):
+        return "comparison"
+    if tokens.intersection(_NUMERIC_LOOKUP_TERMS) or _NUMBER.search(question):
+        return "date_or_numeric_lookup"
+    return "single_fact_lookup"
+
+
 def normalize_atomic_search_query(query: str, *, max_words: int = 12) -> str:
     """Reduce one generated query to an entity-plus-attribute lookup.
 
@@ -437,6 +490,7 @@ def normalize_atomic_search_query(query: str, *, max_words: int = 12) -> str:
     if max_words < 4:
         raise ValueError("max_words must be at least four")
 
+    task_type = classify_query_task_type(normalized)
     site_operators = [f"site:{item}" for item in _SITE.findall(normalized)[:1]]
     without_site = _SITE.sub(" ", normalized)
     entities = _entity_phrases(without_site)
@@ -455,6 +509,11 @@ def normalize_atomic_search_query(query: str, *, max_words: int = 12) -> str:
             for term in dict.fromkeys(_meaningful_terms(without_site))
             if term not in entity_terms and term not in _GENERIC_SEARCH_TERMS
         ][:3]
+    if task_type == "list_or_enumeration":
+        if "discography" in raw_tokens or {"album", "albums"}.intersection(raw_tokens):
+            attributes = ["discography", "overview"]
+        else:
+            attributes = ["list", "overview"]
 
     if not entity:
         fallback_terms = [
@@ -487,6 +546,7 @@ __all__ = [
     "MIN_SEARCH_RELEVANCE_SCORE",
     "MIN_UNCERTAIN_RELEVANCE_SCORE",
     "assess_search_relevance",
+    "classify_query_task_type",
     "deterministic_query_rewrite",
     "normalize_atomic_search_query",
     "search_relevance_score",
