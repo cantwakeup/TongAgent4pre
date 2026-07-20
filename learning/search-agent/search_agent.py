@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
 import os
 import re
-import socket
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -17,7 +15,7 @@ from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from uuid import uuid4
 
@@ -32,7 +30,7 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import BaseTool, InjectedToolArg, tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -84,6 +82,21 @@ from research_state import (
     ResearchStrategy,
     TongAgentState,
 )
+from retrieval_quality import (
+    MIN_SEARCH_RELEVANCE_SCORE,
+    assess_search_relevance,
+    deterministic_query_rewrite,
+    search_relevance_score,
+)
+from retrieval_safety import (
+    URLValidationError,
+    ValidatedURL,
+    build_pinned_request,
+    canonicalize_http_url,
+    public_addresses,
+    revalidate_public_url,
+    validate_public_url,
+)
 from telemetry import write_event_log, write_plan_snapshot
 
 
@@ -94,7 +107,6 @@ MAX_DOWNLOAD_BYTES = 1_000_000
 MAX_REDIRECTS = 3
 MIN_EVIDENCE_CHARS = 500
 MIN_LIMITED_EVIDENCE_CHARS = 300
-MIN_SEARCH_RELEVANCE_SCORE = 20
 
 
 def _load_local_env(path: Path) -> None:
@@ -216,52 +228,15 @@ def _host_matches_domain(host: str, domain: str) -> bool:
 
 
 def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
-    """Score lexical query/result overlap without trusting search-engine rank."""
-    haystack = " ".join(
-        str(result.get(key, "")) for key in ("title", "snippet", "url")
-    ).casefold()
-    score = 0
+    """Score entity-aware query/result overlap without trusting provider rank."""
 
-    for domain in re.findall(r"\bsite:([^\s]+)", query, flags=re.IGNORECASE):
-        # Search operators sometimes include a path; host matching must not.
-        domain_host = domain.split("/", 1)[0].rstrip(".")
-        if _host_matches_domain(
-            _normalized_host(str(result.get("url", ""))), domain_host
-        ):
-            score += 100
+    return search_relevance_score(query, result)
 
-    quoted = [
-        item.strip().casefold()
-        for item in re.findall(r'["“”]([^"“”]{2,})["“”]', query)
-        if item.strip()
-    ]
-    score += 50 * sum(item in haystack for item in quoted)
 
-    query_without_site = re.sub(r"\bsite:[^\s]+", " ", query, flags=re.IGNORECASE)
-    ascii_terms = {
-        item.casefold()
-        for item in re.findall(r"[A-Za-z][A-Za-z0-9._-]{2,}", query_without_site)
-        if item.casefold() not in {"site", "http", "https", "www"}
-    }
-    haystack_terms = {
-        item.casefold() for item in re.findall(r"[A-Za-z][A-Za-z0-9._-]{2,}", haystack)
-    }
-    score += 20 * len(ascii_terms.intersection(haystack_terms))
+def _deterministic_query_rewrite(query: str) -> str:
+    """Return the stable entity-quoting rewrite used by provider fallback."""
 
-    query_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query))
-    result_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", haystack))
-    if len(query_cjk) >= 2 and result_cjk:
-        query_pairs = {
-            query_cjk[index : index + 2] for index in range(len(query_cjk) - 1)
-        }
-        result_pairs = {
-            result_cjk[index : index + 2] for index in range(len(result_cjk) - 1)
-        }
-        if query_pairs:
-            score += round(
-                40 * len(query_pairs.intersection(result_pairs)) / len(query_pairs)
-            )
-    return min(score, 100)
+    return deterministic_query_rewrite(query)
 
 
 def _duckduckgo_results(
@@ -280,7 +255,16 @@ def _bing_results(
     client: httpx.Client, query: str, result_limit: int
 ) -> list[dict[str, Any]]:
     """Fetch and parse Bing's RSS results."""
-    response = client.get(BING_SEARCH_URL, params={"format": "rss", "q": query})
+    response = client.get(
+        BING_SEARCH_URL,
+        params={
+            "format": "rss",
+            "q": query,
+            "cc": "us",
+            "mkt": "en-US",
+            "setlang": "en-US",
+        },
+    )
     response.raise_for_status()
     root = ET.fromstring(response.content)
     return [
@@ -311,7 +295,18 @@ def _rank_search_results(
                 "url": url,
                 "snippet": str(raw.get("snippet", "")),
                 "engine": engine,
-                "relevance_score": _search_relevance_score(query, raw),
+            }
+            relevance = assess_search_relevance(query, raw)
+            item["relevance_score"] = relevance["score"]
+            item["relevance_details"] = {
+                key: relevance[key]
+                for key in (
+                    "gate",
+                    "matched_terms",
+                    "matched_entity_terms",
+                    "matched_years",
+                    "matched_numbers",
+                )
             }
             existing = merged.get(key)
             if (
@@ -329,32 +324,12 @@ def _rank_search_results(
 
 def _public_addresses(hostname: str) -> list[str]:
     """Resolve a hostname and reject local, private, or otherwise unsafe targets."""
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, None)}
-    except socket.gaierror as exc:
-        msg = f"Could not resolve host: {hostname}"
-        raise ValueError(msg) from exc
-    if not addresses:
-        msg = f"Host resolved to no addresses: {hostname}"
-        raise ValueError(msg)
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global:
-            msg = f"Refusing non-public address for {hostname}: {address}"
-            raise ValueError(msg)
-    return sorted(addresses)
+    return list(public_addresses(hostname))
 
 
-def _validate_public_url(url: str) -> None:
+def _validate_public_url(url: str) -> ValidatedURL:
     """Allow only public HTTP(S) URLs."""
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        msg = "Only http:// and https:// URLs are allowed"
-        raise ValueError(msg)
-    if not parsed.hostname:
-        msg = "URL must include a hostname"
-        raise ValueError(msg)
-    _public_addresses(parsed.hostname)
+    return validate_public_url(url)
 
 
 @tool
@@ -383,13 +358,17 @@ def web_search(query: str, max_results: int = 5) -> str:
         minimum_relevant = min(2, result_limit)
         use_fallback = relevant_duckduckgo < minimum_relevant
         bing: list[dict[str, Any]] = []
+        rewritten_query: str | None = None
         if use_fallback:
             if not fallback_reason:
                 fallback_reason = (
                     "duckduckgo_empty" if not duckduckgo else "duckduckgo_low_relevance"
                 )
+            candidate_rewrite = _deterministic_query_rewrite(query)
+            if " ".join(candidate_rewrite.split()) != " ".join(query.split()):
+                rewritten_query = candidate_rewrite
             try:
-                bing = _bing_results(client, query, result_limit)
+                bing = _bing_results(client, rewritten_query or query, result_limit)
                 engine_status["bing"] = "success"
             except (httpx.HTTPError, ET.ParseError, ValueError):
                 bing = []
@@ -419,6 +398,7 @@ def web_search(query: str, max_results: int = 5) -> str:
                 if rows
             ],
             "fallback_reason": fallback_reason or None,
+            "query_rewrite": rewritten_query,
             "search_quality": "relevant" if relevant_results else "low_relevance",
             "relevant_results": relevant_results,
             "provider_success": provider_success,
@@ -442,10 +422,47 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
     current_url = url
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,text/plain;q=0.9"}
 
-    with httpx.Client(timeout=20, headers=headers, follow_redirects=False) as client:
-        for redirect_count in range(MAX_REDIRECTS + 1):
-            _validate_public_url(current_url)
-            with client.stream("GET", current_url) as response:
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        try:
+            validation = _validate_public_url(current_url)
+        except URLValidationError as exc:
+            if redirect_count == 0:
+                raise
+            raise URLValidationError(
+                f"Redirect target rejected: {exc}",
+                taxonomy="redirect_rejected",
+            ) from exc
+        if isinstance(validation, ValidatedURL):
+            pinned = build_pinned_request(validation)
+            client_options: dict[str, Any] = {
+                "transport": pinned.transport,
+                "trust_env": False,
+            }
+            request_url = pinned.url
+            request_headers = pinned.headers
+            request_extensions = pinned.extensions
+        else:  # Compatibility for deterministic tests that patch the validator.
+            client_options = {}
+            request_url = current_url
+            request_headers = {}
+            request_extensions = {}
+        with httpx.Client(
+            timeout=20,
+            headers=headers,
+            follow_redirects=False,
+            **client_options,
+        ) as client:
+            stream = (
+                client.stream(
+                    "GET",
+                    request_url,
+                    headers=request_headers,
+                    extensions=request_extensions,
+                )
+                if isinstance(validation, ValidatedURL)
+                else client.stream("GET", request_url)
+            )
+            with stream as response:
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:
@@ -453,17 +470,30 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                             "status": "error",
                             "url": current_url,
                             "error": "Redirect response did not include a Location header",
+                            "failure_taxonomy": "redirect_invalid",
+                            "failure_type": "redirect_invalid",
+                            "retryable": False,
+                            "switch_source": True,
                         }
                     if redirect_count == MAX_REDIRECTS:
                         return {
                             "status": "error",
                             "url": url,
                             "error": "Too many redirects",
+                            "failure_taxonomy": "redirect_limit",
+                            "failure_type": "redirect_limit",
+                            "retryable": False,
+                            "switch_source": True,
                         }
                     current_url = urljoin(current_url, location)
                     continue
 
+                response_status = getattr(response, "status_code", None)
+                if isinstance(response_status, int) and response_status >= 400:
+                    return _http_status_failure(response_status, current_url)
                 response.raise_for_status()
+                if isinstance(validation, ValidatedURL):
+                    revalidate_public_url(validation)
                 content_type = response.headers.get("content-type", "").lower()
                 if not any(
                     kind in content_type
@@ -473,6 +503,10 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                         "status": "error",
                         "url": current_url,
                         "error": f"Unsupported content type: {content_type or 'unknown'}",
+                        "failure_taxonomy": "unsupported_content",
+                        "failure_type": "unsupported_content",
+                        "retryable": False,
+                        "switch_source": True,
                     }
 
                 raw_content_length = response.headers.get("content-length")
@@ -554,7 +588,15 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                 "truncation_reasons": truncation_reasons,
             }
 
-    return {"status": "error", "url": url, "error": "Could not fetch page"}
+    return {
+        "status": "error",
+        "url": url,
+        "error": "Could not fetch page",
+        "failure_taxonomy": "network_error",
+        "failure_type": "network_error",
+        "retryable": True,
+        "switch_source": True,
+    }
 
 
 @tool
@@ -565,23 +607,93 @@ def fetch_url(url: str, max_chars: int = 12_000) -> str:
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         failed_url = str(exc.request.url)
-        payload = {
-            "status": "error",
-            "url": failed_url,
-            "error": f"HTTP {status}",
-            "retry_with_another_source": True,
-        }
+        payload = _http_status_failure(status, failed_url)
     except httpx.RequestError as exc:
         failed_url = str(exc.request.url)
+        if isinstance(exc, httpx.TimeoutException):
+            taxonomy = "timeout"
+        elif isinstance(exc, httpx.ConnectError) and any(
+            type(item).__name__ == "gaierror" for item in _exception_chain(exc)
+        ):
+            taxonomy = "dns_error"
+        else:
+            taxonomy = "network_error"
         payload = {
             "status": "error",
             "url": failed_url,
             "error": type(exc).__name__,
+            "failure_taxonomy": taxonomy,
+            "failure_type": taxonomy,
+            "retryable": True,
+            "switch_source": True,
+            "retry_with_another_source": True,
+        }
+    except URLValidationError as exc:
+        rejected = exc.taxonomy in {
+            "dns_rebinding",
+            "dns_rejected",
+            "redirect_rejected",
+            "ssrf_rejected",
+        }
+        payload = {
+            "status": "rejected" if rejected else "error",
+            "url": url,
+            "error": str(exc),
+            "failure_taxonomy": exc.taxonomy,
+            "failure_type": exc.taxonomy,
+            "retryable": exc.retryable,
+            "switch_source": True,
             "retry_with_another_source": True,
         }
     except ValueError as exc:
-        payload = {"status": "rejected", "url": url, "error": str(exc)}
+        payload = {
+            "status": "rejected",
+            "url": url,
+            "error": str(exc),
+            "failure_taxonomy": "invalid_url",
+            "failure_type": "invalid_url",
+            "retryable": False,
+            "switch_source": True,
+            "retry_with_another_source": True,
+        }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _http_status_failure(status: int, url: str) -> dict[str, Any]:
+    """Return stable access/rate/server taxonomy without response contents."""
+
+    if status in {401, 403, 407, 451}:
+        taxonomy = "access_blocked"
+        retryable = False
+    elif status == 429:
+        taxonomy = "rate_limited"
+        retryable = True
+    else:
+        taxonomy = "http_error"
+        retryable = status >= 500
+    return {
+        "status": "error",
+        "url": url,
+        "error": f"HTTP {status}",
+        "http_status": status,
+        "failure_taxonomy": taxonomy,
+        "failure_type": taxonomy,
+        "retryable": retryable,
+        "switch_source": True,
+        "retry_with_another_source": True,
+    }
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Return one bounded exception chain without serializing provider details."""
+
+    chain = [error]
+    while len(chain) < 8:
+        next_error = chain[-1].__cause__ or chain[-1].__context__
+        if next_error is None or next_error in chain:
+            break
+        chain.append(next_error)
+    return chain
 
 
 @dataclass
@@ -831,6 +943,27 @@ class ResearchBudget:
             self._record_scope_call("fetch")
             return True
 
+    def cancel_tool_reservation(self, tool: str) -> None:
+        """Roll back a semantic reservation when the outer hard guard denies it."""
+
+        if tool not in {"search", "fetch"}:
+            raise ValueError(f"Unknown semantic reservation: {tool}")
+        with self._lock:
+            counter = "search_calls" if tool == "search" else "fetch_calls"
+            current = int(getattr(self, counter))
+            if current <= 0:
+                raise ValueError(f"No {tool} reservation is available to cancel")
+            scoped_usage: dict[str, int | None] | None = None
+            if self.subquestion_limits and self.active_subquestion_id is not None:
+                scoped_usage = self.subquestion_usage[self.active_subquestion_id]
+                if int(scoped_usage.get(counter, 0)) <= 0:
+                    raise ValueError(
+                        f"No scoped {tool} reservation is available to cancel"
+                    )
+            setattr(self, counter, current - 1)
+            if scoped_usage is not None:
+                scoped_usage[counter] = int(scoped_usage[counter]) - 1
+
     def record_search_success(self, *, relevant: bool = True) -> None:
         """Record one legacy result-bearing search observation.
 
@@ -911,10 +1044,45 @@ class ResearchBudget:
             return "success", "none", False
         if status == "budget_exceeded":
             return "budget_exceeded", "budget", False
+        if status == "suppressed":
+            taxonomy = str(
+                payload.get(
+                    "failure_taxonomy",
+                    payload.get("failure_type", "duplicate_url"),
+                )
+            )
+            return (
+                "suppressed",
+                "http" if taxonomy == "access_blocked" else "content",
+                False,
+            )
         if status == "rejected":
             return "rejected", "safety", False
         if status == "insufficient_content":
             return "insufficient_content", "content", True
+        taxonomy = str(
+            payload.get(
+                "failure_taxonomy",
+                payload.get("failure_type", ""),
+            )
+        ).casefold()
+        if taxonomy in {"timeout", "dns_error", "network_error"}:
+            return status or "error", "network", bool(payload.get("retryable", True))
+        if taxonomy in {"access_blocked", "rate_limited", "http_error"}:
+            return status or "error", "http", bool(payload.get("retryable", False))
+        if taxonomy in {
+            "dns_rebinding",
+            "dns_rejected",
+            "redirect_rejected",
+            "ssrf_rejected",
+        }:
+            return status or "error", "safety", False
+        if taxonomy in {
+            "redirect_invalid",
+            "redirect_limit",
+            "unsupported_content",
+        }:
+            return status or "error", "content", False
         normalized_error = " ".join(
             (
                 error,
@@ -940,7 +1108,12 @@ class ResearchBudget:
             failure_class = "content"
         else:
             failure_class = "unknown"
-        retryable = bool(payload.get("retry_with_another_source", True))
+        retryable = bool(
+            payload.get(
+                "retryable",
+                payload.get("retry_with_another_source", True),
+            )
+        )
         return status or "error", failure_class, retryable
 
     def record_tool_attempt(
@@ -1013,7 +1186,19 @@ class ResearchBudget:
                 "retryable": retryable,
                 "status": str(payload.get("status", "error")),
                 "error": str(payload.get("error", "")),
+                "failure_taxonomy": str(
+                    payload.get(
+                        "failure_taxonomy",
+                        payload.get("failure_type", ""),
+                    )
+                ),
+                "switch_source": bool(payload.get("switch_source", False)),
             }
+            if tool_name == "fetch_url":
+                try:
+                    attempt["canonical_target"] = canonicalize_http_url(target)
+                except URLValidationError:
+                    attempt["canonical_target"] = target
             if tool_name == "web_search":
                 attempt.update(
                     {
@@ -1118,6 +1303,72 @@ class ResearchBudget:
                     else {}
                 ),
             }
+
+    def fetch_suppression(self, url: str) -> dict[str, Any] | None:
+        """Skip repeated URLs and hosts already shown to block retrieval."""
+
+        try:
+            canonical = canonicalize_http_url(url)
+        except URLValidationError:
+            return None
+        target_host = _normalized_host(canonical)
+        with self._lock:
+            attempted_urls: set[str] = set()
+            blocked_hosts: set[str] = set()
+            for attempt in self.tool_attempts:
+                if attempt.get("tool") != "fetch_url":
+                    continue
+                status = str(attempt.get("status", ""))
+                if status in {"budget_exceeded", "suppressed"}:
+                    continue
+                prior_target = str(
+                    attempt.get("canonical_target", attempt.get("target", ""))
+                )
+                try:
+                    attempted_urls.add(canonicalize_http_url(prior_target))
+                except URLValidationError:
+                    pass
+                if attempt.get("failure_taxonomy") == "access_blocked":
+                    prior_host = _normalized_host(prior_target)
+                    if prior_host:
+                        blocked_hosts.add(prior_host)
+
+            if canonical in attempted_urls:
+                taxonomy = (
+                    "access_blocked"
+                    if target_host in blocked_hosts
+                    else "duplicate_url"
+                )
+                reason = "same_url_already_attempted"
+            elif target_host and target_host in blocked_hosts:
+                taxonomy = "access_blocked"
+                reason = "host_previously_access_blocked"
+            else:
+                return None
+            payload = {
+                "status": "suppressed",
+                "url": url,
+                "error": reason,
+                "suppression_reason": reason,
+                "failure_taxonomy": taxonomy,
+                "failure_type": taxonomy,
+                "retryable": False,
+                "switch_source": True,
+                "retry_with_another_source": True,
+                "provider_outcome": "not_called",
+            }
+            cached_source = next(
+                (
+                    source
+                    for source in self.sources
+                    if canonicalize_http_url(str(source.get("url", ""))) == canonical
+                ),
+                None,
+            )
+            if cached_source is not None:
+                payload["source_id"] = str(cached_source["source_id"])
+                payload["cached_success"] = True
+            return payload
 
     def has_full_evidence_host(self, url: str) -> bool:
         """Return whether this host already has one full-length fetched source."""
@@ -1527,10 +1778,13 @@ class ResearchBudget:
         for attempt in attempts:
             tool_name = attempt.get("tool")
             if tool_name == "fetch_url":
-                # Budget rejection is the only fetch outcome produced before a
-                # reservation. Provider, safety, and content failures all
-                # consume the fetch that was admitted by `reserve_fetch`.
-                admitted = str(attempt.get("status", "error")) != "budget_exceeded"
+                # Budget rejection and deterministic duplicate/blocked-host
+                # suppression happen before a reservation. Provider, safety,
+                # and content failures consume the admitted fetch.
+                admitted = str(attempt.get("status", "error")) not in {
+                    "budget_exceeded",
+                    "suppressed",
+                }
                 if admitted:
                     totals["fetch_calls"] += 1
                 subquestion_id = str(attempt.get("subquestion_id", ""))
@@ -2654,6 +2908,7 @@ def build_budgeted_tools(
     raw_search_tool: BaseTool | None = None,
     raw_fetch_tool: BaseTool | None = None,
     budget: ResearchBudget | None = None,
+    external_guard: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> tuple[list[BaseTool], ResearchBudget]:
     """Wrap raw search/fetch tools with one shared semantic and budget ledger."""
     if budget is None:
@@ -2665,6 +2920,23 @@ def build_budgeted_tools(
     # providers after constructing the wrappers.
     search_provider = raw_search_tool
     fetch_provider = raw_fetch_tool
+
+    def external_denial(tool_name: str) -> dict[str, Any] | None:
+        if external_guard is None:
+            return None
+        denial = external_guard(tool_name)
+        if denial is None:
+            return None
+        if not isinstance(denial, Mapping):
+            raise TypeError("external_guard must return a mapping or None")
+        payload = dict(denial)
+        payload.setdefault("status", "budget_exceeded")
+        payload.setdefault("tool", tool_name)
+        payload.setdefault("reason", "execution_budget_exceeded")
+        payload.setdefault("provider_outcome", "not_called")
+        payload.setdefault("provider_success", False)
+        payload.setdefault("retryable", False)
+        return payload
 
     def provider_error_payload(
         *,
@@ -2717,6 +2989,37 @@ def build_budgeted_tools(
                 }
             )
             return json.dumps(payload, ensure_ascii=False)
+        denial = external_denial("web_search")
+        if denial is not None:
+            budget.cancel_tool_reservation("search")
+            denial.setdefault("query", query)
+            attempt = budget.record_tool_attempt(
+                tool_name="web_search",
+                target=query,
+                payload=denial,
+            )
+            denial.update(
+                {
+                    key: attempt.get(key)
+                    for key in (
+                        "attempt_id",
+                        "outcome",
+                        "failure_class",
+                        "retryable",
+                        "provider_success",
+                        "provider_outcome",
+                        "nonempty_search",
+                        "relevant_search",
+                        "evidence_producing_search",
+                        "provider_failure",
+                        "relevant_results",
+                        "reported_relevant_results",
+                        "scored_result_count",
+                        "semantic_mismatches",
+                    )
+                }
+            )
+            return json.dumps(denial, ensure_ascii=False, indent=2)
         result_limit = min(max_results, budget.policy.max_results_per_search)
         try:
             raw_payload = json.loads(
@@ -2764,8 +3067,21 @@ def build_budgeted_tools(
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @tool("fetch_url")
-    def limited_fetch_url(url: str, max_chars: int = 12_000) -> str:
+    def limited_fetch_url(
+        url: str,
+        max_chars: int = 12_000,
+        force_refresh: Annotated[bool, InjectedToolArg] = False,
+    ) -> str:
         """Fetch one public page within the active run budget and assign a source ID."""
+        suppressed = None if force_refresh else budget.fetch_suppression(url)
+        if suppressed is not None:
+            attempt = budget.record_tool_attempt(
+                tool_name="fetch_url",
+                target=url,
+                payload=suppressed,
+            )
+            suppressed["attempt_id"] = attempt["attempt_id"]
+            return json.dumps(suppressed, ensure_ascii=False, indent=2)
         if not budget.reserve_fetch():
             payload = {
                 "status": "budget_exceeded",
@@ -2777,6 +3093,17 @@ def build_budgeted_tools(
                 tool_name="fetch_url", target=url, payload=payload
             )
             return json.dumps(payload, ensure_ascii=False)
+        denial = external_denial("fetch_url")
+        if denial is not None:
+            budget.cancel_tool_reservation("fetch")
+            denial.setdefault("url", url)
+            attempt = budget.record_tool_attempt(
+                tool_name="fetch_url",
+                target=url,
+                payload=denial,
+            )
+            denial["attempt_id"] = attempt["attempt_id"]
+            return json.dumps(denial, ensure_ascii=False, indent=2)
         char_limit = min(max_chars, budget.policy.max_chars_per_page)
         try:
             raw_payload = json.loads(
@@ -2832,7 +3159,7 @@ SYSTEM_PROMPT = """You are a careful web research assistant.
 For every research request:
 1. Follow the explicit research plan and focus on the active subquestion selected by the outer workflow.
 2. Use get_research_plan, get_source_ledger, and get_evidence_graph to inspect durable plan and provenance state.
-3. Use meaningfully different web_search queries within the active subquestion's reserved budget. Prefer results with relevance_score >= 20; low-relevance primary results automatically trigger the backup engine.
+3. Use meaningfully different web_search queries within the active subquestion's reserved budget. Prefer results with relevance_score >= 40; low-relevance primary results automatically trigger the entity-aware rewrite and backup engine.
 4. Select and fetch relevant pages. Prefer primary and official sources. A `limited` source is a short page accepted only because its host is anchored by full evidence; use it for narrow facts and disclose the limitation.
 5. After fetching, call record_evidence for each proposition you may report. `claim` must be a self-contained report-ready sentence with a subject and predicate, never a label like "official name" or "contact email"; `quote` is the separate exact page excerpt. Omit claim_id when creating a new claim: code assigns the C#. Pass claim_id only to reuse a C# returned by a successful earlier call, such as when adding contradictory evidence. Never invent C# IDs. If registration fails, read the tool error, correct the call, and retry.
 6. Base factual claims only on supported or contested [C#] records. Cite them as `[C#][S#]`; never invent or locally renumber claim, evidence, or source IDs.

@@ -227,9 +227,9 @@ class ResearchBudgetTests(unittest.TestCase):
             fetch.invoke({"url": responses[0]["url"]})
             fetch.invoke({"url": responses[1]["url"]})
             first_snapshot = budget.snapshot()
-            fetch.invoke({"url": responses[2]["url"]})
+            fetch.invoke({"url": responses[2]["url"], "force_refresh": True})
             drifted_snapshot = budget.snapshot()
-            fetch.invoke({"url": responses[3]["url"]})
+            fetch.invoke({"url": responses[3]["url"], "force_refresh": True})
             final_snapshot = budget.snapshot()
 
         self.assertEqual(
