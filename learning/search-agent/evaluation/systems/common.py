@@ -1341,9 +1341,9 @@ def _load_fixture_backend(resolved_config: ResolvedConfig) -> FixtureBackend:
 def _live_raw_tools() -> list[BaseTool]:
     # Kept lazy so importing the baseline contracts never initializes the
     # TongAgent application graph or any online client.
-    from search_agent import fetch_url, web_search  # noqa: PLC0415
+    from search_agent import create_retrieval_tools  # noqa: PLC0415
 
-    return [web_search, fetch_url]
+    return list(create_retrieval_tools())
 
 
 def _live_model(resolved_config: ResolvedConfig) -> BaseChatModel:
@@ -1693,6 +1693,7 @@ def _semantic_failure_type(
         "dns_error": FailureType.DNS_REJECTED,
         "dns_rebinding": FailureType.SECURITY_REJECTED,
         "redirect_rejected": FailureType.SECURITY_REJECTED,
+        "unsafe_url": FailureType.SECURITY_REJECTED,
         "security_rejected": FailureType.SECURITY_REJECTED,
         "ssrf_rejected": FailureType.SECURITY_REJECTED,
         "private_address": FailureType.SECURITY_REJECTED,

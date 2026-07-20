@@ -217,7 +217,9 @@ def revalidate_public_url(validated: ValidatedURL) -> None:
     if validated.proxy_url is None:
         observed = public_addresses(validated.hostname)
     else:
-        observed = _doh_public_addresses(validated.hostname, validated.proxy_url)
+        first = _doh_public_addresses(validated.hostname, validated.proxy_url)
+        second = _doh_public_addresses(validated.hostname, validated.proxy_url)
+        observed = _stable_answers(validated.hostname, first, second)
     if observed != validated.addresses:
         raise URLValidationError(
             f"DNS answers changed during request for {validated.hostname}",

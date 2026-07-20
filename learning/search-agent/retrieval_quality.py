@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 
 MIN_SEARCH_RELEVANCE_SCORE = 40
+MIN_UNCERTAIN_RELEVANCE_SCORE = 15
 
 _ASCII_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9._'-]*")
 _CAPITALIZED_PHRASE = re.compile(
@@ -92,6 +93,29 @@ _ENGLISH_STOPWORDS = frozenset(
     }
 )
 
+# A hit consisting only of one of these terms is not a useful candidate. They
+# are common first-token failure modes in the Bing RSS results observed during
+# the Stage F canary.
+_GENERIC_SEARCH_TERMS = frozenset(
+    {
+        "best",
+        "blue",
+        "green",
+        "james",
+        "latest",
+        "nelson",
+        "new",
+        "news",
+        "official",
+        "red",
+        "san",
+        "school",
+        "site",
+        "top",
+        "white",
+    }
+)
+
 
 def _host_matches_domain(host: str, domain: str) -> bool:
     normalized_host = host.casefold().rstrip(".").removeprefix("www.")
@@ -148,7 +172,7 @@ def _contains_token_phrase(needle: list[str], haystack: list[str]) -> bool:
 
 
 def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any]:
-    """Return an auditable score whose relevance gate rejects one-word noise."""
+    """Return an auditable score and three-tier relevance assessment."""
 
     raw_haystack = " ".join(
         str(result.get(key, "")) for key in ("title", "snippet", "url")
@@ -162,10 +186,14 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
             return {
                 "score": 100,
                 "gate": "site_match",
+                "tier": "relevant",
+                "reason": "result_host_matches_site_operator",
+                "rejection_reason": None,
                 "matched_terms": [],
                 "matched_entity_terms": [],
                 "matched_years": [],
                 "matched_numbers": [],
+                "provider_rank_adjustment": 0,
             }
 
     query_without_site = _SITE.sub(" ", query)
@@ -209,6 +237,17 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
     result_numbers = set(_NUMBER.findall(raw_haystack)).difference(result_years)
     matched_numbers = sorted(query_numbers.intersection(result_numbers))
 
+    distinctive_entity_terms = [
+        term
+        for term in matched_entity_terms
+        if term not in _GENERIC_SEARCH_TERMS and len(term) >= 3
+    ]
+    distinctive_terms = [
+        term
+        for term in matched_terms
+        if term not in _GENERIC_SEARCH_TERMS and len(term) >= 3
+    ]
+
     if entity_term_sets:
         entity_gate = any(
             len(matched) >= min(2, len(terms))
@@ -222,9 +261,7 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
         entity_gate = bool(query_terms) and len(matched_terms) >= required_terms
         gate = "term_coverage" if entity_gate else "insufficient_term_coverage"
 
-    if not entity_gate:
-        score = 0
-    else:
+    if entity_gate:
         score = (
             50 * len(matched_quoted)
             + 35 * len(exact_entities)
@@ -233,6 +270,35 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
             + 25 * len(matched_years)
             + 20 * len(matched_numbers)
         )
+        distinctive_matches = set(distinctive_entity_terms).union(distinctive_terms)
+        if distinctive_matches:
+            score += 10 * len(distinctive_matches)
+        elif not matched_years and not matched_numbers:
+            score = 0
+            gate = "generic_only"
+    elif entity_term_sets and distinctive_entity_terms:
+        # A single distinctive entity token such as "Mandela" is worth
+        # verifying, but it is never enough to become relevant by itself.
+        score = 18 * len(distinctive_entity_terms)
+        gate = "partial_entity_coverage"
+    elif not entity_term_sets and distinctive_terms:
+        score = 12 * len(distinctive_terms)
+        gate = "partial_term_coverage"
+    else:
+        score = 0
+        if matched_terms:
+            gate = "generic_only"
+
+    provider_rank = result.get("provider_rank")
+    provider_rank_adjustment = 0
+    if (
+        isinstance(provider_rank, int)
+        and not isinstance(provider_rank, bool)
+        and 1 <= provider_rank <= 5
+        and score > 0
+    ):
+        provider_rank_adjustment = (6 - provider_rank) * 2
+        score += provider_rank_adjustment
 
     query_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query))
     result_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", haystack))
@@ -251,13 +317,33 @@ def assess_search_relevance(query: str, result: dict[str, Any]) -> dict[str, Any
             if cjk_score >= MIN_SEARCH_RELEVANCE_SCORE:
                 gate = "cjk_pair_coverage"
 
+    bounded_score = min(score, 100)
+    if bounded_score >= MIN_SEARCH_RELEVANCE_SCORE and (
+        entity_gate or gate == "cjk_pair_coverage"
+    ):
+        tier = "relevant"
+        reason = gate
+        rejection_reason = None
+    elif bounded_score >= MIN_UNCERTAIN_RELEVANCE_SCORE:
+        tier = "uncertain"
+        reason = gate
+        rejection_reason = "requires_page_verification"
+    else:
+        tier = "irrelevant"
+        reason = gate
+        rejection_reason = gate
+
     return {
-        "score": min(score, 100),
+        "score": bounded_score,
         "gate": gate,
+        "tier": tier,
+        "reason": reason,
+        "rejection_reason": rejection_reason,
         "matched_terms": matched_terms,
         "matched_entity_terms": matched_entity_terms,
         "matched_years": matched_years,
         "matched_numbers": matched_numbers,
+        "provider_rank_adjustment": provider_rank_adjustment,
     }
 
 
@@ -291,6 +377,7 @@ def deterministic_query_rewrite(query: str) -> str:
 
 __all__ = [
     "MIN_SEARCH_RELEVANCE_SCORE",
+    "MIN_UNCERTAIN_RELEVANCE_SCORE",
     "assess_search_relevance",
     "deterministic_query_rewrite",
     "search_relevance_score",

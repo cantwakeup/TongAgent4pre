@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_policy import EFFORT_POLICIES
+from retrieval_backend import RetrievalSession, SearchBroker
+from retrieval_providers import ProviderSearchResponse, SearchResult
 from retrieval_quality import (
     MIN_SEARCH_RELEVANCE_SCORE,
     assess_search_relevance,
@@ -17,7 +19,7 @@ from retrieval_quality import (
 from search_agent import (
     _search_relevance_score,
     build_budgeted_tools,
-    web_search,
+    create_retrieval_tools,
 )
 
 
@@ -174,23 +176,44 @@ class StageFSearchRegressionTests(unittest.TestCase):
             for item in self.cases
             if item["case_id"] == "frames-0664-mandela-imprisonment"
         )
-        with (
-            patch(
-                "search_agent._duckduckgo_results",
-                return_value=case["drift_results"],
-            ),
-            patch(
-                "search_agent._bing_results",
-                return_value=case["relevant_results"],
-            ) as backup,
-        ):
-            result = json.loads(
-                web_search.invoke({"query": case["query"], "max_results": 5})
-            )
 
-        rewritten = backup.call_args.args[1]
-        self.assertEqual(rewritten, result["query_rewrite"])
+        class Provider:
+            def __init__(self, name: str, rows: list[dict[str, str]]) -> None:
+                self.name = name
+                self.rows = rows
+                self.queries: list[str] = []
+
+            def search(
+                self,
+                query: str,
+                max_results: int,
+            ) -> ProviderSearchResponse:
+                self.queries.append(query)
+                return ProviderSearchResponse(
+                    provider=self.name,
+                    query=query,
+                    status="success",
+                    results=[
+                        SearchResult(
+                            title=row["title"],
+                            url=row["url"],
+                            snippet=row["snippet"],
+                            provider=self.name,
+                            provider_rank=rank,
+                        )
+                        for rank, row in enumerate(self.rows[:max_results], 1)
+                    ],
+                )
+
+        primary = Provider("duckduckgo_html", case["drift_results"])
+        backup = Provider("bing_rss", case["relevant_results"])
+        session = RetrievalSession(SearchBroker([primary, backup]))
+        search, _ = create_retrieval_tools(session)
+        result = json.loads(search.invoke({"query": case["query"], "max_results": 5}))
+
+        rewritten = backup.queries[0]
         self.assertIn('"Nelson Mandela"', rewritten)
+        self.assertNotEqual(rewritten, case["query"])
         self.assertGreaterEqual(result["relevant_results"], 1)
 
     def test_access_blocked_url_and_host_are_suppressed_without_spending_fetch(

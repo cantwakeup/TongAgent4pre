@@ -6,7 +6,8 @@ import argparse
 import json
 import os
 import re
-import xml.etree.ElementTree as ET
+import socket
+import ssl
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from uuid import uuid4
 
 import httpx
@@ -82,10 +83,10 @@ from research_state import (
     ResearchStrategy,
     TongAgentState,
 )
+from retrieval_backend import RetrievalSession, build_default_session
+from retrieval_providers import configured_user_agent
 from retrieval_quality import (
     MIN_SEARCH_RELEVANCE_SCORE,
-    assess_search_relevance,
-    deterministic_query_rewrite,
     search_relevance_score,
 )
 from retrieval_safety import (
@@ -100,9 +101,6 @@ from retrieval_safety import (
 from telemetry import write_event_log, write_plan_snapshot
 
 
-DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
-BING_SEARCH_URL = "https://www.bing.com/search"
-USER_AGENT = "Mozilla/5.0 (compatible; DeepAgentsLearningBot/0.1; personal research)"
 MAX_DOWNLOAD_BYTES = 1_000_000
 MAX_REDIRECTS = 3
 MIN_EVIDENCE_CHARS = 500
@@ -155,171 +153,16 @@ class _ReadableHTMLParser(HTMLParser):
             self.title_parts.append(text)
 
 
-class _DuckDuckGoResultParser(HTMLParser):
-    """Parse result links and snippets from DuckDuckGo's HTML-only endpoint."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.results: list[dict[str, str]] = []
-        self._current: dict[str, str] | None = None
-        self._capture: str | None = None
-
-    @staticmethod
-    def _result_url(href: str) -> str:
-        absolute = "https:" + href if href.startswith("//") else href
-        parsed = urlparse(absolute)
-        if parsed.hostname and _host_matches_domain(parsed.hostname, "duckduckgo.com"):
-            redirected = parse_qs(parsed.query).get("uddg")
-            if redirected:
-                return unquote(redirected[0])
-        return absolute
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "a":
-            return
-        values = dict(attrs)
-        classes = set((values.get("class") or "").split())
-        if "result__a" in classes:
-            if self._current and self._current.get("title"):
-                self.results.append(self._current)
-            self._current = {
-                "title": "",
-                "url": self._result_url(values.get("href") or ""),
-                "snippet": "",
-            }
-            self._capture = "title"
-        elif "result__snippet" in classes and self._current is not None:
-            self._capture = "snippet"
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a":
-            self._capture = None
-
-    def handle_data(self, data: str) -> None:
-        if self._current is None or self._capture is None:
-            return
-        text = " ".join(data.split())
-        if text:
-            existing = self._current[self._capture]
-            self._current[self._capture] = f"{existing} {text}".strip()
-
-    def close(self) -> None:
-        super().close()
-        if self._current and self._current.get("title"):
-            self.results.append(self._current)
-            self._current = None
-
-
 def _normalized_host(url: str) -> str:
     """Return a comparison-safe public hostname without a leading `www`."""
     hostname = (urlparse(url).hostname or "").casefold()
     return hostname.removeprefix("www.")
 
 
-def _host_matches_domain(host: str, domain: str) -> bool:
-    """Match a hostname to a domain on a DNS-label boundary."""
-    normalized_host = host.casefold().rstrip(".").removeprefix("www.")
-    normalized_domain = domain.casefold().rstrip(".").removeprefix("www.")
-    if not normalized_host or not normalized_domain:
-        return False
-    return normalized_host == normalized_domain or normalized_host.endswith(
-        f".{normalized_domain}"
-    )
-
-
 def _search_relevance_score(query: str, result: dict[str, Any]) -> int:
     """Score entity-aware query/result overlap without trusting provider rank."""
 
     return search_relevance_score(query, result)
-
-
-def _deterministic_query_rewrite(query: str) -> str:
-    """Return the stable entity-quoting rewrite used by provider fallback."""
-
-    return deterministic_query_rewrite(query)
-
-
-def _duckduckgo_results(
-    client: httpx.Client, query: str, result_limit: int
-) -> list[dict[str, Any]]:
-    """Fetch and parse DuckDuckGo's HTML results."""
-    response = client.post(DUCKDUCKGO_SEARCH_URL, data={"q": query, "kl": "wt-wt"})
-    response.raise_for_status()
-    parser = _DuckDuckGoResultParser()
-    parser.feed(response.text)
-    parser.close()
-    return [dict(item) for item in parser.results[:result_limit]]
-
-
-def _bing_results(
-    client: httpx.Client, query: str, result_limit: int
-) -> list[dict[str, Any]]:
-    """Fetch and parse Bing's RSS results."""
-    response = client.get(
-        BING_SEARCH_URL,
-        params={
-            "format": "rss",
-            "q": query,
-            "cc": "us",
-            "mkt": "en-US",
-            "setlang": "en-US",
-        },
-    )
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
-    return [
-        {
-            "title": item.findtext("title", default="").strip(),
-            "url": item.findtext("link", default="").strip(),
-            "snippet": item.findtext("description", default="").strip(),
-        }
-        for item in root.findall("./channel/item")[:result_limit]
-    ]
-
-
-def _rank_search_results(
-    query: str,
-    engine_results: list[tuple[str, list[dict[str, Any]]]],
-    result_limit: int,
-) -> list[dict[str, Any]]:
-    """Merge, de-duplicate, annotate, and rank results from multiple engines."""
-    merged: dict[str, dict[str, Any]] = {}
-    for engine, results in engine_results:
-        for raw in results:
-            url = str(raw.get("url", ""))
-            key = urlparse(url)._replace(fragment="").geturl() or str(
-                raw.get("title", "")
-            )
-            item = {
-                "title": str(raw.get("title", "")),
-                "url": url,
-                "snippet": str(raw.get("snippet", "")),
-                "engine": engine,
-            }
-            relevance = assess_search_relevance(query, raw)
-            item["relevance_score"] = relevance["score"]
-            item["relevance_details"] = {
-                key: relevance[key]
-                for key in (
-                    "gate",
-                    "matched_terms",
-                    "matched_entity_terms",
-                    "matched_years",
-                    "matched_numbers",
-                )
-            }
-            existing = merged.get(key)
-            if (
-                existing is None
-                or item["relevance_score"] > existing["relevance_score"]
-            ):
-                merged[key] = item
-    ranked = sorted(
-        merged.values(),
-        key=lambda item: (int(item["relevance_score"]), item["engine"] == "bing"),
-        reverse=True,
-    )
-    return ranked[:result_limit]
 
 
 def _public_addresses(hostname: str) -> list[str]:
@@ -332,95 +175,15 @@ def _validate_public_url(url: str) -> ValidatedURL:
     return validate_public_url(url)
 
 
-@tool
-def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web, falling back when primary results have low relevance."""
-    result_limit = min(max(max_results, 1), 8)
-    with httpx.Client(
-        timeout=20, headers={"User-Agent": USER_AGENT}, follow_redirects=True
-    ) as client:
-        fallback_reason = ""
-        engine_status: dict[str, str] = {}
-        try:
-            duckduckgo = _duckduckgo_results(client, query, result_limit)
-            engine_status["duckduckgo"] = "success"
-        except (httpx.HTTPError, ValueError):
-            duckduckgo = []
-            fallback_reason = "duckduckgo_error"
-            engine_status["duckduckgo"] = "error"
-        ranked_duckduckgo = _rank_search_results(
-            query, [("duckduckgo", duckduckgo)], result_limit
-        )
-        relevant_duckduckgo = sum(
-            int(item["relevance_score"]) >= MIN_SEARCH_RELEVANCE_SCORE
-            for item in ranked_duckduckgo
-        )
-        minimum_relevant = min(2, result_limit)
-        use_fallback = relevant_duckduckgo < minimum_relevant
-        bing: list[dict[str, Any]] = []
-        rewritten_query: str | None = None
-        if use_fallback:
-            if not fallback_reason:
-                fallback_reason = (
-                    "duckduckgo_empty" if not duckduckgo else "duckduckgo_low_relevance"
-                )
-            candidate_rewrite = _deterministic_query_rewrite(query)
-            if " ".join(candidate_rewrite.split()) != " ".join(query.split()):
-                rewritten_query = candidate_rewrite
-            try:
-                bing = _bing_results(client, rewritten_query or query, result_limit)
-                engine_status["bing"] = "success"
-            except (httpx.HTTPError, ET.ParseError, ValueError):
-                bing = []
-                engine_status["bing"] = "error"
-        results = _rank_search_results(
-            query,
-            [("duckduckgo", duckduckgo), ("bing", bing)],
-            result_limit,
-        )
-        relevant_results = sum(
-            int(item["relevance_score"]) >= MIN_SEARCH_RELEVANCE_SCORE
-            for item in results
-        )
-        search_status = "success" if "success" in engine_status.values() else "error"
-        provider_success = search_status == "success"
-        nonempty_search = bool(results)
-        relevant_search = relevant_results > 0
-    return json.dumps(
-        {
-            "status": search_status,
-            "query": query,
-            "results": results,
-            "engine_status": engine_status,
-            "engines": [
-                engine
-                for engine, rows in (("duckduckgo", duckduckgo), ("bing", bing))
-                if rows
-            ],
-            "fallback_reason": fallback_reason or None,
-            "query_rewrite": rewritten_query,
-            "search_quality": "relevant" if relevant_results else "low_relevance",
-            "relevant_results": relevant_results,
-            "provider_success": provider_success,
-            "nonempty_search": nonempty_search,
-            "relevant_search": relevant_search,
-            "provider_failure": not provider_success,
-            **(
-                {"error": "all_search_engines_failed"}
-                if search_status == "error"
-                else {}
-            ),
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-
 def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
     """Fetch and extract a validated public page, allowing network errors to propagate."""
     char_limit = min(max(max_chars, 1_000), 20_000)
     current_url = url
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,text/plain;q=0.9"}
+    headers = {
+        "User-Agent": configured_user_agent(),
+        "Accept": "text/html,text/plain;q=0.9",
+        "Accept-Encoding": "identity",
+    }
 
     for redirect_count in range(MAX_REDIRECTS + 1):
         try:
@@ -480,8 +243,8 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                             "status": "error",
                             "url": url,
                             "error": "Too many redirects",
-                            "failure_taxonomy": "redirect_limit",
-                            "failure_type": "redirect_limit",
+                            "failure_taxonomy": "too_many_redirects",
+                            "failure_type": "too_many_redirects",
                             "retryable": False,
                             "switch_source": True,
                         }
@@ -503,8 +266,8 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                         "status": "error",
                         "url": current_url,
                         "error": f"Unsupported content type: {content_type or 'unknown'}",
-                        "failure_taxonomy": "unsupported_content",
-                        "failure_type": "unsupported_content",
+                        "failure_taxonomy": "unsupported_content_type",
+                        "failure_type": "unsupported_content_type",
                         "retryable": False,
                         "switch_source": True,
                     }
@@ -552,7 +315,20 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
 
             if "html" in content_type:
                 parser = _ReadableHTMLParser()
-                parser.feed(body)
+                try:
+                    parser.feed(body)
+                    parser.close()
+                except (TypeError, ValueError) as exc:
+                    return {
+                        "status": "error",
+                        "url": current_url,
+                        "error": type(exc).__name__,
+                        "failure_taxonomy": "parse_error",
+                        "failure_type": "parse_error",
+                        "retryable": False,
+                        "switch_source": True,
+                        "retry_with_another_source": True,
+                    }
                 title = " ".join(parser.title_parts).strip()
                 text = "\n".join(parser.parts)
             else:
@@ -562,6 +338,19 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                 line.strip() for line in text.splitlines() if line.strip()
             )
             observed_content_length = len(normalized)
+            if observed_content_length == 0:
+                return {
+                    "status": "error",
+                    "url": current_url,
+                    "error": "Page contained no visible text",
+                    "failure_taxonomy": "insufficient_content",
+                    "failure_type": "insufficient_content",
+                    "retryable": False,
+                    "switch_source": True,
+                    "retry_with_another_source": True,
+                    "http_status": response_status,
+                    "content_type": content_type or None,
+                }
             content_length = None if download_truncated else observed_content_length
             char_truncated = observed_content_length > char_limit
             content = normalized[:char_limit]
@@ -583,6 +372,8 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
                 "downloaded_bytes_scope": "httpx_decoded_response_bytes",
                 "http_content_length": http_content_length,
                 "http_content_encoding": content_encoding or None,
+                "http_status": response_status,
+                "content_type": content_type or None,
                 "fetched_at": datetime.now(UTC).isoformat(),
                 "truncated": bool(truncation_reasons),
                 "truncation_reasons": truncation_reasons,
@@ -592,32 +383,37 @@ def _fetch_public_url(url: str, max_chars: int) -> dict[str, Any]:
         "status": "error",
         "url": url,
         "error": "Could not fetch page",
-        "failure_taxonomy": "network_error",
-        "failure_type": "network_error",
+        "failure_taxonomy": "provider_error",
+        "failure_type": "provider_error",
         "retryable": True,
         "switch_source": True,
     }
 
 
-@tool
-def fetch_url(url: str, max_chars: int = 12_000) -> str:
-    """Fetch one public page and return a structured JSON result."""
+def _direct_fetch_payload(url: str, max_chars: int) -> dict[str, Any]:
+    """Call the direct HTTP fetcher and normalize its failure taxonomy."""
+
     try:
         payload = _fetch_public_url(url, max_chars)
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        failed_url = str(exc.request.url)
+        failed_url = url
         payload = _http_status_failure(status, failed_url)
     except httpx.RequestError as exc:
-        failed_url = str(exc.request.url)
+        failed_url = url
         if isinstance(exc, httpx.TimeoutException):
             taxonomy = "timeout"
         elif isinstance(exc, httpx.ConnectError) and any(
-            type(item).__name__ == "gaierror" for item in _exception_chain(exc)
+            isinstance(item, socket.gaierror) for item in _exception_chain(exc)
         ):
             taxonomy = "dns_error"
+        elif any(
+            isinstance(item, ssl.SSLError) or "ssl" in type(item).__name__.casefold()
+            for item in _exception_chain(exc)
+        ):
+            taxonomy = "tls_error"
         else:
-            taxonomy = "network_error"
+            taxonomy = "provider_error"
         payload = {
             "status": "error",
             "url": failed_url,
@@ -629,18 +425,25 @@ def fetch_url(url: str, max_chars: int = 12_000) -> str:
             "retry_with_another_source": True,
         }
     except URLValidationError as exc:
-        rejected = exc.taxonomy in {
+        security_rejected = exc.taxonomy in {
             "dns_rebinding",
-            "dns_rejected",
             "redirect_rejected",
             "ssrf_rejected",
         }
+        taxonomy = (
+            "unsafe_url"
+            if security_rejected
+            else "dns_error"
+            if exc.taxonomy == "dns_rejected"
+            else exc.taxonomy
+        )
         payload = {
-            "status": "rejected" if rejected else "error",
+            "status": "rejected" if security_rejected else "error",
             "url": url,
             "error": str(exc),
-            "failure_taxonomy": exc.taxonomy,
-            "failure_type": exc.taxonomy,
+            "failure_taxonomy": taxonomy,
+            "failure_type": taxonomy,
+            "security_reason": exc.taxonomy if security_rejected else None,
             "retryable": exc.retryable,
             "switch_source": True,
             "retry_with_another_source": True,
@@ -650,13 +453,26 @@ def fetch_url(url: str, max_chars: int = 12_000) -> str:
             "status": "rejected",
             "url": url,
             "error": str(exc),
-            "failure_taxonomy": "invalid_url",
-            "failure_type": "invalid_url",
+            "failure_taxonomy": "unsafe_url",
+            "failure_type": "unsafe_url",
             "retryable": False,
             "switch_source": True,
             "retry_with_another_source": True,
         }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    aliases = {
+        "http_error": "provider_error",
+        "network_error": "provider_error",
+        "redirect_limit": "too_many_redirects",
+        "unsupported_content": "unsupported_content_type",
+    }
+    original_taxonomy = str(
+        payload.get("failure_taxonomy", payload.get("failure_type", ""))
+    )
+    taxonomy = aliases.get(original_taxonomy, original_taxonomy)
+    if taxonomy:
+        payload["failure_taxonomy"] = taxonomy
+        payload["failure_type"] = taxonomy
+    return payload
 
 
 def _http_status_failure(status: int, url: str) -> dict[str, Any]:
@@ -669,7 +485,7 @@ def _http_status_failure(status: int, url: str) -> dict[str, Any]:
         taxonomy = "rate_limited"
         retryable = True
     else:
-        taxonomy = "http_error"
+        taxonomy = "provider_error"
         retryable = status >= 500
     return {
         "status": "error",
@@ -694,6 +510,48 @@ def _exception_chain(error: BaseException) -> list[BaseException]:
             break
         chain.append(next_error)
     return chain
+
+
+def create_retrieval_tools(
+    session: RetrievalSession | None = None,
+) -> tuple[BaseTool, BaseTool]:
+    """Create one isolated search/fetch tool pair backed by one run session."""
+
+    active_session = session or build_default_session()
+
+    @tool("web_search")
+    def unified_web_search(query: str, max_results: int = 5) -> str:
+        """Search all configured providers and return ranked public candidates."""
+
+        execution = active_session.search(query, max_results)
+        return json.dumps(execution.public_dict(), ensure_ascii=False, indent=2)
+
+    @tool("fetch_url")
+    def unified_fetch_url(
+        url: str,
+        max_chars: int = 12_000,
+        bypass_cache: Annotated[bool, InjectedToolArg] = False,
+    ) -> str:
+        """Acquire one public page through cache, direct HTTP, or safe fallback."""
+
+        payload = active_session.fetch(
+            url,
+            max_chars,
+            direct_fetch=_direct_fetch_payload,
+            use_cache=not bypass_cache,
+        )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    shared_metadata = {
+        "retrieval_backend": "unified",
+        "retrieval_session": active_session,
+    }
+    unified_web_search.metadata = dict(shared_metadata)
+    unified_fetch_url.metadata = dict(shared_metadata)
+    return unified_web_search, unified_fetch_url
+
+
+web_search, fetch_url = create_retrieval_tools()
 
 
 @dataclass
@@ -1053,7 +911,11 @@ class ResearchBudget:
             )
             return (
                 "suppressed",
-                "http" if taxonomy == "access_blocked" else "content",
+                (
+                    "http"
+                    if taxonomy in {"access_blocked", "rate_limited"}
+                    else "content"
+                ),
                 False,
             )
         if status == "rejected":
@@ -1066,7 +928,12 @@ class ResearchBudget:
                 payload.get("failure_type", ""),
             )
         ).casefold()
-        if taxonomy in {"timeout", "dns_error", "network_error"}:
+        if taxonomy in {
+            "timeout",
+            "dns_error",
+            "network_error",
+            "tls_error",
+        }:
             return status or "error", "network", bool(payload.get("retryable", True))
         if taxonomy in {"access_blocked", "rate_limited", "http_error"}:
             return status or "error", "http", bool(payload.get("retryable", False))
@@ -1075,14 +942,20 @@ class ResearchBudget:
             "dns_rejected",
             "redirect_rejected",
             "ssrf_rejected",
+            "unsafe_url",
         }:
             return status or "error", "safety", False
         if taxonomy in {
             "redirect_invalid",
             "redirect_limit",
             "unsupported_content",
+            "too_many_redirects",
+            "unsupported_content_type",
+            "parse_error",
         }:
             return status or "error", "content", False
+        if taxonomy == "provider_error":
+            return status or "error", "provider", bool(payload.get("retryable", True))
         normalized_error = " ".join(
             (
                 error,
@@ -1314,7 +1187,7 @@ class ResearchBudget:
         target_host = _normalized_host(canonical)
         with self._lock:
             attempted_urls: set[str] = set()
-            blocked_hosts: set[str] = set()
+            blocked_hosts: dict[str, str] = {}
             for attempt in self.tool_attempts:
                 if attempt.get("tool") != "fetch_url":
                     continue
@@ -1328,21 +1201,23 @@ class ResearchBudget:
                     attempted_urls.add(canonicalize_http_url(prior_target))
                 except URLValidationError:
                     pass
-                if attempt.get("failure_taxonomy") == "access_blocked":
+                if attempt.get("failure_taxonomy") in {
+                    "access_blocked",
+                    "rate_limited",
+                }:
                     prior_host = _normalized_host(prior_target)
                     if prior_host:
-                        blocked_hosts.add(prior_host)
+                        blocked_hosts[prior_host] = str(attempt.get("failure_taxonomy"))
 
             if canonical in attempted_urls:
-                taxonomy = (
-                    "access_blocked"
-                    if target_host in blocked_hosts
-                    else "duplicate_url"
+                taxonomy = blocked_hosts.get(
+                    target_host,
+                    "duplicate_url",
                 )
                 reason = "same_url_already_attempted"
             elif target_host and target_host in blocked_hosts:
-                taxonomy = "access_blocked"
-                reason = "host_previously_access_blocked"
+                taxonomy = blocked_hosts[target_host]
+                reason = "host_in_access_cooldown"
             else:
                 return None
             payload = {
@@ -1485,6 +1360,17 @@ class ResearchBudget:
                 "discovered_by_search_attempt_id": discovered_by_search_attempt_id,
                 "evidence_quality": payload.get("evidence_quality", "full"),
                 "quality_reason": payload.get("quality_reason", ""),
+                "acquisition_method": payload.get(
+                    "acquisition_method",
+                    "direct_http",
+                ),
+                "content_provider": payload.get(
+                    "content_provider",
+                    "direct_http",
+                ),
+                "original_url": payload.get("original_url", requested_url),
+                "final_url": payload.get("final_url", url),
+                "fallback_triggered": bool(payload.get("fallback_triggered", False)),
             }
             existing = next(
                 (source for source in self.sources if source["url"] == url), None
@@ -1557,6 +1443,11 @@ class ResearchBudget:
                 existing["latest_discovered_by_search_attempt_id"] = (
                     discovered_by_search_attempt_id
                 )
+                existing["latest_acquisition_method"] = revision["acquisition_method"]
+                existing["latest_content_provider"] = revision["content_provider"]
+                existing["latest_original_url"] = revision["original_url"]
+                existing["latest_final_url"] = revision["final_url"]
+                existing["latest_fallback_triggered"] = revision["fallback_triggered"]
                 existing["content_changed"] = existing["content_sha256"] != content_hash
                 self._refresh_duplicate_sources()
                 self.evidence_graph.cache_page(
@@ -1611,6 +1502,16 @@ class ResearchBudget:
                 "duplicate_of_source_id": None,
                 "evidence_quality": revision["evidence_quality"],
                 "quality_reason": revision["quality_reason"],
+                "acquisition_method": revision["acquisition_method"],
+                "latest_acquisition_method": revision["acquisition_method"],
+                "content_provider": revision["content_provider"],
+                "latest_content_provider": revision["content_provider"],
+                "original_url": revision["original_url"],
+                "latest_original_url": revision["original_url"],
+                "final_url": revision["final_url"],
+                "latest_final_url": revision["final_url"],
+                "fallback_triggered": revision["fallback_triggered"],
+                "latest_fallback_triggered": revision["fallback_triggered"],
             }
             self.sources.append(record)
             self._refresh_duplicate_sources()
@@ -3073,7 +2974,17 @@ def build_budgeted_tools(
         force_refresh: Annotated[bool, InjectedToolArg] = False,
     ) -> str:
         """Fetch one public page within the active run budget and assign a source ID."""
-        suppressed = None if force_refresh else budget.fetch_suppression(url)
+        active_fetch_provider = fetch_provider or fetch_url
+        retrieval_metadata = active_fetch_provider.metadata or {}
+        retrieval_session = retrieval_metadata.get("retrieval_session")
+        has_provider_cache = isinstance(
+            retrieval_session, RetrievalSession
+        ) and retrieval_session.has_cached_content(url)
+        suppressed = (
+            None
+            if force_refresh or has_provider_cache
+            else budget.fetch_suppression(url)
+        )
         if suppressed is not None:
             attempt = budget.record_tool_attempt(
                 tool_name="fetch_url",
@@ -3106,11 +3017,13 @@ def build_budgeted_tools(
             return json.dumps(denial, ensure_ascii=False, indent=2)
         char_limit = min(max_chars, budget.policy.max_chars_per_page)
         try:
-            raw_payload = json.loads(
-                (fetch_provider or fetch_url).invoke(
-                    {"url": url, "max_chars": char_limit}
-                )
-            )
+            fetch_arguments: dict[str, Any] = {
+                "url": url,
+                "max_chars": char_limit,
+            }
+            if retrieval_metadata.get("retrieval_backend") == "unified":
+                fetch_arguments["bypass_cache"] = force_refresh
+            raw_payload = json.loads(active_fetch_provider.invoke(fetch_arguments))
             if not isinstance(raw_payload, dict):
                 msg = "Fetch provider response must be a JSON object"
                 raise TypeError(msg)
@@ -3120,6 +3033,8 @@ def build_budgeted_tools(
                 content_chars = int(payload.get("content_chars", 0))
                 if content_chars < MIN_LIMITED_EVIDENCE_CHARS:
                     payload["status"] = "insufficient_content"
+                    payload["failure_taxonomy"] = "insufficient_content"
+                    payload["failure_type"] = "insufficient_content"
                     payload["error"] = (
                         f"Fewer than {MIN_LIMITED_EVIDENCE_CHARS} visible characters"
                     )
@@ -3132,6 +3047,8 @@ def build_budgeted_tools(
                         )
                     else:
                         payload["status"] = "insufficient_content"
+                        payload["failure_taxonomy"] = "insufficient_content"
+                        payload["failure_type"] = "insufficient_content"
                         payload["error"] = (
                             f"Fewer than {MIN_EVIDENCE_CHARS} visible characters and "
                             "no full-length source anchors this host"
@@ -3159,8 +3076,8 @@ SYSTEM_PROMPT = """You are a careful web research assistant.
 For every research request:
 1. Follow the explicit research plan and focus on the active subquestion selected by the outer workflow.
 2. Use get_research_plan, get_source_ledger, and get_evidence_graph to inspect durable plan and provenance state.
-3. Use meaningfully different web_search queries within the active subquestion's reserved budget. Prefer results with relevance_score >= 40; low-relevance primary results automatically trigger the entity-aware rewrite and backup engine.
-4. Select and fetch relevant pages. Prefer primary and official sources. A `limited` source is a short page accepted only because its host is anchored by full evidence; use it for narrow facts and disclose the limitation.
+3. Use meaningfully different web_search queries within the active subquestion's reserved budget. Prefer `relevant` results. When only `uncertain` candidates are returned, fetch the best one to verify it; deterministic provider fallback and fusion have already run.
+4. Select and fetch relevant pages. Prefer primary and official sources. Search snippets are discovery hints only. A `limited` source is a short page accepted only because its host is anchored by full evidence; use it for narrow facts and disclose the limitation.
 5. After fetching, call record_evidence for each proposition you may report. `claim` must be a self-contained report-ready sentence with a subject and predicate, never a label like "official name" or "contact email"; `quote` is the separate exact page excerpt. Omit claim_id when creating a new claim: code assigns the C#. Pass claim_id only to reuse a C# returned by a successful earlier call, such as when adding contradictory evidence. Never invent C# IDs. If registration fails, read the tool error, correct the call, and retry.
 6. Base factual claims only on supported or contested [C#] records. Cite them as `[C#][S#]`; never invent or locally renumber claim, evidence, or source IDs.
 7. During a `[RESEARCH STEP]`, do not write the final report. During `[FINAL SYNTHESIS]`, you MUST call write_file to create `/report.md` in the constrained evidence-graph format requested by the outer workflow. Write an honest partial report even when no subquestion was covered.
@@ -3354,7 +3271,13 @@ def build_agent(
                 **free_model_options,
             )
 
-        network_tools, budget = build_budgeted_tools(policy, strategy=strategy)
+        raw_search_tool, raw_fetch_tool = create_retrieval_tools()
+        network_tools, budget = build_budgeted_tools(
+            policy,
+            strategy=strategy,
+            raw_search_tool=raw_search_tool,
+            raw_fetch_tool=raw_fetch_tool,
+        )
         model = create_chat_model(model_name)
         reviewer_model = create_chat_model(worker_model_name)
         planner = build_model_planner(model)

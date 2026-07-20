@@ -17,7 +17,7 @@ from retrieval_safety import (
     build_pinned_request,
     validate_public_url,
 )
-from search_agent import ResearchBudget, _fetch_public_url, fetch_url
+from search_agent import ResearchBudget, _fetch_public_url, create_retrieval_tools
 
 
 class _ForbiddenResponse:
@@ -73,9 +73,10 @@ class _ContentResponse:
         content_length: str | None,
         *,
         content_encoding: str | None = None,
+        content_type: str = "text/plain",
     ) -> None:
         self._body = body
-        self.headers = {"content-type": "text/plain"}
+        self.headers = {"content-type": content_type}
         if content_length is not None:
             self.headers["content-length"] = content_length
         if content_encoding is not None:
@@ -202,27 +203,23 @@ class _RateLimitedDoHClient(_DoHClient):
 class FetchUrlTests(unittest.TestCase):
     """Verify that one inaccessible page does not raise out of the tool."""
 
+    def setUp(self) -> None:
+        _, self.fetch_url = create_retrieval_tools()
+
     @patch("search_agent._validate_public_url")
     @patch("search_agent.httpx.Client", _ForbiddenClient)
     def test_http_403_becomes_a_tool_result(self, validate_url: object) -> None:
         del validate_url
 
-        result = fetch_url.invoke({"url": "https://example.com/private"})
-
-        self.assertEqual(
-            json.loads(result),
-            {
-                "status": "error",
-                "url": "https://example.com/private",
-                "error": "HTTP 403",
-                "http_status": 403,
-                "failure_taxonomy": "access_blocked",
-                "failure_type": "access_blocked",
-                "retryable": False,
-                "switch_source": True,
-                "retry_with_another_source": True,
-            },
+        result = json.loads(
+            self.fetch_url.invoke({"url": "https://example.com/private"})
         )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["http_status"], 403)
+        self.assertEqual(result["failure_taxonomy"], "access_blocked")
+        self.assertEqual(result["acquisition_method"], "direct_http")
+        self.assertFalse(result["fallback_triggered"])
 
     def test_http_429_and_timeout_have_distinct_taxonomy(self) -> None:
         request = httpx.Request("GET", "https://example.com/page")
@@ -236,11 +233,12 @@ class FetchUrlTests(unittest.TestCase):
 
         with patch("search_agent._fetch_public_url", side_effect=rate_error):
             rate_limited = json.loads(
-                fetch_url.invoke({"url": "https://example.com/page"})
+                self.fetch_url.invoke({"url": "https://example.com/page"})
             )
+        _, timeout_fetch = create_retrieval_tools()
         with patch("search_agent._fetch_public_url", side_effect=timeout_error):
             timed_out = json.loads(
-                fetch_url.invoke({"url": "https://example.com/page"})
+                timeout_fetch.invoke({"url": "https://example.com/page"})
             )
 
         self.assertEqual(rate_limited["failure_taxonomy"], "rate_limited")
@@ -248,18 +246,18 @@ class FetchUrlTests(unittest.TestCase):
         self.assertEqual(timed_out["failure_taxonomy"], "timeout")
         self.assertTrue(timed_out["retryable"])
 
-    def test_dns_rejection_keeps_machine_taxonomy(self) -> None:
+    def test_dns_rejection_maps_to_dns_error_taxonomy(self) -> None:
         failure = URLValidationError(
             "Could not resolve host: example.invalid",
             taxonomy="dns_rejected",
         )
         with patch("search_agent._fetch_public_url", side_effect=failure):
             result = json.loads(
-                fetch_url.invoke({"url": "https://example.invalid/page"})
+                self.fetch_url.invoke({"url": "https://example.invalid/page"})
             )
 
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["failure_taxonomy"], "dns_rejected")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["failure_taxonomy"], "dns_error")
         self.assertFalse(result["retryable"])
 
     def test_proxy_resolver_timeout_and_rate_limit_keep_exact_taxonomy(self) -> None:
@@ -289,7 +287,9 @@ class FetchUrlTests(unittest.TestCase):
         )
 
         with patch("search_agent._fetch_public_url", side_effect=error):
-            result = json.loads(fetch_url.invoke({"url": "https://public.example"}))
+            result = json.loads(
+                self.fetch_url.invoke({"url": "https://public.example"})
+            )
 
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["failure_taxonomy"], "timeout")
@@ -396,6 +396,47 @@ class FetchUrlTests(unittest.TestCase):
         self.assertEqual(result["http_content_encoding"], "gzip")
         self.assertFalse(result["truncated"])
 
+    @patch("search_agent._validate_public_url")
+    def test_unsupported_content_type_has_exact_taxonomy(
+        self,
+        validate_url: object,
+    ) -> None:
+        del validate_url
+        client = _ContentClient(
+            _ContentResponse(
+                b"%PDF",
+                "4",
+                content_type="application/pdf",
+            )
+        )
+
+        with patch("search_agent.httpx.Client", return_value=client):
+            result = _fetch_public_url(
+                "https://fixture.test/document.pdf",
+                12_000,
+            )
+
+        self.assertEqual(
+            result["failure_taxonomy"],
+            "unsupported_content_type",
+        )
+
+    @patch("search_agent._validate_public_url")
+    def test_empty_visible_page_has_insufficient_content_taxonomy(
+        self,
+        validate_url: object,
+    ) -> None:
+        del validate_url
+        client = _ContentClient(_ContentResponse(b"", "0"))
+
+        with patch("search_agent.httpx.Client", return_value=client):
+            result = _fetch_public_url(
+                "https://fixture.test/empty",
+                12_000,
+            )
+
+        self.assertEqual(result["failure_taxonomy"], "insufficient_content")
+
     def test_proxy_doh_ignores_synthetic_system_dns_and_keeps_public_answers(
         self,
     ) -> None:
@@ -446,6 +487,30 @@ class FetchUrlTests(unittest.TestCase):
             self.assertRaises(URLValidationError) as raised,
         ):
             validate_public_url("https://public-looking.example/page")
+
+        self.assertEqual(raised.exception.taxonomy, "dns_rebinding")
+
+    def test_proxy_post_response_doh_rejects_transient_answer_drift(self) -> None:
+        validated = ValidatedURL(
+            url="https://public.example/page",
+            hostname="public.example",
+            port=443,
+            proxy_url="http://127.0.0.1:17898",
+            addresses=("93.184.216.34",),
+            selected_address="93.184.216.34",
+            resolution_mode="proxy_doh",
+        )
+        with (
+            patch(
+                "retrieval_safety._doh_public_addresses",
+                side_effect=[
+                    ("93.184.216.35",),
+                    ("93.184.216.34",),
+                ],
+            ),
+            self.assertRaises(URLValidationError) as raised,
+        ):
+            retrieval_safety.revalidate_public_url(validated)
 
         self.assertEqual(raised.exception.taxonomy, "dns_rebinding")
 
@@ -542,11 +607,12 @@ class FetchUrlTests(unittest.TestCase):
             ],
         ):
             result = json.loads(
-                fetch_url.invoke({"url": "https://public.example/start"})
+                self.fetch_url.invoke({"url": "https://public.example/start"})
             )
 
         self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["failure_taxonomy"], "redirect_rejected")
+        self.assertEqual(result["failure_taxonomy"], "unsafe_url")
+        self.assertEqual(result["security_reason"], "redirect_rejected")
 
     @patch("search_agent.httpx.Client", _ForbiddenClient)
     def test_target_http_status_is_not_masked_by_post_response_dns_failure(
@@ -572,7 +638,7 @@ class FetchUrlTests(unittest.TestCase):
                 ),
             ) as revalidate,
         ):
-            result = json.loads(fetch_url.invoke({"url": validation.url}))
+            result = json.loads(self.fetch_url.invoke({"url": validation.url}))
 
         revalidate.assert_not_called()
         self.assertEqual(result["failure_taxonomy"], "access_blocked")
