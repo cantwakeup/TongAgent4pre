@@ -147,6 +147,7 @@ def _canonicalize_runner_result(
         "run_id": run_id,
         "git_sha": git_sha,
         "resolved_config": config,
+        "runtime_mode": config.runtime_mode,
         "config_fingerprint": config.config_fingerprint,
         "fairness_fingerprint": config.fairness_fingerprint,
         "artifact_directory": str(Path(config.artifact_directory).resolve()),

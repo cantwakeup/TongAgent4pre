@@ -285,6 +285,7 @@ class RunResult(StrictModel):
     run_id: NonEmptyString
     task_id: NonEmptyString
     system_id: NonEmptyString
+    runtime_mode: Literal["strict", "permissive"] = "strict"
     git_sha: NonEmptyString
     resolved_config: ResolvedConfig
     config_fingerprint: NonEmptyString
@@ -317,12 +318,16 @@ class RunResult(StrictModel):
     normalized_exact_match: bool | None
     judge_score: Coverage | None
     judge_result: JudgeResult | None = None
+    workflow_metrics: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def validate_result_coherence(self) -> RunResult:
         """Reject mismatched identities, fingerprints, timing, and failures."""
         if self.system_id != self.resolved_config.system_id:
             msg = "system_id must match resolved_config.system_id"
+            raise ValueError(msg)
+        if self.runtime_mode != self.resolved_config.runtime_mode:
+            msg = "runtime_mode must match resolved_config.runtime_mode"
             raise ValueError(msg)
         if self.config_fingerprint != self.resolved_config.config_fingerprint:
             msg = "config_fingerprint must match the resolved configuration"

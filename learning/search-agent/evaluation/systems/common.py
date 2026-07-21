@@ -1400,6 +1400,7 @@ def prepare_runtime(
     enable_tongagent_token_control: bool = False,
     enable_tongagent_context_compaction: bool = False,
     search_query_normalizer: Callable[[str], str] | None = None,
+    reserve_final_synthesis: bool | None = None,
 ) -> PreparedRuntime:
     """Resolve model and raw providers, then install shared semantic wrappers."""
 
@@ -1430,11 +1431,18 @@ def prepare_runtime(
         raw_tools = _live_raw_tools()
         model = injected_model or _live_model(resolved_config)
 
+    # The strict graph consumes the held final-extractor reservation through
+    # ``finalize_answer``.  The permissive workflow owns its finalization in
+    # code after a structured draft call, so it must not leave an unused live
+    # reservation outstanding.  ``None`` preserves the old behaviour for all
+    # existing callers and, in particular, the strict baseline.
+    if reserve_final_synthesis is None:
+        reserve_final_synthesis = resolved_config.backend_kind == "live"
     middleware = EvaluationMiddleware(
         execution_budget,
         trace,
         max_output_tokens=resolved_config.model.max_output_tokens or 1,
-        reserve_final_synthesis=resolved_config.backend_kind == "live",
+        reserve_final_synthesis=reserve_final_synthesis,
         stage_output_caps=(
             DEFAULT_TONGAGENT_STAGE_OUTPUT_CAPS
             if enable_tongagent_token_control
@@ -1658,6 +1666,7 @@ def build_run_result(
         budget_resource=budget_resource,
         budget_snapshot=budget_snapshot,
         budget_accounting_version=2,
+        runtime_mode=resolved_config.runtime_mode,
         artifact_directory=resolved_config.artifact_directory,
         fixture_smoke=resolved_config.backend_kind == "fixture",
         normalized_exact_match=normalized_exact_match(

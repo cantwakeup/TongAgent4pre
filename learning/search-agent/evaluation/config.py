@@ -136,6 +136,14 @@ class BudgetLimits(FrozenStrictModel):
     recursion_limit: RecursionLimit = 125
 
 
+class PermissiveWorkflowConfig(FrozenStrictModel):
+    """Ablation switches for TongAgent's post-hoc verification workflow."""
+
+    enable_posthoc_verifier: bool = True
+    require_exact_quote_for_core_claims: bool = True
+    allow_low_confidence_answer: bool = True
+
+
 class ResolvedConfig(FrozenStrictModel):
     """Complete non-secret configuration for one evaluation attempt.
 
@@ -158,6 +166,10 @@ class ResolvedConfig(FrozenStrictModel):
     model: EvaluationModelConfig
     tools: SharedToolConfig
     budget: BudgetLimits
+    runtime_mode: Literal["strict", "permissive"] = "strict"
+    permissive_workflow: PermissiveWorkflowConfig = Field(
+        default_factory=PermissiveWorkflowConfig
+    )
     judge: EvaluationJudgeConfig | None = None
     seed: int
     system_options: dict[str, JsonValue] = Field(default_factory=dict)
@@ -201,17 +213,42 @@ class ResolvedConfig(FrozenStrictModel):
         )
         complete = _fingerprint(self._fingerprint_payload(fairness=False))
         fairness = _fingerprint(self._fingerprint_payload(fairness=True))
+        # Stage F/strict artifacts predate the explicit runtime-mode fields.
+        # They remain valid only for the exact old strict-default semantics;
+        # all newly resolved configs include the mode and permissive switches
+        # in both fingerprints.  This compatibility path never admits a
+        # permissive config under an old strict fingerprint.
+        legacy_complete = _fingerprint(
+            self._fingerprint_payload(fairness=False, include_runtime_mode=False)
+        )
+        legacy_fairness = _fingerprint(
+            self._fingerprint_payload(fairness=True, include_runtime_mode=False)
+        )
+        legacy_match = (
+            self._is_legacy_strict_default()
+            and self.config_fingerprint == legacy_complete
+            and self.fairness_fingerprint == legacy_fairness
+        )
         if self.config_fingerprint and self.config_fingerprint != complete:
-            msg = "persisted config_fingerprint does not match resolved config"
-            raise ValueError(msg)
+            if not legacy_match:
+                msg = "persisted config_fingerprint does not match resolved config"
+                raise ValueError(msg)
+            complete = legacy_complete
         if self.fairness_fingerprint and self.fairness_fingerprint != fairness:
-            msg = "persisted fairness_fingerprint does not match resolved config"
-            raise ValueError(msg)
+            if not legacy_match:
+                msg = "persisted fairness_fingerprint does not match resolved config"
+                raise ValueError(msg)
+            fairness = legacy_fairness
         object.__setattr__(self, "config_fingerprint", complete)
         object.__setattr__(self, "fairness_fingerprint", fairness)
         return self
 
-    def _fingerprint_payload(self, *, fairness: bool) -> dict[str, JsonValue]:
+    def _fingerprint_payload(
+        self,
+        *,
+        fairness: bool,
+        include_runtime_mode: bool = True,
+    ) -> dict[str, JsonValue]:
         """Return the canonical payload for one fingerprint scope."""
         excluded = {
             "artifact_directory",
@@ -220,7 +257,17 @@ class ResolvedConfig(FrozenStrictModel):
         }
         if fairness:
             excluded.update({"system_id", "system_options"})
+        if not include_runtime_mode:
+            excluded.update({"runtime_mode", "permissive_workflow"})
         return self.model_dump(mode="json", exclude=excluded)
+
+    def _is_legacy_strict_default(self) -> bool:
+        """Whether an old persisted fingerprint is semantically equivalent."""
+
+        return (
+            self.runtime_mode == "strict"
+            and self.permissive_workflow == PermissiveWorkflowConfig()
+        )
 
     def fairness_payload(self) -> dict[str, JsonValue]:
         """Expose the exact shared configuration covered by fairness checks."""

@@ -1,0 +1,103 @@
+{
+  "\"lunarite mine\" location": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Lunarite Mine archive",
+        "url": "https://archive.fixture.test/lunarite-mine",
+        "snippet": "Lunarite Mine is located in Alton Valley.",
+        "relevance_score": 92
+      },
+      {
+        "title": "Lunar calendar",
+        "url": "https://noise.fixture.test/lunar-calendar",
+        "snippet": "A calendar of lunar observations.",
+        "relevance_score": 4
+      }
+    ]
+  },
+  "\"alton valley\" river": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Alton Valley water survey",
+        "url": "https://survey.fixture.test/alton-valley",
+        "snippet": "The Arden River passes through Alton Valley.",
+        "relevance_score": 94
+      },
+      {
+        "title": "Alton Valley hiking guide",
+        "url": "https://guide.fixture.test/alton-hiking",
+        "snippet": "A guide to walking paths in the valley.",
+        "relevance_score": 12
+      }
+    ]
+  },
+  "\"aurora bridge\" opening": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Aurora Bridge engineering record",
+        "url": "https://records.fixture.test/aurora-bridge",
+        "snippet": "Aurora Bridge opened in 1974.",
+        "relevance_score": 93
+      },
+      {
+        "title": "Aurora weather archive",
+        "url": "https://noise.fixture.test/aurora-weather",
+        "snippet": "Aurora observations from 1974.",
+        "relevance_score": 6
+      }
+    ]
+  },
+  "\"meridian monument\" dedication": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Meridian Monument register",
+        "url": "https://register.fixture.test/meridian-monument",
+        "snippet": "The Meridian Monument was dedicated in 1974.",
+        "relevance_score": 91
+      }
+    ]
+  },
+  "\"harbor light station\" construction": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Harbor Light Station local history",
+        "url": "https://history.fixture.test/harbor-light",
+        "snippet": "The station was completed in 1950.",
+        "relevance_score": 90
+      },
+      {
+        "title": "Harbor Light Station preservation file",
+        "url": "https://preservation.fixture.test/harbor-light",
+        "snippet": "The station was completed in 1952.",
+        "relevance_score": 88
+      }
+    ]
+  },
+  "\"harbor light station\" history": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Harbor Light Station local history",
+        "url": "https://history.fixture.test/harbor-light",
+        "snippet": "The station was completed in 1950.",
+        "relevance_score": 90
+      }
+    ]
+  },
+  "\"harbor light station\" preservation": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Harbor Light Station preservation file",
+        "url": "https://preservation.fixture.test/harbor-light",
+        "snippet": "The station was completed in 1952.",
+        "relevance_score": 88
+      }
+    ]
+  }
+}

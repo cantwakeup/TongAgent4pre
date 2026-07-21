@@ -1,0 +1,47 @@
+{
+  "https://archive.fixture.test/lunarite-mine": {
+    "status": "success",
+    "title": "Lunarite Mine archive",
+    "content": "The municipal mining archive records that Lunarite Mine is located in Alton Valley. The entry describes the mine as a small historical operation and gives no river information. Archive staff digitised the location record for local research. The archive catalogue preserves maps, survey notebooks, and correspondence from the district office. Its descriptive note explains that the location record was reviewed against a local cadastral map before publication. Researchers may use the catalogue entry to locate the historical mine, but the entry does not identify a watercourse."
+  },
+  "https://survey.fixture.test/alton-valley": {
+    "status": "success",
+    "title": "Alton Valley water survey",
+    "content": "The regional water survey states that the Arden River passes through Alton Valley before joining the lower plain. The survey distinguishes the river from seasonal creeks and lists the valley as its principal upstream corridor. Hydrology staff measured the channel during spring and autumn and recorded tributary observations in an accompanying table. The survey's geographic description repeatedly identifies Alton Valley as the upstream corridor of the Arden River. It does not make a claim about the history of Lunarite Mine beyond the shared valley location."
+  },
+  "https://guide.fixture.test/alton-hiking": {
+    "status": "success",
+    "title": "Alton Valley hiking guide",
+    "content": "This local guide describes walking paths, lookout points, and picnic sites in Alton Valley. It does not identify the river that passes through the valley. Visitors should verify route conditions with park staff."
+  },
+  "https://noise.fixture.test/lunar-calendar": {
+    "status": "success",
+    "title": "Lunar calendar",
+    "content": "This calendar collects dates for lunar observations. It is unrelated to the history or location of Lunarite Mine and contains no geographic information about Alton Valley."
+  },
+  "https://records.fixture.test/aurora-bridge": {
+    "status": "success",
+    "title": "Aurora Bridge engineering record",
+    "content": "The engineering record states that Aurora Bridge opened in 1974 after a three-year construction programme. The document discusses the bridge opening but does not describe the Meridian Monument. The record was archived by the city engineer. Its project summary lists design approvals, construction milestones, and the opening ceremony attended by municipal officials. A preservation note confirms that the 1974 opening date is copied from the final engineering register rather than a later commemorative publication."
+  },
+  "https://register.fixture.test/meridian-monument": {
+    "status": "success",
+    "title": "Meridian Monument register",
+    "content": "The civic register states that the Meridian Monument was dedicated in 1974. The dedication took place during the same municipal anniversary programme, according to the register's historical note. The register stores the dedication programme, a short description of the monument, and the names of local officials who attended. Its archivist note distinguishes the dedication date from the later restoration date and says that the original programme is held in the municipal records office. The register was catalogued as a primary municipal source during its latest archive review."
+  },
+  "https://noise.fixture.test/aurora-weather": {
+    "status": "success",
+    "title": "Aurora weather archive",
+    "content": "This weather archive lists aurora observations during 1974. It is unrelated to Aurora Bridge, its construction, or the Meridian Monument dedication."
+  },
+  "https://history.fixture.test/harbor-light": {
+    "status": "success",
+    "title": "Harbor Light Station local history",
+    "content": "The local history says that Harbor Light Station was completed in 1950. It cites a newspaper note but does not include the original construction certificate. The history was prepared for a community walking tour and summarises recollections from several longtime residents. Its editor notes that the publication used secondary materials and should be compared with official construction records when an exact date matters. The history contains no image of a signed completion certificate. A final editorial note says that the walking-tour booklet was never intended to settle a disputed historical date."
+  },
+  "https://preservation.fixture.test/harbor-light": {
+    "status": "success",
+    "title": "Harbor Light Station preservation file",
+    "content": "The preservation file says that Harbor Light Station was completed in 1952. Its date conflicts with an older local-history account and the file recommends checking the original construction certificate. The file was assembled during a condition survey and cites an inventory form held by the preservation office. It explicitly warns that the two dates cannot both be accepted without resolving whether they refer to construction, commissioning, or a later alteration. The available file does not reproduce the original certificate."
+  }
+}

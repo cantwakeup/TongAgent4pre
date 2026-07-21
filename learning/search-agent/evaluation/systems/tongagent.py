@@ -112,6 +112,20 @@ class TongAgentRunner:
         before a controlled live experiment can spend a model or web budget.
         """
 
+        if resolved_config.runtime_mode == "permissive":
+            # The permissive implementation is intentionally a code-owned
+            # workflow rather than a LangGraph/FSM.  Keep the strict builder
+            # entirely untouched and preflight the exact permissive runtime
+            # path instead.
+            from .permissive import preflight_permissive_workflow
+
+            return preflight_permissive_workflow(
+                task,
+                resolved_config,
+                fixture_backend=self._fixture_backend,
+                model=self._model,
+            )
+
         options, policy = _resolve_options(resolved_config)
         artifact_directory = Path(resolved_config.artifact_directory).expanduser()
         tongagent_directory = artifact_directory / "native" / "tongagent"
@@ -154,6 +168,19 @@ class TongAgentRunner:
 
     def run(self, task: EvalTask, resolved_config: ResolvedConfig) -> RunResult:
         """Execute one isolated, checkpointed B3 attempt."""
+
+        if resolved_config.runtime_mode == "permissive":
+            # Do not route permissive research through the strict FSM.  Both
+            # modes still receive the same shared runtime, retrieval wrappers,
+            # security checks, and hard execution budget.
+            from .permissive import run_permissive_workflow
+
+            return run_permissive_workflow(
+                task,
+                resolved_config,
+                fixture_backend=self._fixture_backend,
+                model=self._model,
+            )
 
         options, policy = _resolve_options(resolved_config)
         artifact_directory = Path(resolved_config.artifact_directory).expanduser()

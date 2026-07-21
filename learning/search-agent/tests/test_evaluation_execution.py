@@ -143,6 +143,7 @@ result = {
     "schema_version": 1,
     "run_id": result["run_id"],
     "completion_status": "completed",
+    "runtime_mode": config.get("runtime_mode", "strict"),
     "wall_time_seconds": result["wall_time_seconds"],
     "search_calls": 0,
     "fetch_calls": 0,
@@ -154,6 +155,7 @@ result = {
     "normalized_exact_match": True,
     "judge_score": None,
     "judge_result": None,
+    "workflow_metrics": None,
 }))
 (attempt / "failure.json").write_text(json.dumps({
     "failure_type": None,

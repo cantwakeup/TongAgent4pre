@@ -225,6 +225,12 @@ def resolve_system_config(
             "recursion_limit": 125,
         },
         "judge": None,
+        "runtime_mode": "strict",
+        "permissive_workflow": {
+            "enable_posthoc_verifier": True,
+            "require_exact_quote_for_core_claims": True,
+            "allow_low_confidence_answer": True,
+        },
         "system_options": _default_system_options(system_id, fixture_directory),
     }
     override_payload = dict(overrides or {})
@@ -646,6 +652,7 @@ def build_failure_result(
         completion_status=completion_status,
         failure_type=failure_type,
         failure=failure,
+        runtime_mode=config.runtime_mode,
         artifact_directory=str(Path(config.artifact_directory).resolve()),
         fixture_smoke=config.backend_kind == "fixture",
         normalized_exact_match=normalized_exact_match(
@@ -729,6 +736,7 @@ def _canonical_metrics_payload(result: RunResult) -> dict[str, Any]:
         "schema_version": 1,
         "run_id": result.run_id,
         "completion_status": result.completion_status.value,
+        "runtime_mode": result.runtime_mode,
         "wall_time_seconds": result.wall_time_seconds,
         "search_calls": result.search_calls,
         "fetch_calls": result.fetch_calls,
@@ -748,6 +756,7 @@ def _canonical_metrics_payload(result: RunResult) -> dict[str, Any]:
             if result.judge_result is not None
             else None
         ),
+        "workflow_metrics": result.workflow_metrics,
     }
     if (
         result.external_retrieval_calls is not None

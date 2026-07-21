@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "fixture_id": "permissive-controlled-v1",
+  "search_file": "search.json",
+  "page_file": "pages.json"
+}

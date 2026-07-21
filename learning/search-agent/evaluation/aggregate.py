@@ -23,6 +23,7 @@ from .schema import RunResult
 
 _RESULT_COLUMNS = (
     "system_id",
+    "runtime_mode",
     "task_id",
     "backend_kind",
     "fixture_smoke",
@@ -45,6 +46,11 @@ _RESULT_COLUMNS = (
     "citations",
     "evidence_count",
     "structural_subquestion_coverage",
+    "sq_research_completion_rate",
+    "draft_claim_count",
+    "verified_claim_rate",
+    "critical_claim_verified_rate",
+    "unsupported_claim_rate",
     "total_tokens",
     "estimated_cost",
     "config_fingerprint",
@@ -84,6 +90,10 @@ def aggregate_experiment(
     git_sha = next(iter(git_shas), None)
     backend_kinds = {result.resolved_config.backend_kind for _, result in selected}
     backend_kind = next(iter(backend_kinds), None)
+    runtime_modes = {result.runtime_mode for _, result in selected}
+    if len(runtime_modes) > 1:
+        raise FairnessMismatchError("cannot aggregate mixed runtime modes")
+    runtime_mode = next(iter(runtime_modes), None)
     rows = [
         _result_row(result, attempt_directory.name)
         for attempt_directory, result in selected
@@ -96,6 +106,7 @@ def aggregate_experiment(
         "fairness_fingerprint": fairness_fingerprint,
         "git_sha": git_sha,
         "backend_kind": backend_kind,
+        "runtime_mode": runtime_mode,
         "fixture_smoke": (
             backend_kind == "fixture" if backend_kind is not None else None
         ),
@@ -190,8 +201,10 @@ def _sorted_attempts(task_directory: Path) -> list[Path]:
 
 
 def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
+    workflow = result.workflow_metrics or {}
     return {
         "system_id": result.system_id,
+        "runtime_mode": result.runtime_mode,
         "task_id": result.task_id,
         "backend_kind": result.resolved_config.backend_kind,
         "fixture_smoke": result.fixture_smoke,
@@ -218,6 +231,11 @@ def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
         "citations": len(result.citations),
         "evidence_count": result.evidence_count,
         "structural_subquestion_coverage": (result.structural_subquestion_coverage),
+        "sq_research_completion_rate": workflow.get("sq_research_completion_rate"),
+        "draft_claim_count": workflow.get("draft_claim_count"),
+        "verified_claim_rate": workflow.get("verified_claim_rate"),
+        "critical_claim_verified_rate": workflow.get("critical_claim_verified_rate"),
+        "unsupported_claim_rate": workflow.get("unsupported_claim_rate"),
         "total_tokens": (
             result.token_usage.total_tokens if result.token_usage is not None else None
         ),
@@ -274,6 +292,21 @@ def _system_summaries(
             for result in results
             if result.estimated_cost is not None
         ]
+        workflow_values = {
+            key: [
+                value
+                for result in results
+                for value in [_numeric_workflow_metric(result, key)]
+                if value is not None
+            ]
+            for key in (
+                "sq_research_completion_rate",
+                "draft_claim_count",
+                "verified_claim_rate",
+                "critical_claim_verified_rate",
+                "unsupported_claim_rate",
+            )
+        }
         failure_distribution = Counter(
             result.failure_type.value
             for result in results
@@ -286,6 +319,7 @@ def _system_summaries(
             {
                 "system_id": system_id,
                 "backend_kind": results[0].resolved_config.backend_kind,
+                "runtime_mode": results[0].runtime_mode,
                 "fixture_smoke": results[0].fixture_smoke,
                 "runs": len(results),
                 "completion_distribution": dict(
@@ -341,9 +375,25 @@ def _system_summaries(
                 "estimated_cost": (
                     sum(cost_values) if len(cost_values) == len(results) else None
                 ),
+                "workflow_metric_runs": {
+                    key: len(values) for key, values in workflow_values.items()
+                },
+                "mean_workflow_metrics": {
+                    key: fmean(values) if values else None
+                    for key, values in workflow_values.items()
+                },
             }
         )
     return summaries
+
+
+def _numeric_workflow_metric(result: RunResult, key: str) -> float | None:
+    """Return one optional numeric permissive metric without coercing N/A to 0."""
+
+    value = (result.workflow_metrics or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _render_csv(rows: list[dict[str, Any]]) -> str:
