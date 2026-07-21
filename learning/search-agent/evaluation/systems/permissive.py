@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import traceback
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,7 +24,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
-from evidence_graph import normalize_evidence_text, validate_evidence_graph
+from evidence_graph import (
+    MAX_QUOTE_CHARS,
+    normalize_evidence_text,
+    validate_evidence_graph,
+)
 from retrieval_quality import (
     assess_search_relevance,
     classify_query_task_type,
@@ -151,6 +156,7 @@ class VerifiedClaim(_StrictModel):
     exact_quotes: list[str] = Field(default_factory=list)
     explanation: str
     canonical_claim_id: str | None = None
+    registration_failures: list[dict[str, str]] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -857,7 +863,7 @@ def _quote_for_claim(claim: str, source: ResearchSource) -> tuple[str | None, bo
     )
     if not scored:
         return None, False
-    best = scored[0]
+    best = _bounded_literal_quote(scored[0], tokens)
     source_numbers = set(re.findall(r"\b\d+(?:[.,]\d+)?\b", best))
     contradicts = bool(
         claim_numbers
@@ -867,6 +873,39 @@ def _quote_for_claim(claim: str, source: ResearchSource) -> tuple[str | None, bo
     if not tokens.intersection(_meaningful_tokens(best)):
         return None, contradicts
     return best, contradicts
+
+
+def _bounded_literal_quote(candidate: str, claim_tokens: set[str]) -> str:
+    """Keep an exact, relevant page span within EvidenceGraph quote limits.
+
+    Some HTML-to-text pages contain navigation or tables without sentence-ending
+    punctuation.  They become one enormous ``_SENTENCE`` fragment even though
+    they are valid page text.  Taking a word-boundary window retains a literal
+    continuous excerpt that the graph can revalidate against the canonical page;
+    it does not summarize, invent, or paraphrase source content.
+    """
+
+    text = normalize_evidence_text(candidate)
+    if len(text) <= MAX_QUOTE_CHARS:
+        return text
+    locations = [
+        match.start()
+        for token in sorted(claim_tokens)
+        for match in re.finditer(rf"\b{re.escape(token)}\b", text, flags=re.IGNORECASE)
+    ]
+    anchor = min(locations) if locations else 0
+    start = max(0, anchor - MAX_QUOTE_CHARS // 3)
+    end = min(len(text), start + MAX_QUOTE_CHARS)
+    if start:
+        boundary = text.find(" ", start)
+        start = boundary + 1 if boundary >= 0 and boundary < end else start
+    if end < len(text):
+        boundary = text.rfind(" ", start, end)
+        end = boundary if boundary > start else end
+    excerpt = text[start:end].strip()
+    # The quote invariant has a positive lower bound.  This fallback is still
+    # a literal contiguous prefix, used only for pathological whitespace.
+    return excerpt or text[:MAX_QUOTE_CHARS].strip()
 
 
 def _verify(
@@ -909,12 +948,17 @@ def _verify(
             selected = []
             explanation = "No canonical fetched source supports this claim."
         canonical_claim_id: str | None = None
+        registration_failures: list[dict[str, str]] = []
         # Graph registration is intentionally post-hoc.  A quote was selected
         # from the page passage, and EvidenceGraphStore rechecks it against its
         # cached canonical page before assigning C#/E# IDs.
         registered: list[tuple[ResearchSource, str]] = []
         for source, quote in selected:
             try:
+                # Verification runs after all SQs have been researched.  The
+                # graph nevertheless owns claims by their original SQ, not by
+                # whichever SQ happened to be active at workflow completion.
+                runtime.research_budget.activate_subquestion(claim.subquestion_id)
                 record = runtime.research_budget.record_evidence(
                     source_id=source.source_id,
                     claim=claim.text,
@@ -925,11 +969,27 @@ def _verify(
                     claim_id=canonical_claim_id or "",
                 )
             except Exception as exc:
+                invariant = str(exc).splitlines()[0][:500]
+                reason = (
+                    "quote_too_long"
+                    if len(normalize_evidence_text(quote)) > MAX_QUOTE_CHARS
+                    else "canonical_registration_rejected"
+                )
+                failure = {
+                    "category": reason,
+                    "exception_type": type(exc).__name__,
+                    "invariant": invariant,
+                    "source_id": source.source_id,
+                    "claim_id": claim.claim_id,
+                    "quote_chars": str(len(normalize_evidence_text(quote))),
+                    "safe_traceback": sanitize_trace_value(
+                        traceback.format_exc(limit=12)
+                    )[:2_000],
+                }
+                registration_failures.append(failure)
                 runtime.trace.record(
                     "permissive_evidence_registration_failed",
-                    draft_claim_id=claim.claim_id,
-                    source_id=source.source_id,
-                    exception_type=type(exc).__name__,
+                    **failure,
                 )
                 continue
             canonical_claim_id = str(record["claim"]["claim_id"])
@@ -952,19 +1012,22 @@ def _verify(
                 exact_quotes=[quote for _, quote in registered],
                 explanation=explanation,
                 canonical_claim_id=canonical_claim_id,
+                registration_failures=registration_failures,
             )
         )
     return verified
 
 
-def _finalize(
+def _finalization_decision(
     *,
-    task: EvalTask,
     draft: DraftAnswer,
     notes: Sequence[ResearchNote],
     verified: Sequence[VerifiedClaim],
     config: ResolvedConfig,
-) -> tuple[str, str, list[str]]:
+    required_subquestion_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Make one auditable high/low/abstain finalization decision."""
+
     statuses = {item.claim_id: item for item in verified}
     critical = [item for item in draft.claims if item.critical_for_final_answer]
     unsupported = [
@@ -980,50 +1043,128 @@ def _finalize(
         and statuses[item.claim_id].status == "partially_supported"
     ]
     missing_sq = [note.subquestion_id for note in notes if not note.source_ids]
-    # The model may not quietly evade verification by emitting no critical
-    # claims.  A final answer needs at least one source-grounded core claim.
-    allowed = (
+    researched_ids = {note.subquestion_id for note in notes}
+    required_ids = set(required_subquestion_ids or researched_ids)
+    unresearched_sq = sorted(required_ids - researched_ids)
+    mapped_critical = [item.claim_id for item in critical if not item.source_ids]
+    all_high = (
         bool(critical)
         and not unsupported
+        and not weak
         and not missing_sq
+        and not unresearched_sq
+        and not mapped_critical
         and bool(draft.proposed_answer)
     )
-    if weak and config.permissive_workflow.require_exact_quote_for_core_claims:
-        allowed = False
-    if weak and not config.permissive_workflow.allow_low_confidence_answer:
-        allowed = False
+    low = (
+        bool(critical)
+        and bool(weak)
+        and not unsupported
+        and not missing_sq
+        and not unresearched_sq
+        and not mapped_critical
+        and any(
+            statuses.get(item.claim_id) is not None
+            and statuses[item.claim_id].status == "verified"
+            for item in critical
+        )
+        and bool(draft.proposed_answer)
+        and bool(draft.reasoning_steps)
+        and not draft.missing_information
+        and config.permissive_workflow.allow_low_confidence_answer
+    )
     if not config.permissive_workflow.enable_posthoc_verifier:
-        allowed = bool(draft.proposed_answer) and not missing_sq
+        all_high = (
+            bool(draft.proposed_answer) and not missing_sq and not unresearched_sq
+        )
+        low = False
         unsupported = []
         weak = []
-    if not allowed:
-        missing = (
-            ", ".join(sorted(set(missing_sq + unsupported))) or "verified core evidence"
+    status = "answered" if all_high else "answered_low_confidence" if low else "abstain"
+    return {
+        "schema_version": 1,
+        "answer_status": status,
+        "confidence": "high" if all_high else "low" if low else "none",
+        "all_required_sq_researched": not unresearched_sq,
+        "missing_source_subquestions": sorted(missing_sq),
+        "unresearched_subquestions": unresearched_sq,
+        "critical_claims": [item.claim_id for item in critical],
+        "verified_critical_claims": [
+            item.claim_id
+            for item in critical
+            if statuses.get(item.claim_id) is not None
+            and statuses[item.claim_id].status == "verified"
+        ],
+        "partially_supported_critical_claims": weak,
+        "unsupported_or_contested_critical_claims": sorted(unsupported),
+        "unmapped_critical_claims": mapped_critical,
+        "low_confidence_reason": (
+            "Core claims include canonical sources but one or more only have "
+            "partial exact-quote verification."
+            if low
+            else None
+        ),
+    }
+
+
+def _finalize(
+    *,
+    task: EvalTask,
+    draft: DraftAnswer,
+    notes: Sequence[ResearchNote],
+    verified: Sequence[VerifiedClaim],
+    config: ResolvedConfig,
+    required_subquestion_ids: Sequence[str] | None = None,
+) -> tuple[str, str, list[str]]:
+    decision = _finalization_decision(
+        draft=draft,
+        notes=notes,
+        verified=verified,
+        config=config,
+        required_subquestion_ids=required_subquestion_ids,
+    )
+    if decision["answer_status"] == "abstain":
+        missing = sorted(
+            set(
+                list(decision["missing_source_subquestions"])
+                + list(decision["unresearched_subquestions"])
+                + list(decision["unsupported_or_contested_critical_claims"])
+                + list(decision["unmapped_critical_claims"])
+            )
         )
         return (
             "## Answer\nINSUFFICIENT_EVIDENCE\nABSTAIN\n"
-            f"- Missing or unsupported: {missing}\n"
+            f"- Missing or unsupported: {', '.join(missing) or 'verified core evidence'}\n"
             "FINAL_ANSWER: ABSTAIN",
             "abstain",
-            unsupported,
+            list(decision["unsupported_or_contested_critical_claims"]),
         )
     citations = sorted(
-        {source_id for claim in critical for source_id in claim.source_ids}
-    )
-    confidence = "low" if weak else draft.confidence
-    caveat = (
-        "\n- Low confidence: one or more core claims have source support but no exact quote."
-        if weak
-        else ""
+        {
+            source_id
+            for claim in draft.claims
+            if claim.critical_for_final_answer
+            for source_id in claim.source_ids
+        }
     )
     answer = str(draft.proposed_answer).strip()
+    low = decision["answer_status"] == "answered_low_confidence"
+    verification_lines = [
+        f"- Fully verified core claims: {', '.join(decision['verified_critical_claims']) or 'none'}",
+        f"- Partially supported core claims: {', '.join(decision['partially_supported_critical_claims']) or 'none'}",
+    ]
+    if low:
+        verification_lines.append(
+            f"- Low confidence reason: {decision['low_confidence_reason']}"
+        )
     return (
         "## Answer\n"
         f"{answer}\n\n"
         f"Sources: {' '.join(f'[{item}]' for item in citations)}\n"
-        f"Confidence: {confidence}.{caveat}\n"
-        f"FINAL_ANSWER: {answer}",
-        "answer_low_confidence" if weak else "answer",
+        f"Confidence: {decision['confidence']}.\n"
+        + "\n".join(verification_lines)
+        + f"\nFINAL_ANSWER: {answer}",
+        "answer_low_confidence" if low else "answer",
         [],
     )
 
@@ -1084,6 +1225,12 @@ def run_permissive_workflow(
     final_answer = "FINAL_ANSWER: ABSTAIN"
     final_status = "abstain"
     removed_claims: list[str] = []
+    finalization_decision: dict[str, Any] = {
+        "schema_version": 1,
+        "answer_status": "abstain",
+        "confidence": "none",
+        "reason": "workflow did not reach finalization",
+    }
     try:
         runtime = prepare_runtime(
             task,
@@ -1172,12 +1319,20 @@ def run_permissive_workflow(
         if runtime is not None:
             verified = _verify(runtime=runtime, draft=draft, sources=all_sources)
         trace.record("permissive_phase", phase="FINALIZE")
+        finalization_decision = _finalization_decision(
+            draft=draft,
+            notes=notes,
+            verified=verified,
+            config=resolved_config,
+            required_subquestion_ids=[item.id for item in plan.subquestions],
+        )
         final_answer, final_status, removed_claims = _finalize(
             task=task,
             draft=draft,
             notes=notes,
             verified=verified,
             config=resolved_config,
+            required_subquestion_ids=[item.id for item in plan.subquestions],
         )
         trace.record(
             "permissive_finalized",
@@ -1293,21 +1448,71 @@ def run_permissive_workflow(
             caught=caught,
         )
         _write_json(
-            native_directory / "permissive_workflow.json",
+            native_directory / "research_notes.json",
             {
-                "runtime_mode": "permissive",
+                "schema_version": 1,
+                "task_id": task.id,
                 "plan": plan.model_dump(mode="json") if plan is not None else None,
+                "research_notes": [item.model_dump(mode="json") for item in notes],
                 "research_bundles": {
                     key: [item.model_dump(mode="json") for item in value]
                     for key, value in bundles.items()
                 },
-                "research_notes": [item.model_dump(mode="json") for item in notes],
+            },
+        )
+        _write_json(
+            native_directory / "draft_answer.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
                 "draft": draft.model_dump(mode="json"),
+            },
+        )
+        _write_json(
+            native_directory / "verified_claims.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
                 "verified_claims": [item.model_dump(mode="json") for item in verified],
+            },
+        )
+        _write_json(
+            native_directory / "evidence_graph.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "claims": ledger.get("claims", []),
+                "evidence_units": ledger.get("evidence_units", []),
+                "conflicts": ledger.get("conflicts", []),
+                "state_integrity_errors": graph_errors,
+            },
+        )
+        _write_json(
+            native_directory / "finalization_decision.json",
+            {
+                **finalization_decision,
+                "schema_version": 1,
+                "task_id": task.id,
+                "final_answer_status": final_status,
+                "final_answer": final_answer,
+            },
+        )
+        _write_json(
+            native_directory / "permissive_workflow.json",
+            {
+                "schema_version": 1,
+                "runtime_mode": "permissive",
+                "phase": "FINALIZE",
                 "final_answer_status": final_status,
                 "workflow_metrics": workflow_metrics,
-                "phase": "FINALIZE",
                 "state_integrity_errors": graph_errors,
+                "canonical_artifacts": {
+                    "research_notes": "research_notes.json",
+                    "draft_answer": "draft_answer.json",
+                    "verified_claims": "verified_claims.json",
+                    "evidence_graph": "evidence_graph.json",
+                    "finalization_decision": "finalization_decision.json",
+                },
             },
         )
         return RunResult.model_validate(result.model_dump(mode="python"))

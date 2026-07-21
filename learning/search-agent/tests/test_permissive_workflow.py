@@ -17,6 +17,8 @@ from evaluation.systems.permissive import (
     DraftClaim,
     PermissiveSubquestion,
     ResearchNote,
+    ResearchSource,
+    VerifiedClaim,
     _draft,
     _finalize,
     _note,
@@ -353,7 +355,21 @@ def test_permissive_controlled_two_hop_workflow_verifies_before_answer(
     )
     assert workflow["phase"] == "FINALIZE"
     assert workflow["final_answer_status"] == "answer"
-    assert {item["status"] for item in workflow["verified_claims"]} == {"verified"}
+    artifacts = workflow["canonical_artifacts"]
+    assert set(artifacts) == {
+        "research_notes",
+        "draft_answer",
+        "verified_claims",
+        "evidence_graph",
+        "finalization_decision",
+    }
+    for filename in artifacts.values():
+        payload = json.loads((tmp_path / "native" / "tongagent" / filename).read_text())
+        assert payload["schema_version"] == 1
+    verified = json.loads(
+        (tmp_path / "native" / "tongagent" / artifacts["verified_claims"]).read_text()
+    )
+    assert {item["status"] for item in verified["verified_claims"]} == {"verified"}
 
 
 @pytest.mark.parametrize(
@@ -634,6 +650,185 @@ def test_finalizer_refuses_answer_without_a_critical_source_grounded_claim(
     assert status == "abstain"
     assert removed == []
     assert "FINAL_ANSWER: ABSTAIN" in answer
+
+
+@pytest.mark.parametrize(
+    ("historical_case", "claim_text"),
+    [
+        (
+            "frames-0123-long-wikipedia-navigation",
+            "The hockey goal was scored in overtime.",
+        ),
+        (
+            "frames-0664-long-band-navigation",
+            "The band has a documented studio-album list.",
+        ),
+        (
+            "frames-0718-long-state-admission-table",
+            "Pennsylvania was admitted on March 5, 1778.",
+        ),
+    ],
+)
+def test_long_navigation_passage_registers_bounded_canonical_quote(
+    tmp_path: Path, historical_case: str, claim_text: str
+) -> None:
+    """Regression for the three live ValueErrors caused by >500-char quotes."""
+
+    backend = _backend()
+    runtime = _runtime(tmp_path / historical_case, _river_task(), backend)
+    runtime.research_budget.configure_subquestions(["SQ1"])
+    runtime.middleware.configure_token_partitions(["SQ1"])
+    content = "navigation " * 260 + claim_text + " canonical supporting text " * 260
+    runtime.research_budget.sources.append(
+        {"source_id": "S-long", "url": "https://example.test/long", "title": "Long"}
+    )
+    runtime.research_budget.evidence_graph.cache_page("S-long", content)
+    source = ResearchSource(
+        source_id="S-long",
+        title="Long",
+        url="https://example.test/long",
+        provider="fixture",
+        provider_rank=1,
+        acquisition_method="direct_http",
+        relevance_tier="relevant",
+        relevance_reason="fixture",
+        passage=content,
+        content_chars=len(content),
+        fetch_status="success",
+    )
+    verified = _verify(
+        runtime=runtime,
+        draft=DraftAnswer(
+            claims=[
+                DraftClaim(
+                    claim_id="D1",
+                    text=claim_text,
+                    source_ids=["S-long"],
+                    critical_for_final_answer=True,
+                    subquestion_id="SQ1",
+                )
+            ],
+            proposed_answer="A source-grounded answer.",
+            reasoning_steps=["Use the canonical source."],
+        ),
+        sources={"S-long": source},
+    )
+    assert verified[0].status == "verified"
+    assert verified[0].exact_quotes
+    assert len(verified[0].exact_quotes[0]) <= 500
+    assert verified[0].registration_failures == []
+
+
+def test_finalizer_allows_low_confidence_answer_with_verified_and_partial_core_claims(
+    tmp_path: Path,
+) -> None:
+    backend = _backend()
+    draft = DraftAnswer(
+        claims=[
+            DraftClaim(
+                claim_id="D1",
+                text="The first source establishes the required year.",
+                source_ids=["S1"],
+                critical_for_final_answer=True,
+                subquestion_id="SQ1",
+            ),
+            DraftClaim(
+                claim_id="D2",
+                text="The second source supports the associated calculation.",
+                source_ids=["S2"],
+                critical_for_final_answer=True,
+                subquestion_id="SQ2",
+            ),
+        ],
+        reasoning_steps=["Use the two source-grounded values."],
+        proposed_answer="42",
+    )
+    verified = [
+        VerifiedClaim(
+            claim_id="D1",
+            status="verified",
+            source_ids=["S1"],
+            exact_quotes=["The first source establishes the required year."],
+            explanation="Exact quote found.",
+            canonical_claim_id="C1",
+        ),
+        VerifiedClaim(
+            claim_id="D2",
+            status="partially_supported",
+            source_ids=["S2"],
+            explanation="Canonical source fetched but quote is partial.",
+        ),
+    ]
+    answer, status, removed = _finalize(
+        task=_river_task(),
+        draft=draft,
+        notes=[
+            ResearchNote(subquestion_id="SQ1", source_ids=["S1"]),
+            ResearchNote(subquestion_id="SQ2", source_ids=["S2"]),
+        ],
+        verified=verified,
+        config=_config(tmp_path, backend),
+        required_subquestion_ids=["SQ1", "SQ2"],
+    )
+    assert status == "answer_low_confidence"
+    assert removed == []
+    assert "Confidence: low." in answer
+    assert "Partially supported core claims: D2" in answer
+    assert "FINAL_ANSWER: 42" in answer
+
+
+def test_canonical_registration_rejection_is_retained_as_structured_metadata(
+    tmp_path: Path,
+) -> None:
+    backend = _backend()
+    runtime = _runtime(tmp_path, _river_task(), backend)
+    runtime.research_budget.configure_subquestions(["SQ1"])
+    runtime.middleware.configure_token_partitions(["SQ1"])
+    source = ResearchSource(
+        source_id="S-mismatch",
+        title="Mismatch",
+        url="https://example.test/mismatch",
+        provider="fixture",
+        provider_rank=1,
+        acquisition_method="direct_http",
+        relevance_tier="relevant",
+        relevance_reason="fixture",
+        passage="The canonical-looking passage says the bridge opened in 1974.",
+        content_chars=60,
+        fetch_status="success",
+    )
+    runtime.research_budget.sources.append(
+        {
+            "source_id": "S-mismatch",
+            "url": source.url,
+            "title": source.title,
+        }
+    )
+    runtime.research_budget.evidence_graph.cache_page(
+        "S-mismatch", "A different canonical page does not contain that passage."
+    )
+    verified = _verify(
+        runtime=runtime,
+        draft=DraftAnswer(
+            claims=[
+                DraftClaim(
+                    claim_id="D1",
+                    text="The bridge opened in 1974.",
+                    source_ids=["S-mismatch"],
+                    critical_for_final_answer=True,
+                    subquestion_id="SQ1",
+                )
+            ]
+        ),
+        sources={"S-mismatch": source},
+    )
+    assert verified[0].status == "partially_supported"
+    assert len(verified[0].registration_failures) == 1
+    failure = verified[0].registration_failures[0]
+    assert failure["category"] == "canonical_registration_rejected"
+    assert failure["exception_type"] == "EvidenceQuoteMismatch"
+    assert failure["source_id"] == "S-mismatch"
+    assert "EvidenceQuoteMismatch" in failure["safe_traceback"]
 
 
 def test_strict_preflight_remains_available_with_controlled_fixture(

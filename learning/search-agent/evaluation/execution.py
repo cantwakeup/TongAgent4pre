@@ -422,6 +422,12 @@ def run_evaluation(
                 "dataset_digest": dataset_digest,
                 "systems": list(normalized_systems),
                 "seed": seed,
+                # This is intentionally explicit: wall time is reported as a
+                # metric, while the watchdog remains a shared safety guard for
+                # every system in a comparison.
+                "task_watchdog_sec": next(iter(prospective.values()))[
+                    1
+                ].budget.wall_time_seconds,
             },
         )
     )
