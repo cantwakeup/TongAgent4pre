@@ -51,6 +51,15 @@ _RESULT_COLUMNS = (
     "verified_claim_rate",
     "critical_claim_verified_rate",
     "unsupported_claim_rate",
+    "coverage",
+    "selective_accuracy",
+    "risk",
+    "atomic_fact_support_rate",
+    "critical_fact_support_rate",
+    "unsupported_answer_rate",
+    "contradicted_answer_rate",
+    "citation_precision",
+    "answer_rate",
     "total_tokens",
     "estimated_cost",
     "config_fingerprint",
@@ -236,6 +245,17 @@ def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
         "verified_claim_rate": workflow.get("verified_claim_rate"),
         "critical_claim_verified_rate": workflow.get("critical_claim_verified_rate"),
         "unsupported_claim_rate": workflow.get("unsupported_claim_rate"),
+        "coverage": workflow.get("balanced_coverage"),
+        "selective_accuracy": workflow.get("balanced_selective_accuracy"),
+        "risk": workflow.get("balanced_risk"),
+        "atomic_fact_support_rate": workflow.get("balanced_atomic_fact_support_rate"),
+        "critical_fact_support_rate": workflow.get(
+            "balanced_critical_fact_support_rate"
+        ),
+        "unsupported_answer_rate": workflow.get("balanced_unsupported_answer_rate"),
+        "contradicted_answer_rate": workflow.get("balanced_contradicted_answer_rate"),
+        "citation_precision": workflow.get("balanced_citation_precision"),
+        "answer_rate": workflow.get("balanced_answer_rate"),
         "total_tokens": (
             result.token_usage.total_tokens if result.token_usage is not None else None
         ),
@@ -305,6 +325,15 @@ def _system_summaries(
                 "verified_claim_rate",
                 "critical_claim_verified_rate",
                 "unsupported_claim_rate",
+                "balanced_coverage",
+                "balanced_selective_accuracy",
+                "balanced_risk",
+                "balanced_atomic_fact_support_rate",
+                "balanced_critical_fact_support_rate",
+                "balanced_unsupported_answer_rate",
+                "balanced_contradicted_answer_rate",
+                "balanced_citation_precision",
+                "balanced_answer_rate",
             )
         }
         failure_distribution = Counter(
