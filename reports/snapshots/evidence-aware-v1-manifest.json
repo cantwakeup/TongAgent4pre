@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "snapshot_name": "evidence-aware-v1",
+  "frozen_commit": "ab6350d770db2d6cf1d86fb3dfd7dd3549571dc5",
+  "fixed_task_ids": ["0016", "0123", "0191", "0664", "0718"],
+  "experiments": [
+    {
+      "id": "frames-permissive-second-20260721-215544",
+      "systems": ["simple_react", "vanilla_deepagents", "tongagent"],
+      "summary_path": "learning/search-agent/output/evaluations/frames-permissive-second-20260721-215544/summary.json",
+      "summary_sha256": "9906002dd2a47ef81df83a8dc3c80f1cb67f37ed80afe7601b0aeb8afce964da"
+    },
+    {
+      "id": "frames-fact-gap-retry-20260722-004211",
+      "systems": ["tongagent"],
+      "summary_path": "learning/search-agent/output/evaluations/frames-fact-gap-retry-20260722-004211/summary.json",
+      "summary_sha256": "3519d9ba82a60fdb39be99b0a4e5e9f7fbc7e8645b8ec46308ae2c1fd16125ee",
+      "summary_markdown_sha256": "f7bcfb285d938c0876c900989732e5b95b88d65ce52547badd8cae0f267b1f80"
+    }
+  ],
+  "modules": [
+    "unified_retrieval_backend",
+    "ssrf_safe_fetch_and_fallback",
+    "shared_execution_budgets",
+    "strict_fsm",
+    "permissive_research_workflow",
+    "posthoc_evidence_verifier",
+    "typed_deterministic_synthesis",
+    "optional_fact_gap_retrieval"
+  ],
+  "known_limitations": [
+    "No observed raw exact-match gain from Fact-Gap on the frozen five-task run.",
+    "Post-hoc verification frequently abstains after useful partial research.",
+    "Normalized exact match is a raw machine metric, not a complete quality judgement."
+  ]
+}
