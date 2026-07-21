@@ -477,15 +477,16 @@ class AdaptiveGraphTests(unittest.TestCase):
             result["adaptive_control"]["decision_history"][-1]["action"],
             "fail_closed",
         )
-        self.assertEqual(len(report_inputs), 1)
-        self.assertEqual(len(report_inputs[0]), 1)
-        report_input = report_inputs[0][0]
-        self.assertNotIn(research_sentinel, report_input)
-        self.assertNotIn(claim_id, report_input)
-        self.assertNotIn(source_id, report_input)
-        self.assertNotIn("https://integrity.example/fact", report_input)
-        self.assertIn("CANONICAL SOURCE LEDGER:\n[]", report_input)
-        self.assertIn('"claims": []', report_input)
+        # Integrity failure is incomplete evidence: use code-owned abstention,
+        # never send a synthesis prompt to the ordinary report model.
+        self.assertEqual(report_inputs, [])
+        self.assertEqual(result["report_type"], "deterministic_abstain")
+        self.assertIn("INSUFFICIENT_EVIDENCE", result["report_markdown"])
+        self.assertIn("ABSTAIN", result["report_markdown"])
+        self.assertNotIn(research_sentinel, result["report_markdown"])
+        self.assertNotIn(claim_id, result["report_markdown"])
+        self.assertNotIn(source_id, result["report_markdown"])
+        self.assertNotIn("https://integrity.example/fact", result["report_markdown"])
 
 
 if __name__ == "__main__":

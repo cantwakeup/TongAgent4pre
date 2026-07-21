@@ -129,6 +129,7 @@ class FailureType(StrEnum):
     RUNNER_ERROR = "runner_error"
     SEARCH_ERROR = "search_error"
     SECURITY_REJECTED = "security_rejected"
+    STATE_INTEGRITY_ERROR = "state_integrity_error"
     TOOL_ERROR = "tool_error"
 
 

@@ -71,6 +71,7 @@ from research_graph import (
     Planner,
     build_evidence_graph_tools,
     build_model_planner,
+    build_model_phase_decider,
     build_phase_research_tools,
     build_research_graph,
     build_research_state_tools,
@@ -3142,6 +3143,9 @@ class AgentRuntimeDependencies:
     token_budget_snapshot: Callable[[], dict[str, Any]] | None = None
     token_budget_can_start: Callable[[str], bool] | None = None
     model_budget_snapshot: Callable[[], dict[str, Any]] | None = None
+    phase_decider: (
+        Callable[[TongAgentState, str, bool, str | None], dict[str, Any]] | None
+    ) = None
     phase_fixture_compatibility: bool = False
 
 
@@ -3316,6 +3320,7 @@ def build_agent(
         token_budget_snapshot = None
         token_budget_can_start = None
         model_budget_snapshot = None
+        phase_decider = None
     else:
         if (
             runtime_dependencies.budget.policy != policy
@@ -3337,6 +3342,7 @@ def build_agent(
         token_budget_snapshot = runtime_dependencies.token_budget_snapshot
         token_budget_can_start = runtime_dependencies.token_budget_can_start
         model_budget_snapshot = runtime_dependencies.model_budget_snapshot
+        phase_decider = runtime_dependencies.phase_decider
 
     state_tools = build_research_state_tools(
         budget.snapshot, require_researcher=topology == "multi"
@@ -3375,6 +3381,13 @@ def build_agent(
         if phase_research_tools
         else None
     )
+    phase_action_apply = (
+        (phase_research_tools[0].metadata or {}).get("phase_action_apply")
+        if phase_research_tools
+        else None
+    )
+    if phase_action_drain is not None and phase_decider is None:
+        phase_decider = build_model_phase_decider(model)
     _disable_general_purpose_subagent(model)
     subagents = _build_subagents(
         topology=topology,
@@ -3485,8 +3498,11 @@ def build_agent(
         token_budget_can_start=token_budget_can_start,
         model_budget_snapshot=model_budget_snapshot,
         phase_action_drain=phase_action_drain,
+        phase_action_apply=phase_action_apply,
+        phase_decider=phase_decider,
         report_read=lambda: report_path.read_text() if report_path.is_file() else "",
         report_clear=lambda: report_path.unlink(missing_ok=True),
+        report_write=lambda content: report_path.write_text(content, encoding="utf-8"),
         checkpointer=checkpointer,
         max_subquestions=max_subquestions,
         max_research_cycles=max_subquestions * (2 + 2 * effective_max_escalations),

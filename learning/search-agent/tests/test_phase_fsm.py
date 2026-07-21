@@ -47,7 +47,9 @@ def _state() -> dict[str, Any]:
     }
 
 
-def _tools(*, fail_first_fetch: bool = False) -> tuple[list[Any], list[str]]:
+def _tools(
+    *, fail_first_fetch: bool = False, include_fallback: bool = True
+) -> tuple[list[Any], list[str]]:
     fetched: list[str] = []
 
     @tool("web_search")
@@ -79,7 +81,7 @@ def _tools(*, fail_first_fetch: bool = False) -> tuple[list[Any], list[str]]:
                             "relevance_tier": "uncertain",
                         }
                     ]
-                    if fail_first_fetch
+                    if fail_first_fetch and include_fallback
                     else []
                 ),
             }
@@ -278,3 +280,30 @@ def test_selected_access_blocked_candidate_uses_one_scoped_fallback() -> None:
     ]
     assert fetch_action["scope"]["source_id"] == "S1"
     assert len(fetch_action["attempts"]) == 2
+
+
+def test_access_blocked_without_second_host_records_no_eligible_fallback() -> None:
+    tools, fetched = _tools(fail_first_fetch=True, include_fallback=False)
+    choose, select, _ = tools
+    state = _state()
+    choose.func(
+        query="Primary fact attribute",
+        task_type="single_fact_lookup",
+        runtime=_runtime(state, "search"),
+    )
+    search_action = _drain(tools, state)["action"]
+    state.update(
+        {
+            "active_research_phase": "NEED_RESULT_SELECTION",
+            "active_search_scope": search_action["scope"],
+            "active_phase_turn_index": 1,
+        }
+    )
+    select.func(
+        result_id="R1", reason="top candidate", runtime=_runtime(state, "fetch")
+    )
+    fetch_action = _drain(tools, state)["action"]
+
+    assert fetched == ["https://public.example/primary"]
+    assert fetch_action["status"] == "fetch_failed"
+    assert fetch_action["fallback_reason"] == "no_eligible_fallback_candidate"

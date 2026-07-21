@@ -892,6 +892,7 @@ def report_claim_mapping_errors(
     claims: list[dict[str, Any]],
     evidence_units: list[dict[str, Any]],
     allowed_caveat_lines: set[str] | None = None,
+    allowed_non_factual_lines: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Validate constrained report lines against canonical claim-source edges."""
     lines = report.splitlines()
@@ -912,6 +913,7 @@ def report_claim_mapping_errors(
     invalid_sources_section_lines: list[str] = []
     unauthorized_caveat_lines: list[str] = []
     allowed_caveats = set(allowed_caveat_lines or set())
+    allowed_non_factual = set(allowed_non_factual_lines or set())
     current_section = ""
     section_order: list[str] = []
 
@@ -937,6 +939,8 @@ def report_claim_mapping_errors(
             invalid_section_structure.append(f"line {line_number}:unexpected")
             continue
         if not stripped:
+            continue
+        if stripped in allowed_non_factual:
             continue
         claim_ids = set(REPORT_CLAIM_PATTERN.findall(line))
         source_ids = set(REPORT_SOURCE_PATTERN.findall(line))

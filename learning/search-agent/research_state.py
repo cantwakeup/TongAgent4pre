@@ -263,6 +263,18 @@ class TongAgentState(DeepAgentState, total=False):
     active_search_scope: dict[str, Any]
     active_fetch_scope: dict[str, Any]
     active_evidence_attempts: dict[str, int]
+    # The FSM controller is the sole writer of phase ownership and decision
+    # telemetry.  Keeping the owner explicit prevents a completed SQ from
+    # leaking its terminal phase into the next SQ.
+    phase_subquestion_id: str | None
+    phase_decision_context: dict[str, Any]
+    pending_model_action_error: dict[str, Any] | None
+    model_action_parse_failures: int
+    model_action_repairs: int
+    model_action_repair_successes: int
+    model_action_events: list[dict[str, Any]]
+    report_type: str
+    deterministic_report: str
     phase_transition_log: list[dict[str, Any]]
     phase_timings: list[dict[str, Any]]
     active_phase_turn_index: int

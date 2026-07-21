@@ -62,6 +62,8 @@ TokenBudgetCanStart = Callable[[str], bool]
 ModelBudgetSnapshot = Callable[[], dict[str, Any]]
 EvidenceRecord = Callable[..., dict[str, Any]]
 PhaseActionDrain = Callable[[TongAgentState], dict[str, Any] | None]
+PhaseActionApply = Callable[[TongAgentState, str, dict[str, Any]], dict[str, Any]]
+PhaseDecisionCaller = Callable[[TongAgentState, str, bool, str | None], dict[str, Any]]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
 ControlRoute = Literal["select", "report"]
@@ -223,6 +225,141 @@ class _PhaseActionStore:
         return {"action": action, "ignored": ignored}
 
 
+class QueryDecision(BaseModel):
+    """The only structured model output accepted in ``NEED_QUERY``."""
+
+    query: str = Field(min_length=3, max_length=180)
+    task_type: Literal[
+        "single_fact_lookup",
+        "list_or_enumeration",
+        "comparison",
+        "date_or_numeric_lookup",
+    ]
+
+
+class ResultSelectionDecision(BaseModel):
+    """The only structured model output accepted in result selection."""
+
+    result_id: str = Field(pattern=r"^R[1-9][0-9]*$")
+    reason: str = Field(min_length=1, max_length=240)
+
+
+class EvidenceDecision(BaseModel):
+    """The only structured model output accepted in evidence registration."""
+
+    claim: str = Field(min_length=16, max_length=600)
+    quote_id: str = Field(pattern=r"^Q[1-9][0-9]*$")
+    stance: Literal["support", "contradict"] = "support"
+
+
+def phase_decision_schema(phase: str) -> type[BaseModel]:
+    """Return the one schema allowed for the code-owned FSM phase."""
+
+    schemas: dict[str, type[BaseModel]] = {
+        "NEED_QUERY": QueryDecision,
+        "NEED_RESULT_SELECTION": ResultSelectionDecision,
+        "NEED_EVIDENCE": EvidenceDecision,
+    }
+    try:
+        return schemas[phase]
+    except KeyError as exc:
+        raise ValueError(f"no model decision schema for phase {phase!r}") from exc
+
+
+def _safe_phase_output_summary(value: Any, *, limit: int = 480) -> str:
+    """Keep malformed model output auditable without replaying large context."""
+
+    if value is None:
+        return "<empty>"
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return " ".join(rendered.split())[:limit]
+
+
+def build_phase_decision_prompt(
+    state: TongAgentState,
+    *,
+    phase: str,
+    repair: bool,
+    validation_error: str | None = None,
+) -> str:
+    """Build the compact initial or repair prompt for one phase decision."""
+
+    schema = phase_decision_schema(phase)
+    context = dict(state.get("phase_decision_context", {}))
+    active_id = str(state.get("active_subquestion_id") or "")
+    if repair:
+        # This deliberately contains no prior chat/tool history and no previous
+        # action result: a repair may only choose the current phase action.
+        return (
+            "Return one valid JSON object and nothing else.\n"
+            f"CURRENT PHASE: {phase}\n"
+            f"ACTIVE SUBQUESTION: {active_id}\n"
+            f"REQUIRED SCHEMA: {json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n"
+            f"PREVIOUS VALIDATION ERROR: {validation_error or 'invalid_model_action'}\n"
+            "COMPACT CONTEXT:\n"
+            f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+        )
+    return (
+        "Choose exactly one legal next research action. Return only JSON matching "
+        "the required schema; do not answer the user question or invoke tools.\n"
+        f"CURRENT PHASE: {phase}\n"
+        f"ACTIVE SUBQUESTION: {active_id}\n"
+        f"REQUIRED SCHEMA: {json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n"
+        "COMPACT CONTEXT:\n"
+        f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def build_model_phase_decider(model: BaseChatModel) -> PhaseDecisionCaller:
+    """Create the production fallback structured decision caller.
+
+    Evaluation injects an accounted version.  The standalone CLI still uses
+    this path and keeps exactly the same schema and repair semantics.
+    """
+
+    def decide(
+        state: TongAgentState,
+        phase: str,
+        repair: bool,
+        validation_error: str | None = None,
+    ) -> dict[str, Any]:
+        schema = phase_decision_schema(phase)
+        prompt = build_phase_decision_prompt(
+            state,
+            phase=phase,
+            repair=repair,
+            validation_error=validation_error,
+        )
+        try:
+            response = model.with_structured_output(schema, include_raw=True).invoke(
+                prompt
+            )
+            parsed = response.get("parsed") if isinstance(response, dict) else response
+            decision = (
+                parsed.model_dump(mode="python")
+                if isinstance(parsed, BaseModel)
+                else schema.model_validate(parsed).model_dump(mode="python")
+            )
+        except Exception as exc:  # Provider and parse errors share repair path.
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": _safe_phase_output_summary(
+                    getattr(exc, "errors", lambda: None)()
+                    if hasattr(exc, "errors")
+                    else str(exc)
+                ),
+            }
+        return {"status": "success", "decision": decision}
+
+    return decide
+
+
 def build_phase_research_tools(
     *,
     search_tool: BaseTool,
@@ -355,15 +492,19 @@ def build_phase_research_tools(
         attempts: list[dict[str, Any]] = []
         tried_hosts: set[str] = set()
         successful: dict[str, Any] | None = None
+        eligible_candidates: list[dict[str, Any]] = []
         for candidate in [
             selected,
             *[item for item in candidates if item is not selected],
-        ][:2]:
+        ]:
             url = str(candidate["url"])
             host = re.sub(r"^https?://([^/]+).*$", r"\1", url).casefold()
             if host in tried_hosts:
                 continue
             tried_hosts.add(host)
+            eligible_candidates.append(candidate)
+        for candidate in eligible_candidates[:2]:
+            url = str(candidate["url"])
             try:
                 payload = json.loads(
                     fetch_tool.invoke({"url": url, "max_chars": 12_000})
@@ -386,17 +527,28 @@ def build_phase_research_tools(
                 break
         elapsed = time.perf_counter() - started
         if successful is None:
+            fallback_reason = (
+                "no_eligible_fallback_candidate"
+                if len(eligible_candidates) < 2
+                else "eligible_fallback_failed"
+            )
             store.complete(
                 runtime,
                 {
                     "status": "fetch_failed",
                     "action": "fetch",
                     "attempts": attempts,
+                    "fallback_reason": fallback_reason,
                     "elapsed_seconds": elapsed,
                 },
             )
             return json.dumps(
-                {"status": "fetch_failed", "attempts": attempts}, ensure_ascii=False
+                {
+                    "status": "fetch_failed",
+                    "attempts": attempts,
+                    "fallback_reason": fallback_reason,
+                },
+                ensure_ascii=False,
             )
         quotes = _compact_quote_candidates(str(successful.get("content", "")))
         fetch_scope = {
@@ -509,9 +661,73 @@ def build_phase_research_tools(
             ensure_ascii=False,
         )
 
+    def apply_structured_decision(
+        state: TongAgentState,
+        phase: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one pre-validated model decision through the normal tools.
+
+        The tool implementations own all network and evidence side effects.  A
+        synthetic ``ToolRuntime`` only supplies their existing read-only state
+        view; phase mutation remains exclusively in ``fsm_controller``.
+        """
+
+        runtime = ToolRuntime(
+            state=state,
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id=(
+                "structured-phase-"
+                f"{state.get('active_subquestion_id') or 'none'}-"
+                f"{state.get('active_phase_turn_index', 0)}"
+            ),
+            store=None,
+        )
+        try:
+            if phase == "NEED_QUERY":
+                item = QueryDecision.model_validate(decision)
+                response = choose_search_query.func(
+                    query=item.query,
+                    task_type=item.task_type,
+                    runtime=runtime,
+                )
+            elif phase == "NEED_RESULT_SELECTION":
+                item = ResultSelectionDecision.model_validate(decision)
+                response = select_search_result.func(
+                    result_id=item.result_id,
+                    reason=item.reason,
+                    runtime=runtime,
+                )
+            elif phase == "NEED_EVIDENCE":
+                item = EvidenceDecision.model_validate(decision)
+                response = propose_evidence.func(
+                    claim=item.claim,
+                    quote_id=item.quote_id,
+                    stance=item.stance,
+                    runtime=runtime,
+                )
+            else:
+                raise ValueError(f"unsupported structured phase: {phase}")
+        except Exception as exc:
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": _safe_phase_output_summary(decision),
+            }
+        return {
+            "status": "success",
+            "tool_response": _safe_phase_output_summary(response),
+        }
+
     phase_tools = [choose_search_query, select_search_result, propose_evidence]
     for item in phase_tools:
-        item.metadata = {**(item.metadata or {}), "phase_action_drain": store.drain}
+        item.metadata = {
+            **(item.metadata or {}),
+            "phase_action_drain": store.drain,
+            "phase_action_apply": apply_structured_decision,
+        }
     return phase_tools
 
 
@@ -1987,6 +2203,98 @@ def _query_task_guidance(task_type: str) -> str:
     return "Use one entity plus one factual attribute."
 
 
+def build_deterministic_abstain_report(
+    plan: ResearchPlan,
+    budget: dict[str, Any],
+    *,
+    integrity_failure: bool,
+) -> str:
+    """Render a validator-safe abstention without a synthesis model call."""
+
+    claims_by_id = {
+        str(item.get("claim_id", "")): item
+        for item in budget.get("claims", [])
+        if isinstance(item, dict)
+    }
+    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for item in budget.get("evidence_units", []):
+        if isinstance(item, dict) and item.get("stance") in {"supports", "contradicts"}:
+            evidence_by_claim.setdefault(str(item.get("claim_id", "")), []).append(item)
+    sources_by_id = {
+        str(item.get("source_id", "")): item
+        for item in budget.get("successful_sources", [])
+        if isinstance(item, dict)
+    }
+    plan_claim_ids = [
+        str(claim_id)
+        for subquestion in plan.get("subquestions", [])
+        if subquestion.get("status") == "covered"
+        for claim_id in subquestion.get("claim_ids", [])
+    ]
+    findings: list[str] = []
+    cited_source_ids: list[str] = []
+    if not integrity_failure:
+        for claim_id in dict.fromkeys(plan_claim_ids):
+            claim = claims_by_id.get(claim_id)
+            if not claim or claim.get("status") not in {"supported", "contested"}:
+                continue
+            edges = evidence_by_claim.get(claim_id, [])
+            source_ids = [
+                str(item.get("source_id", ""))
+                for item in edges
+                if str(item.get("source_id", "")) in sources_by_id
+            ]
+            if not source_ids:
+                continue
+            if claim.get("status") == "contested":
+                supported = next(
+                    (
+                        str(item.get("source_id", ""))
+                        for item in edges
+                        if item.get("stance") == "supports"
+                    ),
+                    "",
+                )
+                contradicted = next(
+                    (
+                        str(item.get("source_id", ""))
+                        for item in edges
+                        if item.get("stance") == "contradicts"
+                    ),
+                    "",
+                )
+                source_ids = [item for item in (supported, contradicted) if item]
+            source_refs = "".join(f"[{source_id}]" for source_id in source_ids)
+            findings.append(f"- {claim.get('text', '')} [{claim_id}]{source_refs}")
+            cited_source_ids.extend(source_ids)
+    caveats = sorted(
+        allowed_report_caveat_lines(plan, integrity_failure=integrity_failure)
+    )
+    source_lines = [
+        f"- [{source_id}] {sources_by_id[source_id].get('title', '')} — "
+        f"{sources_by_id[source_id].get('url', '')}"
+        for source_id in dict.fromkeys(cited_source_ids)
+        if source_id in sources_by_id
+    ]
+    return "\n".join(
+        [
+            "## Short Answer",
+            "INSUFFICIENT_EVIDENCE",
+            "ABSTAIN",
+            "",
+            "## Key Findings",
+            *findings,
+            "",
+            "## Conflicts and Caveats",
+            *caveats,
+            "",
+            "## Sources",
+            *source_lines,
+            "",
+        ]
+    )
+
+
 def build_research_graph(
     *,
     research_agent: Any,
@@ -2013,6 +2321,9 @@ def build_research_graph(
     token_budget_can_start: TokenBudgetCanStart | None = None,
     model_budget_snapshot: ModelBudgetSnapshot | None = None,
     phase_action_drain: PhaseActionDrain | None = None,
+    phase_action_apply: PhaseActionApply | None = None,
+    phase_decider: PhaseDecisionCaller | None = None,
+    report_write: Callable[[str], None] | None = None,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
@@ -2038,6 +2349,11 @@ def build_research_graph(
         pinned_topology: Topology identity that cannot change inside this plan.
         max_escalations: Maximum reserve releases for the whole plan.
         model_budget_snapshot: Optional evaluation model-call budget telemetry.
+        phase_action_apply: Applies a validated structured phase action through
+            the code-owned search/fetch/evidence tools.
+        phase_decider: Explicit schema-bound phase decision caller. Evaluation
+            injects an accounted implementation.
+        report_write: Atomic report writer used only for deterministic abstain.
 
     Returns:
         Compiled checkpointable research graph.
@@ -2134,6 +2450,26 @@ def build_research_graph(
             "active_search_scope": {},
             "active_fetch_scope": {},
             "active_evidence_attempts": {},
+            "phase_decision_context": {},
+            "pending_model_action_error": None,
+            "model_action_parse_failures": int(
+                state.get("model_action_parse_failures", 0)
+            )
+            if resuming_plan
+            else 0,
+            "model_action_repairs": int(state.get("model_action_repairs", 0))
+            if resuming_plan
+            else 0,
+            "model_action_repair_successes": int(
+                state.get("model_action_repair_successes", 0)
+            )
+            if resuming_plan
+            else 0,
+            "model_action_events": list(state.get("model_action_events", []))
+            if resuming_plan
+            else [],
+            "report_type": "",
+            "deterministic_report": "",
             "phase_transition_log": (
                 list(state.get("phase_transition_log", [])) if resuming_plan else []
             ),
@@ -2287,6 +2623,39 @@ def build_research_graph(
         )
         event_summary = _compact_research_history(state)
         phase = str(state.get("active_research_phase") or "NEED_QUERY")
+        search_scope = (
+            dict(state.get("active_search_scope", {}))
+            if isinstance(state.get("active_search_scope"), dict)
+            else {}
+        )
+        fetch_scope = (
+            dict(state.get("active_fetch_scope", {}))
+            if isinstance(state.get("active_fetch_scope"), dict)
+            else {}
+        )
+        phase_context = {
+            "active_subquestion": active_context.active_subquestion,
+            "query_task_type": active_context.query_task_type,
+            "remaining_search_budget": active_context.remaining_search_budget,
+            "remaining_fetch_budget": active_context.remaining_fetch_budget,
+            "candidates": [
+                {
+                    "result_id": item.get("result_id"),
+                    "title": item.get("title"),
+                    "snippet": item.get("snippet"),
+                    "rank": item.get("rank"),
+                    "relevance": item.get("relevance"),
+                }
+                for item in search_scope.get("candidates", [])
+                if isinstance(item, dict)
+            ][:5],
+            "quote_candidates": {
+                str(key): str(value)[:800]
+                for key, value in dict(fetch_scope.get("quote_candidates", {})).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
+            "unresolved_requirements": active_context.unresolved_requirements,
+        }
         delegation_instruction = (
             "MULTI MODE: your very next tool call MUST be task with "
             "subagent_type='researcher' and its description MUST start exactly "
@@ -2319,6 +2688,67 @@ CURRENT CODE-OWNED PHASE: {phase}
                 HumanMessage(content=content, id=message_id),
             ],
             "workflow_phase": "researching",
+            "phase_decision_context": phase_context,
+            "pending_model_action_error": None,
+        }
+
+    def phase_decision_node(state: TongAgentState) -> dict[str, Any]:
+        """Obtain one schema-bound initial decision without changing FSM state."""
+
+        active_id = str(state.get("active_subquestion_id") or "")
+        phase = str(state.get("active_research_phase") or "")
+        if (
+            not active_id
+            or phase not in {"NEED_QUERY", "NEED_RESULT_SELECTION", "NEED_EVIDENCE"}
+            or phase_decider is None
+            or phase_action_apply is None
+        ):
+            return {}
+        result = phase_decider(state, phase, False, None)
+        if result.get("status") == "success" and isinstance(
+            result.get("decision"), dict
+        ):
+            applied = phase_action_apply(state, phase, dict(result["decision"]))
+            if applied.get("status") == "success":
+                return {"pending_model_action_error": None}
+            result = applied
+        error = str(result.get("validation_error") or "invalid_model_action")
+        summary = _safe_phase_output_summary(result.get("raw_output_summary"))
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "invalid_model_action",
+            plan_id=str(plan.get("plan_id", "")),
+            subquestion_id=active_id,
+            details={
+                "phase": phase,
+                "validation_error": error,
+                "raw_output_summary": summary,
+                "repair_scheduled": True,
+            },
+        )
+        action_events = list(state.get("model_action_events", []))
+        action_events.append(
+            {
+                "phase": phase,
+                "subquestion_id": active_id,
+                "event": "invalid_model_action",
+                "validation_error": error,
+                "raw_output_summary": summary,
+            }
+        )
+        return {
+            "research_events": events,
+            "pending_model_action_error": {
+                "phase": phase,
+                "validation_error": error,
+                "raw_output_summary": summary,
+            },
+            "model_action_parse_failures": int(
+                state.get("model_action_parse_failures", 0)
+            )
+            + 1,
+            "model_action_events": action_events,
         }
 
     def fsm_controller_node(state: TongAgentState) -> dict[str, Any]:
@@ -2327,22 +2757,111 @@ CURRENT CODE-OWNED PHASE: {phase}
         active_id = str(state.get("active_subquestion_id") or "")
         plan = cast("ResearchPlan", state.get("research_plan", {}))
         previous = str(state.get("active_research_phase") or "")
+        phase_owner = str(state.get("phase_subquestion_id") or "")
         action_bundle = phase_action_drain(state) if phase_action_drain else None
+        updates_prefix: dict[str, Any] = {}
         if not active_id:
-            return {"active_research_phase": "SQ_DONE", "last_phase_action": {}}
-        if not previous:
+            # Do not rewrite a terminal blocked state while preparing a report.
+            return {}
+        if phase_owner != active_id or not previous:
             next_phase = "NEED_QUERY"
             action: dict[str, Any] = {"action": "initialize", "status": "ready"}
             ignored: list[dict[str, Any]] = []
         elif action_bundle is None:
             if phase_action_drain is None:
                 return {}
-            next_phase = "SQ_BLOCKED"
-            action = {"action": "none", "status": "no_model_action"}
-            ignored = []
+            pending = state.get("pending_model_action_error")
+            if (
+                isinstance(pending, dict)
+                and phase_decider is not None
+                and phase_action_apply is not None
+                and not pending.get("repair_attempted")
+            ):
+                validation_error = str(
+                    pending.get("validation_error") or "invalid_model_action"
+                )
+                repaired = phase_decider(state, previous, True, validation_error)
+                events = append_research_event(
+                    list(state.get("research_events", [])),
+                    "model_action_repair_attempted",
+                    plan_id=str(plan.get("plan_id", "")),
+                    subquestion_id=active_id,
+                    details={"phase": previous, "validation_error": validation_error},
+                )
+                repair_events = list(state.get("model_action_events", []))
+                repair_events.append(
+                    {
+                        "phase": previous,
+                        "subquestion_id": active_id,
+                        "event": "model_action_repair_attempted",
+                        "validation_error": validation_error,
+                    }
+                )
+                updates_prefix.update(
+                    {
+                        "research_events": events,
+                        "model_action_repairs": int(
+                            state.get("model_action_repairs", 0)
+                        )
+                        + 1,
+                        "model_action_events": repair_events,
+                    }
+                )
+                if repaired.get("status") == "success" and isinstance(
+                    repaired.get("decision"), dict
+                ):
+                    applied = phase_action_apply(
+                        state, previous, dict(repaired["decision"])
+                    )
+                    if applied.get("status") == "success":
+                        action_bundle = (
+                            phase_action_drain(state) if phase_action_drain else None
+                        )
+                        if action_bundle is not None:
+                            updates_prefix["model_action_repair_successes"] = (
+                                int(state.get("model_action_repair_successes", 0)) + 1
+                            )
+                            repair_events.append(
+                                {
+                                    "phase": previous,
+                                    "subquestion_id": active_id,
+                                    "event": "model_action_repair_succeeded",
+                                }
+                            )
+                if action_bundle is None:
+                    summary = _safe_phase_output_summary(
+                        repaired.get("raw_output_summary")
+                    )
+                    updates_prefix["pending_model_action_error"] = {
+                        **pending,
+                        "repair_attempted": True,
+                        "repair_validation_error": str(
+                            repaired.get("validation_error") or "invalid_model_action"
+                        ),
+                        "repair_raw_output_summary": summary,
+                    }
+                    repair_events.append(
+                        {
+                            "phase": previous,
+                            "subquestion_id": active_id,
+                            "event": "model_action_repair_failed",
+                            "raw_output_summary": summary,
+                        }
+                    )
+            if action_bundle is None:
+                next_phase = "SQ_BLOCKED"
+                action = {"action": "none", "status": "invalid_model_action"}
+                ignored = []
+            else:
+                action = dict(action_bundle.get("action") or {})
+                ignored = [dict(item) for item in action_bundle.get("ignored", [])]
+                next_phase = ""
         else:
             action = dict(action_bundle.get("action") or {})
             ignored = [dict(item) for item in action_bundle.get("ignored", [])]
+            next_phase = ""
+
+        if not next_phase:
             status = str(action.get("status", "missing"))
             name = str(action.get("action", ""))
             if name == "search":
@@ -2404,7 +2923,9 @@ CURRENT CODE-OWNED PHASE: {phase}
             }
         )
         updates: dict[str, Any] = {
+            **updates_prefix,
             "active_research_phase": next_phase,
+            "phase_subquestion_id": active_id,
             "research_events": events,
             "phase_timings": timings,
             "phase_transition_log": [
@@ -2418,6 +2939,11 @@ CURRENT CODE-OWNED PHASE: {phase}
             ],
             "active_phase_turn_index": int(state.get("active_phase_turn_index", 0)) + 1,
             "last_phase_action": action,
+            "pending_model_action_error": None
+            if next_phase != "SQ_BLOCKED"
+            else updates_prefix.get(
+                "pending_model_action_error", state.get("pending_model_action_error")
+            ),
         }
         if str(action.get("action")) == "search" and action.get("scope"):
             updates["active_search_scope"] = action["scope"]
@@ -2954,6 +3480,17 @@ CURRENT CODE-OWNED PHASE: {phase}
                     "Evidence integrity validation failed; research stopped."
                 )
             plan = refresh_plan_status(plan)
+        closure_errors = invalid_covered_subquestions(plan, budget)
+        required_subquestions_covered = bool(plan.get("subquestions")) and all(
+            item.get("status") == "covered" for item in plan.get("subquestions", [])
+        )
+        normal_synthesis_allowed = (
+            not integrity_fail_closed
+            and not closure_errors
+            and required_subquestions_covered
+            and plan.get("status") == "completed"
+            and plan.get("structural_subquestion_coverage") == 1.0
+        )
         events = append_research_event(
             list(state.get("research_events", [])),
             "report_requested",
@@ -2966,8 +3503,37 @@ CURRENT CODE-OWNED PHASE: {phase}
                 "status": plan["status"],
                 "integrity_fail_closed": integrity_fail_closed,
                 "integrity_errors": integrity_errors,
+                "normal_synthesis_allowed": normal_synthesis_allowed,
             },
         )
+        if not normal_synthesis_allowed:
+            report = build_deterministic_abstain_report(
+                plan,
+                budget,
+                integrity_failure=integrity_fail_closed,
+            )
+            events = append_research_event(
+                events,
+                "deterministic_abstain_requested",
+                plan_id=plan["plan_id"],
+                details={
+                    "required_subquestions_covered": required_subquestions_covered,
+                    "plan_status": plan.get("status"),
+                    "structural_subquestion_coverage": plan.get(
+                        "structural_subquestion_coverage"
+                    ),
+                    "closure_errors": closure_errors,
+                },
+            )
+            return {
+                "research_plan": plan,
+                "research_events": events,
+                "budget_state": cast("BudgetState", budget),
+                "workflow_phase": "reporting",
+                "report_markdown": report,
+                "report_type": "deterministic_abstain",
+                "deterministic_report": report,
+            }
         report_plan = {
             "plan_id": plan.get("plan_id"),
             "question": plan.get("question"),
@@ -3092,7 +3658,36 @@ ALLOWED CAVEAT LINES:
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "reporting",
             "report_markdown": "",
+            "report_type": "normal_synthesis",
+            "deterministic_report": "",
         }
+
+    def deterministic_abstain_node(state: TongAgentState) -> dict[str, Any]:
+        """Persist a code-generated report without invoking synthesis/extraction."""
+
+        report = str(state.get("deterministic_report") or "")
+        if not report:
+            raise RuntimeError("deterministic abstain report is missing")
+        if report_write is not None:
+            report_write(report)
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "deterministic_abstain_report_written",
+            plan_id=str(state.get("research_plan", {}).get("plan_id", "")),
+            details={"report_type": "deterministic_abstain"},
+        )
+        return {
+            "research_events": events,
+            "report_markdown": report,
+            "report_type": "deterministic_abstain",
+        }
+
+    def route_after_prepare_report(state: TongAgentState) -> str:
+        return (
+            "deterministic_abstain"
+            if state.get("report_type") == "deterministic_abstain"
+            else "report_agent"
+        )
 
     def finish_node(state: TongAgentState) -> dict[str, Any]:
         budget = budget_snapshot()
@@ -3172,10 +3767,12 @@ ALLOWED CAVEAT LINES:
     builder.add_node("plan", plan_node)
     builder.add_node("select", select_node)
     builder.add_node("prepare_research", prepare_research_node)
+    builder.add_node("phase_decision", phase_decision_node)
     builder.add_node("research_agent", invoke_inner_agent)
     builder.add_node("evaluate", evaluate_node)
     builder.add_node("adaptive_control", adaptive_control_node)
     builder.add_node("prepare_report", prepare_report_node)
+    builder.add_node("deterministic_abstain", deterministic_abstain_node)
     builder.add_node("report_agent", invoke_report_agent)
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "plan")
@@ -3200,8 +3797,12 @@ ALLOWED CAVEAT LINES:
                 "report": "prepare_report",
             },
         )
-        builder.add_edge("prepare_research", "research_agent")
-        builder.add_edge("research_agent", "fsm_controller")
+        if phase_decider is not None and phase_action_apply is not None:
+            builder.add_edge("prepare_research", "phase_decision")
+            builder.add_edge("phase_decision", "fsm_controller")
+        else:
+            builder.add_edge("prepare_research", "research_agent")
+            builder.add_edge("research_agent", "fsm_controller")
     builder.add_conditional_edges(
         "evaluate",
         route_after_evaluate,
@@ -3216,7 +3817,15 @@ ALLOWED CAVEAT LINES:
         route_after_control,
         {"select": "select", "report": "prepare_report"},
     )
-    builder.add_edge("prepare_report", "report_agent")
+    builder.add_conditional_edges(
+        "prepare_report",
+        route_after_prepare_report,
+        {
+            "deterministic_abstain": "deterministic_abstain",
+            "report_agent": "report_agent",
+        },
+    )
+    builder.add_edge("deterministic_abstain", "finish")
     builder.add_edge("report_agent", "finish")
     builder.add_edge("finish", END)
     return builder.compile(

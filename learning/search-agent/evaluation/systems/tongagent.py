@@ -35,9 +35,11 @@ from evidence_graph import (
 )
 from research_graph import (
     PlanDraft,
+    build_phase_decision_prompt,
     create_research_plan,
     fallback_research_plan,
     invalid_covered_subquestions,
+    phase_decision_schema,
 )
 from retrieval_quality import normalize_atomic_search_query
 from search_agent import (
@@ -77,6 +79,7 @@ from .common import (
 
 SYSTEM_TONGAGENT = "tongagent"
 _PLANNER_LABEL = "tongagent.planner"
+_PHASE_DECISION_LABEL_PREFIX = "tongagent.phase_decision"
 _MODE = "single"
 _STRATEGY = "adaptive"
 _MAX_ESCALATIONS = 2
@@ -112,6 +115,7 @@ class TongAgentRunner:
         run_id = f"{self.system_id}-{task.id}-{uuid.uuid4().hex}"
         runtime: PreparedRuntime | None = None
         native_state: dict[str, Any] | None = None
+        phase_checkpoint: dict[str, Any] = {}
         control_fingerprint = ""
         caught: Exception | None = None
         trace.record(
@@ -166,6 +170,11 @@ class TongAgentRunner:
                 token_budget_can_start=runtime.middleware.can_start_token_subquestion,
                 model_budget_snapshot=lambda: execution_budget.snapshot().model_dump(
                     mode="json"
+                ),
+                phase_decider=(
+                    _build_accounted_phase_decider(runtime)
+                    if resolved_config.backend_kind == "live"
+                    else None
                 ),
                 phase_fixture_compatibility=(resolved_config.backend_kind == "fixture"),
             )
@@ -228,40 +237,26 @@ class TongAgentRunner:
         finally:
             # Publish a minimal diagnostic atomically even when graph/model/tool
             # execution failed before a normal native artifact could be built.
+            snapshot_ledger = (
+                runtime.research_budget.snapshot() if runtime is not None else {}
+            )
+            phase_checkpoint = _canonical_phase_checkpoint(
+                native_state,
+                _native_plan(native_state),
+                snapshot_ledger,
+            )
             _atomic_json(
                 tongagent_directory / "phase_runtime_snapshot.json",
                 {
-                    "current_phase": (
-                        native_state.get("active_research_phase")
-                        if native_state is not None
-                        else "unknown"
-                    ),
-                    "active_subquestion_id": (
-                        native_state.get("active_subquestion_id")
-                        if native_state is not None
-                        else None
-                    ),
-                    "last_legal_action": (
-                        native_state.get("last_phase_action", {})
-                        if native_state is not None
-                        else {}
-                    ),
-                    "current_tool": (
-                        native_state.get("last_phase_action", {}).get("action")
-                        if native_state is not None
-                        else None
-                    ),
-                    "budget_snapshot": (
-                        runtime.research_budget.snapshot()
-                        if runtime is not None
-                        else {}
-                    ),
+                    **phase_checkpoint,
+                    "budget_snapshot": snapshot_ledger,
                     "caught_exception": type(caught).__name__ if caught else None,
                 },
             )
 
         ledger = runtime.research_budget.snapshot() if runtime is not None else {}
         plan = _native_plan(native_state)
+        phase_checkpoint = _canonical_phase_checkpoint(native_state, plan, ledger)
         report_path = tongagent_directory / "report.md"
         if native_state is not None:
             _restore_checkpointed_report(report_path, native_state)
@@ -284,6 +279,7 @@ class TongAgentRunner:
             policy=policy,
             model_name=resolved_config.model.name,
             control_fingerprint=control_fingerprint,
+            phase_checkpoint=phase_checkpoint,
         )
         evidence_count = (
             len(_mapping_list(ledger.get("evidence_units")))
@@ -294,28 +290,46 @@ class TongAgentRunner:
         canonical_output = {
             "final_answer": report or None,
             "tongagent_state": native_state,
+            "phase_checkpoint": phase_checkpoint,
+            "report_type": (
+                native_state.get("report_type") if native_state is not None else ""
+            ),
         }
         final_answer_override: str | None = None
         if runtime is not None and resolved_config.backend_kind == "live":
             missing_subquestions = _missing_required_subquestions(plan)
-            try:
-                final_answer_override = runtime.middleware.finalize_answer(
-                    runtime.model,
-                    question=task.question,
-                    draft=report or None,
-                    required_evidence_complete=not missing_subquestions,
+            if (
+                native_state is not None
+                and native_state.get("report_type") == "deterministic_abstain"
+            ):
+                final_answer_override = _attach_final_marker(report or None, "ABSTAIN")
+                trace.record(
+                    "final_synthesis_skipped",
+                    phase="final_synthesis",
+                    reason="deterministic_abstain_report",
                     missing_subquestions=missing_subquestions,
                 )
-            except Exception as exc:
-                if caught is None:
-                    caught = exc
-                    trace.record(
-                        "run_exception",
-                        phase="final_synthesis",
-                        exception_type=type(exc).__name__,
-                        message=_safe_exception_message(exc),
+            else:
+                try:
+                    final_answer_override = runtime.middleware.finalize_answer(
+                        runtime.model,
+                        question=task.question,
+                        draft=report or None,
+                        required_evidence_complete=not missing_subquestions,
+                        missing_subquestions=missing_subquestions,
                     )
-                final_answer_override = _attach_final_marker(report or None, "ABSTAIN")
+                except Exception as exc:
+                    if caught is None:
+                        caught = exc
+                        trace.record(
+                            "run_exception",
+                            phase="final_synthesis",
+                            exception_type=type(exc).__name__,
+                            message=_safe_exception_message(exc),
+                        )
+                    final_answer_override = _attach_final_marker(
+                        report or None, "ABSTAIN"
+                    )
         finished_at = datetime.now(UTC)
         wall_time_seconds = max(0.0, time.perf_counter() - started)
         base_result = build_run_result(
@@ -342,6 +356,9 @@ class TongAgentRunner:
             plan=plan,
             fatal_errors=fatal_errors,
             completeness_errors=completeness_errors,
+            state_integrity_errors=list(
+                phase_checkpoint.get("state_integrity_errors", [])
+            ),
         )
         trace.record(
             "run_finished",
@@ -383,6 +400,7 @@ class TongAgentRunner:
                 if runtime is not None
                 else {}
             ),
+            phase_checkpoint=phase_checkpoint,
         )
         return result
 
@@ -548,6 +566,121 @@ User question: {topic}"""
     return plan
 
 
+def _safe_phase_decision_summary(value: Any, *, limit: int = 480) -> str:
+    """Return a bounded, credential-free summary of malformed model output."""
+
+    safe = sanitize_trace_value(value)
+    try:
+        rendered = json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(safe)
+    return " ".join(rendered.split())[:limit]
+
+
+def _build_accounted_phase_decider(
+    *,
+    runtime: PreparedRuntime,
+) -> Callable[[dict[str, Any], str, bool, str | None], dict[str, Any]]:
+    """Create one accounted, schema-bound decision call per FSM phase."""
+
+    def decide(
+        state: dict[str, Any],
+        phase: str,
+        repair: bool,
+        validation_error: str | None = None,
+    ) -> dict[str, Any]:
+        schema = phase_decision_schema(phase)
+        prompt = build_phase_decision_prompt(
+            cast("Any", state),
+            phase=phase,
+            repair=repair,
+            validation_error=validation_error,
+        )
+        label = (
+            f"{_PHASE_DECISION_LABEL_PREFIX}.{phase.casefold()}"
+            f".{'repair' if repair else 'initial'}"
+        )
+        reservation = runtime.middleware.reserve_external_model_call(
+            label=label,
+            request_payload={
+                "phase": phase,
+                "repair": repair,
+                "prompt": prompt,
+                "response_schema": schema.model_json_schema(),
+            },
+            stage="research_step",
+        )
+        try:
+            response = (
+                runtime.middleware.model_for_stage(
+                    runtime.model,
+                    "research_step",
+                )
+                .with_structured_output(schema, include_raw=True)
+                .invoke(prompt)
+            )
+        except BudgetExceeded:
+            runtime.middleware.cancel_external_model_call(reservation, label=label)
+            raise
+        except Exception as exc:
+            runtime.middleware.cancel_external_model_call(reservation, label=label)
+            runtime.trace.record(
+                "phase_decision_model_failed",
+                phase="research",
+                decision_phase=phase,
+                repair=repair,
+                exception_type=type(exc).__name__,
+                message=_safe_exception_message(exc),
+            )
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": _safe_phase_decision_summary(str(exc)),
+            }
+        raw_response = (
+            response.get("raw") if isinstance(response, Mapping) else response
+        )
+        runtime.middleware.record_external_model_response(
+            raw_response,
+            label=label,
+            reservation=reservation,
+        )
+        try:
+            parsed = (
+                response.get("parsed") if isinstance(response, Mapping) else response
+            )
+            decision = schema.model_validate(parsed).model_dump(mode="python")
+        except Exception as exc:
+            summary = _safe_phase_decision_summary(
+                response.get("parsing_error")
+                if isinstance(response, Mapping)
+                else response
+            )
+            runtime.trace.record(
+                "phase_decision_invalid",
+                phase="research",
+                decision_phase=phase,
+                repair=repair,
+                validation_error=type(exc).__name__,
+                raw_output_summary=summary,
+            )
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": summary,
+            }
+        runtime.trace.record(
+            "phase_decision_finished",
+            phase="research",
+            decision_phase=phase,
+            repair=repair,
+            schema=schema.__name__,
+        )
+        return {"status": "success", "decision": decision}
+
+    return decide
+
+
 def _validate_native_run(
     *,
     plan: dict[str, Any] | None,
@@ -557,6 +690,7 @@ def _validate_native_run(
     policy: EffortPolicy,
     model_name: str,
     control_fingerprint: str,
+    phase_checkpoint: Mapping[str, Any],
 ) -> tuple[list[str], list[str]]:
     """Separate integrity/output failures from honest partial completion."""
 
@@ -565,6 +699,9 @@ def _validate_native_run(
     if plan is None:
         fatal.append("missing durable research plan")
         return fatal, incomplete
+
+    phase_errors = _string_list(phase_checkpoint.get("state_integrity_errors"))
+    fatal.extend(f"state_integrity_error: {item}" for item in phase_errors)
 
     graph_errors = validate_evidence_graph(ledger)
     if graph_errors:
@@ -589,9 +726,14 @@ def _validate_native_run(
             max_escalations=_MAX_ESCALATIONS,
         )
     )
+    report_type = str(native_state.get("report_type", "")) if native_state else ""
     messages = _native_messages(native_state)
     native_trace = _build_tool_trace(messages)
-    if _successful_final_report_write_position(native_trace) is None:
+    deterministic_abstain = report_type == "deterministic_abstain"
+    if (
+        not deterministic_abstain
+        and _successful_final_report_write_position(native_trace) is None
+    ):
         fatal.append("missing successful report-phase write to /report.md")
     if not report:
         fatal.append("missing report.md")
@@ -613,6 +755,9 @@ def _validate_native_run(
             plan,
             integrity_failure=bool(graph_errors),
         ),
+        allowed_non_factual_lines=(
+            {"INSUFFICIENT_EVIDENCE", "ABSTAIN"} if deterministic_abstain else None
+        ),
     )
     for label, values in mapping_errors.items():
         if values:
@@ -627,6 +772,10 @@ def _validate_native_run(
     for label, values in canonical_errors.items():
         if values:
             fatal.append(f"report source {label}: {', '.join(values)}")
+    if deterministic_abstain and (
+        "INSUFFICIENT_EVIDENCE" not in report or "ABSTAIN" not in report
+    ):
+        fatal.append("deterministic abstain report is missing required markers")
 
     if plan.get("status") != "completed":
         incomplete.append(
@@ -669,6 +818,7 @@ def _apply_native_completion(
     plan: dict[str, Any] | None,
     fatal_errors: list[str],
     completeness_errors: list[str],
+    state_integrity_errors: list[str] | None = None,
 ) -> RunResult:
     """Make plan/report integrity authoritative over a terminal chat message."""
 
@@ -680,8 +830,13 @@ def _apply_native_completion(
     if base.completion_status != CompletionStatus.COMPLETED:
         return RunResult.model_validate(payload)
     if fatal_errors:
+        failure_type = (
+            FailureType.STATE_INTEGRITY_ERROR
+            if state_integrity_errors
+            else FailureType.INVALID_OUTPUT
+        )
         failure = FailureDetail(
-            failure_type=FailureType.INVALID_OUTPUT,
+            failure_type=failure_type,
             message="TongAgent native output failed validation",
             stage="tongagent_validation",
             retryable=False,
@@ -695,7 +850,7 @@ def _apply_native_completion(
         payload.update(
             {
                 "completion_status": CompletionStatus.FAILED,
-                "failure_type": FailureType.INVALID_OUTPUT,
+                "failure_type": failure_type,
                 "failure": failure,
             }
         )
@@ -779,6 +934,7 @@ def _write_tongagent_artifacts(
     source_section_canonicalized: bool,
     token_control: dict[str, Any],
     orchestration: dict[str, Any],
+    phase_checkpoint: dict[str, Any],
 ) -> None:
     """Persist the native Stage 03D state beside its SQLite checkpoint."""
 
@@ -805,25 +961,7 @@ def _write_tongagent_artifacts(
     _atomic_json(directory / "orchestration.json", orchestration)
     _atomic_json(
         directory / "phase_state.json",
-        (
-            {
-                "current_phase": native_state.get("active_research_phase"),
-                "active_subquestion_id": native_state.get("active_subquestion_id"),
-                "last_legal_action": native_state.get("last_phase_action", {}),
-                "current_tool": native_state.get("last_phase_action", {}).get("action"),
-                "budget_snapshot": ledger,
-                "transitions": list(native_state.get("phase_transition_log", [])),
-                "timings": list(native_state.get("phase_timings", [])),
-            }
-            if native_state is not None
-            else {
-                "current_phase": "unknown",
-                "active_subquestion_id": None,
-                "last_legal_action": {},
-                "current_tool": None,
-                "budget_snapshot": ledger,
-            }
-        ),
+        {**phase_checkpoint, "budget_snapshot": ledger},
     )
     _atomic_json(
         directory / "compact_checkpoints.json",
@@ -852,6 +990,12 @@ def _write_tongagent_artifacts(
             "fatal_errors": fatal_errors,
             "completeness_errors": completeness_errors,
             "source_section_canonicalized": source_section_canonicalized,
+            "report_type": (
+                native_state.get("report_type") if native_state is not None else ""
+            ),
+            "state_integrity_errors": phase_checkpoint.get(
+                "state_integrity_errors", []
+            ),
         },
     )
     if report:
@@ -878,6 +1022,67 @@ def _atomic_text(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(content, encoding="utf-8")
     temporary.replace(path)
+
+
+def _canonical_phase_checkpoint(
+    native_state: Mapping[str, Any] | None,
+    plan: Mapping[str, Any] | None,
+    ledger: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read the final FSM controller checkpoint and reject silent rewrites."""
+
+    if native_state is None:
+        return {
+            "current_phase": "unknown",
+            "phase_subquestion_id": None,
+            "active_subquestion_id": None,
+            "last_legal_action": {},
+            "current_tool": None,
+            "last_transition": None,
+            "transitions": [],
+            "timings": [],
+            "state_integrity_errors": ["missing_native_fsm_checkpoint"],
+        }
+    transitions = _mapping_list(native_state.get("phase_transition_log"))
+    last_transition = transitions[-1] if transitions else None
+    phase = str(native_state.get("active_research_phase") or "unknown")
+    owner = native_state.get("phase_subquestion_id")
+    owner_id = str(owner) if owner else None
+    active_id = native_state.get("active_subquestion_id")
+    errors: list[str] = []
+    if last_transition is not None and phase != str(last_transition.get("to", "")):
+        errors.append(
+            "final_phase_mismatches_last_transition: "
+            f"{phase} != {last_transition.get('to')}"
+        )
+    if last_transition is not None and owner_id != str(
+        last_transition.get("subquestion_id") or ""
+    ):
+        errors.append("phase_owner_mismatches_last_transition")
+    if phase == "SQ_DONE":
+        owner_subquestion = next(
+            (
+                item
+                for item in _mapping_list((plan or {}).get("subquestions"))
+                if item.get("id") == owner_id
+            ),
+            None,
+        )
+        if owner_subquestion is None or owner_subquestion.get("status") != "covered":
+            errors.append("sq_done_without_covered_requirement")
+        elif invalid_covered_subquestions(dict(plan or {}), dict(ledger)).get(owner_id):
+            errors.append("sq_done_without_canonical_evidence")
+    return {
+        "current_phase": phase,
+        "phase_subquestion_id": owner_id,
+        "active_subquestion_id": active_id,
+        "last_legal_action": dict(native_state.get("last_phase_action", {})),
+        "current_tool": dict(native_state.get("last_phase_action", {})).get("action"),
+        "last_transition": last_transition,
+        "transitions": transitions,
+        "timings": _mapping_list(native_state.get("phase_timings")),
+        "state_integrity_errors": errors,
+    }
 
 
 def _native_plan(state: Mapping[str, Any] | None) -> dict[str, Any] | None:

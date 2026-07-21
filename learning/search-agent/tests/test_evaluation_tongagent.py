@@ -272,7 +272,9 @@ def test_real_tongagent_graph_completes_with_native_exact_quote_provenance(
     assert json.loads((tongagent / "validation.json").read_text()) == {
         "completeness_errors": [],
         "fatal_errors": [],
+        "report_type": "normal_synthesis",
         "source_section_canonicalized": False,
+        "state_integrity_errors": [],
         "status": "passed",
     }
 
