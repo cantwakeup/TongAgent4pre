@@ -1424,7 +1424,11 @@ def run_permissive_workflow(
             structural_subquestion_coverage=sq_completion if plan is not None else None,
             final_answer_override=final_answer,
         )
-        if caught is None:
+        # ``build_run_result`` is authoritative for deadline/budget terminals.
+        # A deterministic ABSTAIN is only a normal partial result when no
+        # terminal budget state was observed.  Overwriting a timed-out result
+        # while retaining its budget snapshot violates RunResult's contract.
+        if caught is None and result.completion_status == CompletionStatus.COMPLETED:
             result = result.model_copy(
                 update={
                     "completion_status": (
