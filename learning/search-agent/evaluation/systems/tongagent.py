@@ -100,6 +100,58 @@ class TongAgentRunner:
         self._fixture_backend = fixture_backend
         self._model = model
 
+    def preflight(
+        self,
+        task: EvalTask,
+        resolved_config: ResolvedConfig,
+    ) -> dict[str, Any]:
+        """Construct the production runtime and graph without invoking it.
+
+        This deliberately shares the same runtime and ``build_agent`` path as
+        :meth:`run`.  It is used to fail fast on dependency-wiring regressions
+        before a controlled live experiment can spend a model or web budget.
+        """
+
+        options, policy = _resolve_options(resolved_config)
+        artifact_directory = Path(resolved_config.artifact_directory).expanduser()
+        tongagent_directory = artifact_directory / "native" / "tongagent"
+        tongagent_directory.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = tongagent_directory / "checkpoint.sqlite"
+        trace = TraceCollector()
+        execution_budget = ExecutionBudget(resolved_config.budget)
+        with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+            runtime, bundle = self._build_runtime_bundle(
+                task=task,
+                resolved_config=resolved_config,
+                options=options,
+                policy=policy,
+                execution_budget=execution_budget,
+                trace=trace,
+                tongagent_directory=tongagent_directory,
+                checkpointer=checkpointer,
+            )
+        snapshot = execution_budget.snapshot()
+        model_invocations = sum(
+            event.event_type == "model_call_started" for event in trace.snapshot()
+        )
+        if (
+            model_invocations
+            or snapshot.total_tokens
+            or snapshot.estimated_token_charges
+        ):
+            msg = "TongAgent startup preflight must not invoke the model"
+            raise RuntimeError(msg)
+        return {
+            "task_id": task.id,
+            "agent_constructed": True,
+            "phase_decider_configured": resolved_config.backend_kind == "live",
+            "topology": bundle.topology,
+            "strategy": bundle.strategy,
+            "runtime_tools": [item.name for item in runtime.tools],
+            "model_invocations": model_invocations,
+            "reserved_model_calls": snapshot.model_calls,
+        }
+
     def run(self, task: EvalTask, resolved_config: ResolvedConfig) -> RunResult:
         """Execute one isolated, checkpointed B3 attempt."""
 
@@ -129,68 +181,17 @@ class TongAgentRunner:
         )
 
         try:
-            runtime = prepare_runtime(
-                task,
-                resolved_config,
-                system_id=self.system_id,
-                execution_budget=execution_budget,
-                trace=trace,
-                injected_backend=self._fixture_backend,
-                injected_model=self._model,
-                semantic_policy=policy,
-                semantic_strategy=_STRATEGY,
-                enable_tongagent_evidence_state=True,
-                enable_tongagent_token_control=True,
-                enable_tongagent_context_compaction=True,
-                search_query_normalizer=normalize_atomic_search_query,
-            )
-            planner = _build_accounted_planner(
-                task=task,
-                runtime=runtime,
-                fixture=resolved_config.backend_kind == "fixture",
-            )
-            summarization = build_evaluation_summarization_middleware(
-                runtime.model,
-                FilesystemBackend(
-                    root_dir=tongagent_directory,
-                    virtual_mode=True,
-                ),
-                runtime.middleware,
-            )
-            dependencies = AgentRuntimeDependencies(
-                model=runtime.model,
-                reviewer_model=runtime.model,
-                network_tools=runtime.tools,
-                budget=runtime.research_budget,
-                planner=planner,
-                middleware=(runtime.middleware, summarization),
-                token_budget_configure=runtime.middleware.configure_token_partitions,
-                token_budget_activate=runtime.middleware.activate_token_subquestion,
-                token_budget_snapshot=runtime.middleware.token_partition_snapshot,
-                token_budget_can_start=runtime.middleware.can_start_token_subquestion,
-                model_budget_snapshot=lambda: execution_budget.snapshot().model_dump(
-                    mode="json"
-                ),
-                phase_decider=(
-                    _build_accounted_phase_decider(runtime)
-                    if resolved_config.backend_kind == "live"
-                    else None
-                ),
-                phase_fixture_compatibility=(resolved_config.backend_kind == "fixture"),
-            )
             thread_id = f"eval-{run_id}"
             with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
-                bundle = build_agent(
-                    output_dir=tongagent_directory,
-                    model_name=resolved_config.model.name,
-                    worker_model_name=resolved_config.model.name,
-                    effort=cast("EffortName", options["effort"]),
-                    mode=_MODE,
-                    strategy=_STRATEGY,
-                    max_escalations=_MAX_ESCALATIONS,
-                    topic=task.question,
+                runtime, bundle = self._build_runtime_bundle(
+                    task=task,
+                    resolved_config=resolved_config,
+                    options=options,
+                    policy=policy,
+                    execution_budget=execution_budget,
+                    trace=trace,
+                    tongagent_directory=tongagent_directory,
                     checkpointer=checkpointer,
-                    runtime_dependencies=dependencies,
                 )
                 control_fingerprint = bundle.config_fingerprint
                 trace.record(
@@ -403,6 +404,83 @@ class TongAgentRunner:
             phase_checkpoint=phase_checkpoint,
         )
         return result
+
+    def _build_runtime_bundle(
+        self,
+        *,
+        task: EvalTask,
+        resolved_config: ResolvedConfig,
+        options: Mapping[str, Any],
+        policy: EffortPolicy,
+        execution_budget: ExecutionBudget,
+        trace: TraceCollector,
+        tongagent_directory: Path,
+        checkpointer: Any,
+    ) -> tuple[PreparedRuntime, Any]:
+        """Build the exact production runtime and graph shared by run/preflight."""
+
+        runtime = prepare_runtime(
+            task,
+            resolved_config,
+            system_id=self.system_id,
+            execution_budget=execution_budget,
+            trace=trace,
+            injected_backend=self._fixture_backend,
+            injected_model=self._model,
+            semantic_policy=policy,
+            semantic_strategy=_STRATEGY,
+            enable_tongagent_evidence_state=True,
+            enable_tongagent_token_control=True,
+            enable_tongagent_context_compaction=True,
+            search_query_normalizer=normalize_atomic_search_query,
+        )
+        planner = _build_accounted_planner(
+            task=task,
+            runtime=runtime,
+            fixture=resolved_config.backend_kind == "fixture",
+        )
+        summarization = build_evaluation_summarization_middleware(
+            runtime.model,
+            FilesystemBackend(
+                root_dir=tongagent_directory,
+                virtual_mode=True,
+            ),
+            runtime.middleware,
+        )
+        dependencies = AgentRuntimeDependencies(
+            model=runtime.model,
+            reviewer_model=runtime.model,
+            network_tools=runtime.tools,
+            budget=runtime.research_budget,
+            planner=planner,
+            middleware=(runtime.middleware, summarization),
+            token_budget_configure=runtime.middleware.configure_token_partitions,
+            token_budget_activate=runtime.middleware.activate_token_subquestion,
+            token_budget_snapshot=runtime.middleware.token_partition_snapshot,
+            token_budget_can_start=runtime.middleware.can_start_token_subquestion,
+            model_budget_snapshot=lambda: execution_budget.snapshot().model_dump(
+                mode="json"
+            ),
+            phase_decider=(
+                _build_accounted_phase_decider(runtime=runtime)
+                if resolved_config.backend_kind == "live"
+                else None
+            ),
+            phase_fixture_compatibility=(resolved_config.backend_kind == "fixture"),
+        )
+        bundle = build_agent(
+            output_dir=tongagent_directory,
+            model_name=resolved_config.model.name,
+            worker_model_name=resolved_config.model.name,
+            effort=cast("EffortName", options["effort"]),
+            mode=_MODE,
+            strategy=_STRATEGY,
+            max_escalations=_MAX_ESCALATIONS,
+            topic=task.question,
+            checkpointer=checkpointer,
+            runtime_dependencies=dependencies,
+        )
+        return runtime, bundle
 
 
 def _resolve_options(
