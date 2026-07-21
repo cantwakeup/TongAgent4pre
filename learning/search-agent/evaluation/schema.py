@@ -285,7 +285,7 @@ class RunResult(StrictModel):
     run_id: NonEmptyString
     task_id: NonEmptyString
     system_id: NonEmptyString
-    runtime_mode: Literal["strict", "permissive"] = "strict"
+    runtime_mode: Literal["strict", "permissive", "answer_revise"] = "strict"
     git_sha: NonEmptyString
     resolved_config: ResolvedConfig
     config_fingerprint: NonEmptyString

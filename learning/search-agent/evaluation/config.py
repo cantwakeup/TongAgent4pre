@@ -148,6 +148,18 @@ class PermissiveWorkflowConfig(FrozenStrictModel):
     repair_max_queries_per_slot: Annotated[int, Field(ge=1, le=2)] = 2
 
 
+class AnswerReviseWorkflowConfig(FrozenStrictModel):
+    """Fixed post-hoc selective-answer controls for the experimental runtime.
+
+    This deliberately contains no Fact Slot / Fact Gap controls.  The workflow
+    reuses the shared retrieval budget and validates an answer after research.
+    """
+
+    enable_posthoc_verifier: bool = True
+    require_exact_quote_for_core_claims: bool = False
+    allow_low_confidence_answer: bool = True
+
+
 class ResolvedConfig(FrozenStrictModel):
     """Complete non-secret configuration for one evaluation attempt.
 
@@ -170,9 +182,12 @@ class ResolvedConfig(FrozenStrictModel):
     model: EvaluationModelConfig
     tools: SharedToolConfig
     budget: BudgetLimits
-    runtime_mode: Literal["strict", "permissive"] = "strict"
+    runtime_mode: Literal["strict", "permissive", "answer_revise"] = "strict"
     permissive_workflow: PermissiveWorkflowConfig = Field(
         default_factory=PermissiveWorkflowConfig
+    )
+    answer_revise_workflow: AnswerReviseWorkflowConfig = Field(
+        default_factory=AnswerReviseWorkflowConfig
     )
     judge: EvaluationJudgeConfig | None = None
     seed: int
@@ -232,10 +247,20 @@ class ResolvedConfig(FrozenStrictModel):
         # Old frozen artifacts omit them, so accept their exact prior identity
         # only when the newly added controls retain the disabled defaults.
         legacy_fact_gap_complete = _fingerprint(
-            self._fingerprint_payload(fairness=False, include_fact_gap=False)
+            self._fingerprint_payload(
+                fairness=False, include_fact_gap=False, include_answer_revise=False
+            )
         )
         legacy_fact_gap_fairness = _fingerprint(
-            self._fingerprint_payload(fairness=True, include_fact_gap=False)
+            self._fingerprint_payload(
+                fairness=True, include_fact_gap=False, include_answer_revise=False
+            )
+        )
+        legacy_answer_revise_complete = _fingerprint(
+            self._fingerprint_payload(fairness=False, include_answer_revise=False)
+        )
+        legacy_answer_revise_fairness = _fingerprint(
+            self._fingerprint_payload(fairness=True, include_answer_revise=False)
         )
         legacy_match = (
             self._is_legacy_strict_default()
@@ -247,16 +272,41 @@ class ResolvedConfig(FrozenStrictModel):
             and self.config_fingerprint == legacy_fact_gap_complete
             and self.fairness_fingerprint == legacy_fact_gap_fairness
         )
+        legacy_answer_revise_match = (
+            self._is_answer_revise_default()
+            and self.config_fingerprint == legacy_answer_revise_complete
+            and self.fairness_fingerprint == legacy_answer_revise_fairness
+        )
         if self.config_fingerprint and self.config_fingerprint != complete:
-            if not legacy_match and not legacy_fact_gap_match:
+            if (
+                not legacy_match
+                and not legacy_fact_gap_match
+                and not legacy_answer_revise_match
+            ):
                 msg = "persisted config_fingerprint does not match resolved config"
                 raise ValueError(msg)
-            complete = legacy_complete if legacy_match else legacy_fact_gap_complete
+            complete = (
+                legacy_complete
+                if legacy_match
+                else legacy_fact_gap_complete
+                if legacy_fact_gap_match
+                else legacy_answer_revise_complete
+            )
         if self.fairness_fingerprint and self.fairness_fingerprint != fairness:
-            if not legacy_match and not legacy_fact_gap_match:
+            if (
+                not legacy_match
+                and not legacy_fact_gap_match
+                and not legacy_answer_revise_match
+            ):
                 msg = "persisted fairness_fingerprint does not match resolved config"
                 raise ValueError(msg)
-            fairness = legacy_fairness if legacy_match else legacy_fact_gap_fairness
+            fairness = (
+                legacy_fairness
+                if legacy_match
+                else legacy_fact_gap_fairness
+                if legacy_fact_gap_match
+                else legacy_answer_revise_fairness
+            )
         object.__setattr__(self, "config_fingerprint", complete)
         object.__setattr__(self, "fairness_fingerprint", fairness)
         return self
@@ -267,6 +317,7 @@ class ResolvedConfig(FrozenStrictModel):
         fairness: bool,
         include_runtime_mode: bool = True,
         include_fact_gap: bool = True,
+        include_answer_revise: bool = True,
     ) -> dict[str, JsonValue]:
         """Return the canonical payload for one fingerprint scope."""
         excluded = {
@@ -277,7 +328,11 @@ class ResolvedConfig(FrozenStrictModel):
         if fairness:
             excluded.update({"system_id", "system_options"})
         if not include_runtime_mode:
-            excluded.update({"runtime_mode", "permissive_workflow"})
+            excluded.update(
+                {"runtime_mode", "permissive_workflow", "answer_revise_workflow"}
+            )
+        elif not include_answer_revise:
+            excluded.add("answer_revise_workflow")
         payload = self.model_dump(mode="json", exclude=excluded)
         if include_runtime_mode and not include_fact_gap:
             permissive = dict(payload.get("permissive_workflow", {}))
@@ -306,6 +361,9 @@ class ResolvedConfig(FrozenStrictModel):
             and self.permissive_workflow.repair_max_fetch_calls == 6
             and self.permissive_workflow.repair_max_queries_per_slot == 2
         )
+
+    def _is_answer_revise_default(self) -> bool:
+        return self.answer_revise_workflow == AnswerReviseWorkflowConfig()
 
     def fairness_payload(self) -> dict[str, JsonValue]:
         """Expose the exact shared configuration covered by fairness checks."""

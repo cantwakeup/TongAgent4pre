@@ -112,11 +112,20 @@ class TongAgentRunner:
         before a controlled live experiment can spend a model or web budget.
         """
 
-        if resolved_config.runtime_mode == "permissive":
+        if resolved_config.runtime_mode in {"permissive", "answer_revise"}:
             # The permissive implementation is intentionally a code-owned
             # workflow rather than a LangGraph/FSM.  Keep the strict builder
             # entirely untouched and preflight the exact permissive runtime
             # path instead.
+            if resolved_config.runtime_mode == "answer_revise":
+                from .answer_revise import preflight_answer_revise_workflow
+
+                return preflight_answer_revise_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
             from .permissive import preflight_permissive_workflow
 
             return preflight_permissive_workflow(
@@ -169,10 +178,19 @@ class TongAgentRunner:
     def run(self, task: EvalTask, resolved_config: ResolvedConfig) -> RunResult:
         """Execute one isolated, checkpointed B3 attempt."""
 
-        if resolved_config.runtime_mode == "permissive":
+        if resolved_config.runtime_mode in {"permissive", "answer_revise"}:
             # Do not route permissive research through the strict FSM.  Both
             # modes still receive the same shared runtime, retrieval wrappers,
             # security checks, and hard execution budget.
+            if resolved_config.runtime_mode == "answer_revise":
+                from .answer_revise import run_answer_revise_workflow
+
+                return run_answer_revise_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
             from .permissive import run_permissive_workflow
 
             return run_permissive_workflow(
