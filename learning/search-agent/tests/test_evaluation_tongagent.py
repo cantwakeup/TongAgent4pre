@@ -434,3 +434,8 @@ def test_preparation_failure_keeps_native_metrics_unavailable_not_zero(
     assert result.relevant_searches == 0
     assert backend.calls == []
     assert model.call_history == []
+    snapshot = json.loads(
+        (tmp_path / "native" / "tongagent" / "phase_runtime_snapshot.json").read_text()
+    )
+    assert snapshot["current_phase"] == "unknown"
+    assert snapshot["budget_snapshot"] == {}

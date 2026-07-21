@@ -61,6 +61,7 @@ TokenBudgetSnapshot = Callable[[], dict[str, Any]]
 TokenBudgetCanStart = Callable[[str], bool]
 ModelBudgetSnapshot = Callable[[], dict[str, Any]]
 EvidenceRecord = Callable[..., dict[str, Any]]
+PhaseActionDrain = Callable[[TongAgentState], dict[str, Any] | None]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
 ControlRoute = Literal["select", "report"]
@@ -164,6 +165,64 @@ def _compact_quote_candidates(content: str, *, limit: int = 3) -> list[str]:
     return candidates or [normalized[: min(800, len(normalized))]]
 
 
+class _PhaseActionStore:
+    """In-process handoff from one phase-decision tool to the FSM controller."""
+
+    def __init__(self) -> None:
+        from threading import RLock
+
+        self._lock = RLock()
+        self._actions: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._ignored: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+
+    @staticmethod
+    def _key(runtime: ToolRuntime) -> tuple[str, str, int]:
+        plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+        return (
+            str(plan.get("plan_id", "")),
+            str(runtime.state.get("active_subquestion_id") or ""),
+            int(runtime.state.get("active_phase_turn_index", 0)),
+        )
+
+    def claim(self, runtime: ToolRuntime, *, tool_name: str, expected: str) -> bool:
+        key = self._key(runtime)
+        actual = str(runtime.state.get("active_research_phase") or "NEED_QUERY")
+        with self._lock:
+            if actual != expected or key in self._actions:
+                self._ignored.setdefault(key, []).append(
+                    {
+                        "tool": tool_name,
+                        "expected_phase": expected,
+                        "actual_phase": actual,
+                        "reason": "phase_mismatch"
+                        if actual != expected
+                        else "already_claimed",
+                    }
+                )
+                return False
+            self._actions[key] = {"tool": tool_name, "expected_phase": expected}
+            return True
+
+    def complete(self, runtime: ToolRuntime, payload: dict[str, Any]) -> None:
+        key = self._key(runtime)
+        with self._lock:
+            self._actions[key] = {**self._actions[key], **payload}
+
+    def drain(self, state: TongAgentState) -> dict[str, Any] | None:
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        key = (
+            str(plan.get("plan_id", "")),
+            str(state.get("active_subquestion_id") or ""),
+            int(state.get("active_phase_turn_index", 0)),
+        )
+        with self._lock:
+            action = self._actions.pop(key, None)
+            ignored = self._ignored.pop(key, [])
+        if action is None and not ignored:
+            return None
+        return {"action": action, "ignored": ignored}
+
+
 def build_phase_research_tools(
     *,
     search_tool: BaseTool,
@@ -172,68 +231,22 @@ def build_phase_research_tools(
     budget_snapshot: BudgetSnapshot,
     legacy_fixture_aliases: bool = False,
 ) -> list[BaseTool]:
-    """Expose a guarded query -> selection -> evidence FSM to a research model.
+    """Build phase decisions; only the outer FSM controller mutates state."""
 
-    The three public tools are intentionally *decisions*, rather than raw
-    retrieval primitives.  A LangGraph tool batch observes the same immutable
-    state, so only the action legal at the beginning of that batch can run;
-    dependent actions in that same model response are rejected before they can
-    reserve a network budget.
-    """
+    del legacy_fixture_aliases
+    store = _PhaseActionStore()
 
-    def transition(
-        runtime: ToolRuntime,
-        *,
-        previous: str,
-        current: str,
-        action: str,
-        elapsed_seconds: float = 0.0,
-        details: dict[str, Any] | None = None,
-        **updates: Any,
-    ) -> Command:
-        plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
-        active_id = str(runtime.state.get("active_subquestion_id") or "")
-        prior_events = list(
-            updates.pop("research_events", runtime.state.get("research_events", []))
-        )
-        events = _phase_event(
-            prior_events,
-            plan_id=str(plan.get("plan_id", "")),
-            subquestion_id=active_id,
-            previous=previous,
-            current=current,
-            action=action,
-            elapsed_seconds=elapsed_seconds,
-            details=details,
-        )
-        timings = list(runtime.state.get("phase_timings", []))
-        timings.append(
+    def ignored(tool_name: str) -> str:
+        return json.dumps(
             {
-                "phase": action,
-                "subquestion_id": active_id,
-                "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
-            }
-        )
-        transition_log = list(runtime.state.get("phase_transition_log", []))
-        transition_log.append(
-            {
-                "subquestion_id": active_id,
-                "from": previous,
-                "to": current,
-                "action": action,
-            }
-        )
-        return Command(
-            update={
-                "active_research_phase": current,
-                "research_events": events,
-                "phase_timings": timings,
-                "phase_transition_log": transition_log,
-                **updates,
-            }
+                "status": "ignored",
+                "failure_type": "invalid_phase_action",
+                "tool": tool_name,
+            },
+            ensure_ascii=False,
         )
 
-    @tool("choose_search_query")
+    @tool("choose_search_query", return_direct=True)
     def choose_search_query(
         query: str,
         task_type: Literal[
@@ -243,97 +256,81 @@ def build_phase_research_tools(
             "date_or_numeric_lookup",
         ],
         runtime: ToolRuntime,
-    ) -> str | Command:
-        """Choose one atomic query. Code executes the only allowed search."""
-        expected = "NEED_QUERY"
-        if str(runtime.state.get("active_research_phase") or expected) != expected:
-            return _phase_rejection(
-                runtime, tool_name="choose_search_query", expected=expected
-            )
+    ) -> str:
+        """Choose one atomic query; the controller owns the transition."""
+        if not store.claim(
+            runtime, tool_name="choose_search_query", expected="NEED_QUERY"
+        ):
+            return ignored("choose_search_query")
         normalized = " ".join(query.split())
         if not normalized or len(normalized.split()) > 14:
-            return _phase_rejection(
-                runtime, tool_name="choose_search_query", expected=expected
-            )
+            store.complete(runtime, {"status": "invalid_query", "elapsed_seconds": 0.0})
+            return json.dumps({"status": "invalid_query"})
         started = time.perf_counter()
         try:
             payload = json.loads(
                 search_tool.invoke({"query": normalized, "max_results": 5})
             )
-        except (
-            Exception
-        ) as exc:  # provider wrappers should be total, but preserve auditability.
+        except Exception as exc:
             payload = {"status": "error", "error": type(exc).__name__, "results": []}
-        raw_results = payload.get("results", []) if isinstance(payload, dict) else []
         candidates = []
-        for index, result in enumerate(raw_results, start=1):
+        for index, result in enumerate(
+            payload.get("results", []) if isinstance(payload, dict) else [], start=1
+        ):
             if not isinstance(result, dict) or not str(result.get("url", "")):
                 continue
             tier = str(result.get("relevance_tier", "uncertain"))
-            if tier == "irrelevant":
-                continue
-            candidates.append(
-                {
-                    "result_id": f"R{index}",
-                    "title": str(result.get("title", "")),
-                    "url": str(result["url"]),
-                    "snippet": str(result.get("snippet", ""))[:500],
-                    "provider": str(result.get("provider", "")),
-                    "rank": int(result.get("final_rank", index) or index),
-                    "relevance": tier,
-                }
-            )
-        search_id = f"{runtime.state.get('active_subquestion_id')}-search-{len(runtime.state.get('phase_transition_log', [])) + 1}"
-        next_phase = "NEED_RESULT_SELECTION" if candidates else "SQ_BLOCKED"
-        visible = [
-            {key: item[key] for key in item if key != "url"} for item in candidates
-        ]
-        content = {
-            "status": "success" if candidates else "no_candidates",
+            if tier != "irrelevant":
+                candidates.append(
+                    {
+                        "result_id": f"R{index}",
+                        "title": str(result.get("title", "")),
+                        "url": str(result["url"]),
+                        "snippet": str(result.get("snippet", ""))[:500],
+                        "provider": str(result.get("provider", "")),
+                        "rank": int(result.get("final_rank", index) or index),
+                        "relevance": tier,
+                    }
+                )
+        search_id = f"{runtime.state.get('active_subquestion_id')}-search-{runtime.state.get('active_phase_turn_index', 0)}"
+        scope = {
             "search_id": search_id,
-            "candidates": visible,
-            "search_quality": payload.get("search_quality")
-            if isinstance(payload, dict)
-            else None,
+            "subquestion_id": runtime.state.get("active_subquestion_id"),
+            "candidates": candidates,
         }
-        command = transition(
+        store.complete(
             runtime,
-            previous=expected,
-            current=next_phase,
-            action="search",
-            elapsed_seconds=time.perf_counter() - started,
-            details={
-                "search_id": search_id,
-                "candidate_count": len(candidates),
+            {
+                "status": "success" if candidates else "no_candidates",
+                "action": "search",
+                "scope": scope,
                 "task_type": task_type,
-            },
-            active_search_scope={
-                "search_id": search_id,
-                "subquestion_id": runtime.state.get("active_subquestion_id"),
-                "candidates": candidates,
+                "elapsed_seconds": time.perf_counter() - started,
+                "search_quality": payload.get("search_quality")
+                if isinstance(payload, dict)
+                else None,
             },
         )
-        command.update["messages"] = [
-            ToolMessage(
-                content=json.dumps(content, ensure_ascii=False),
-                tool_call_id=runtime.tool_call_id,
-                name="choose_search_query",
-                status="success" if candidates else "error",
-            )
-        ]
-        return command
+        return json.dumps(
+            {
+                "status": "success" if candidates else "no_candidates",
+                "search_id": search_id,
+                "candidates": [
+                    {key: item[key] for key in item if key != "url"}
+                    for item in candidates
+                ],
+            },
+            ensure_ascii=False,
+        )
 
-    @tool("select_search_result")
-    def select_search_result(
-        result_id: str, reason: str, runtime: ToolRuntime
-    ) -> str | Command:
-        """Select an R# from the active search scope; code fetches it safely."""
+    @tool("select_search_result", return_direct=True)
+    def select_search_result(result_id: str, reason: str, runtime: ToolRuntime) -> str:
+        """Select one scoped R#; the controller owns the transition."""
         del reason
-        expected = "NEED_RESULT_SELECTION"
-        if str(runtime.state.get("active_research_phase") or "") != expected:
-            return _phase_rejection(
-                runtime, tool_name="select_search_result", expected=expected
-            )
+        if not store.claim(
+            runtime, tool_name="select_search_result", expected="NEED_RESULT_SELECTION"
+        ):
+            return ignored("select_search_result")
         scope = runtime.state.get("active_search_scope", {})
         active_id = str(runtime.state.get("active_subquestion_id") or "")
         candidates = (
@@ -345,15 +342,23 @@ def build_phase_research_tools(
             (item for item in candidates if item.get("result_id") == result_id), None
         )
         if selected is None:
-            return _phase_rejection(
-                runtime, tool_name="select_search_result", expected=expected
+            store.complete(
+                runtime,
+                {
+                    "status": "invalid_result_id",
+                    "action": "fetch",
+                    "elapsed_seconds": 0.0,
+                },
             )
+            return json.dumps({"status": "invalid_result_id"})
         started = time.perf_counter()
         attempts: list[dict[str, Any]] = []
         tried_hosts: set[str] = set()
-        ordered = [selected, *[item for item in candidates if item is not selected]][:2]
         successful: dict[str, Any] | None = None
-        for candidate in ordered:
+        for candidate in [
+            selected,
+            *[item for item in candidates if item is not selected],
+        ][:2]:
             url = str(candidate["url"])
             host = re.sub(r"^https?://([^/]+).*$", r"\1", url).casefold()
             if host in tried_hosts:
@@ -379,31 +384,20 @@ def build_phase_research_tools(
             ):
                 successful = {**payload, "result_id": candidate["result_id"]}
                 break
+        elapsed = time.perf_counter() - started
         if successful is None:
-            command = transition(
+            store.complete(
                 runtime,
-                previous=expected,
-                current="SQ_BLOCKED",
-                action="fetch",
-                elapsed_seconds=time.perf_counter() - started,
-                details={
-                    "search_id": scope.get("search_id"),
+                {
+                    "status": "fetch_failed",
+                    "action": "fetch",
                     "attempts": attempts,
-                    "fallback_count": max(0, len(attempts) - 1),
+                    "elapsed_seconds": elapsed,
                 },
             )
-            command.update["messages"] = [
-                ToolMessage(
-                    content=json.dumps(
-                        {"status": "fetch_failed", "attempts": attempts},
-                        ensure_ascii=False,
-                    ),
-                    tool_call_id=runtime.tool_call_id,
-                    name="select_search_result",
-                    status="error",
-                )
-            ]
-            return command
+            return json.dumps(
+                {"status": "fetch_failed", "attempts": attempts}, ensure_ascii=False
+            )
         quotes = _compact_quote_candidates(str(successful.get("content", "")))
         fetch_scope = {
             "search_id": scope.get("search_id"),
@@ -413,67 +407,57 @@ def build_phase_research_tools(
                 f"Q{index}": quote for index, quote in enumerate(quotes, start=1)
             },
         }
-        command = transition(
+        store.complete(
             runtime,
-            previous=expected,
-            current="NEED_EVIDENCE",
-            action="fetch",
-            elapsed_seconds=time.perf_counter() - started,
-            details={
-                "search_id": scope.get("search_id"),
-                "source_id": successful["source_id"],
+            {
+                "status": "success",
+                "action": "fetch",
+                "scope": fetch_scope,
                 "attempts": attempts,
-                "fallback_count": max(0, len(attempts) - 1),
+                "elapsed_seconds": elapsed,
+                "acquisition_method": successful.get("acquisition_method"),
             },
-            active_fetch_scope=fetch_scope,
         )
-        command.update["messages"] = [
-            ToolMessage(
-                content=json.dumps(
-                    {
-                        "status": "success",
-                        "source_id": successful["source_id"],
-                        "quote_candidates": list(fetch_scope["quote_candidates"]),
-                        "acquisition_method": successful.get("acquisition_method"),
-                    },
-                    ensure_ascii=False,
-                ),
-                tool_call_id=runtime.tool_call_id,
-                name="select_search_result",
-            )
-        ]
-        return command
+        return json.dumps(
+            {
+                "status": "success",
+                "source_id": successful["source_id"],
+                "quote_candidates": list(fetch_scope["quote_candidates"]),
+            },
+            ensure_ascii=False,
+        )
 
-    @tool("propose_evidence")
+    @tool("propose_evidence", return_direct=True)
     def propose_evidence(
         claim: str,
         quote_id: str,
         runtime: ToolRuntime,
         stance: Literal["support", "contradict"] = "support",
-    ) -> str | Command:
-        """Propose one claim and Q#; code records the canonical literal quote."""
-        expected = "NEED_EVIDENCE"
-        if str(runtime.state.get("active_research_phase") or "") != expected:
-            return _phase_rejection(
-                runtime, tool_name="propose_evidence", expected=expected
-            )
+    ) -> str:
+        """Propose one claim and real Q#; the controller owns the transition."""
+        if not store.claim(
+            runtime, tool_name="propose_evidence", expected="NEED_EVIDENCE"
+        ):
+            return ignored("propose_evidence")
         scope = runtime.state.get("active_fetch_scope", {})
         quotes = scope.get("quote_candidates", {}) if isinstance(scope, dict) else {}
         source_id = str(scope.get("source_id", "")) if isinstance(scope, dict) else ""
         quote = quotes.get(quote_id) if isinstance(quotes, dict) else None
-        if not source_id or not isinstance(quote, str):
-            return _phase_rejection(
-                runtime, tool_name="propose_evidence", expected=expected
-            )
         active_id = str(runtime.state.get("active_subquestion_id") or "")
         requirement_id = f"{active_id}:{source_id}:primary"
         attempts = dict(runtime.state.get("active_evidence_attempts", {}))
         count = int(attempts.get(requirement_id, 0))
-        if count >= 2:
-            return _phase_rejection(
-                runtime, tool_name="propose_evidence", expected=expected
+        if not source_id or not isinstance(quote, str) or count >= 2:
+            store.complete(
+                runtime,
+                {
+                    "status": "invalid_evidence",
+                    "action": "record_evidence",
+                    "requirement_id": requirement_id,
+                    "elapsed_seconds": 0.0,
+                },
             )
-        attempts[requirement_id] = count + 1
+            return json.dumps({"status": "invalid_evidence"})
         started = time.perf_counter()
         try:
             result = evidence_record(
@@ -483,172 +467,52 @@ def build_phase_research_tools(
                 stance="supports" if stance == "support" else "contradicts",
             )
         except (EvidenceQuoteMismatch, ValueError) as exc:
-            next_phase = "NEED_EVIDENCE" if count == 0 else "SQ_BLOCKED"
-            command = transition(
+            store.complete(
                 runtime,
-                previous=expected,
-                current=next_phase,
-                action="record_evidence",
-                elapsed_seconds=time.perf_counter() - started,
-                details={
+                {
+                    "status": "evidence_rejected",
+                    "action": "record_evidence",
                     "source_id": source_id,
                     "requirement_id": requirement_id,
                     "attempt": count + 1,
+                    "retryable": count == 0,
+                    "elapsed_seconds": time.perf_counter() - started,
                     "failure_type": type(exc).__name__,
                 },
-                active_evidence_attempts=attempts,
             )
-            command.update["messages"] = [
-                ToolMessage(
-                    content=json.dumps(
-                        {
-                            "status": "evidence_rejected",
-                            "retryable": count == 0,
-                            "quote_candidates": list(quotes),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    tool_call_id=runtime.tool_call_id,
-                    name="propose_evidence",
-                    status="error",
-                )
-            ]
-            return command
-        snapshot = budget_snapshot()
-        events = list(runtime.state.get("research_events", []))
-        closed, events, unresolved = _auto_close_after_evidence(
-            runtime=runtime, snapshot=snapshot, events=events
-        )
-        # Use the normal transition path but retain the auto-closure event.
-        command = transition(
+            return json.dumps(
+                {
+                    "status": "evidence_rejected",
+                    "retryable": count == 0,
+                    "quote_candidates": list(quotes),
+                },
+                ensure_ascii=False,
+            )
+        store.complete(
             runtime,
-            previous=expected,
-            # A valid claim may still need corroboration.  Return to a fresh
-            # query phase instead of treating a single-source SQ as blocked.
-            current="SQ_DONE" if closed is not None else "NEED_QUERY",
-            action="record_evidence",
-            elapsed_seconds=time.perf_counter() - started,
-            details={
+            {
+                "status": "success",
+                "action": "record_evidence",
                 "source_id": source_id,
                 "requirement_id": requirement_id,
                 "attempt": count + 1,
                 "claim_id": result.get("claim", {}).get("claim_id"),
-                "unresolved": unresolved,
+                "elapsed_seconds": time.perf_counter() - started,
             },
-            active_evidence_attempts=attempts,
-            research_events=events,
         )
-        if closed is not None:
-            command.update["research_plan"] = closed
-        command.update["messages"] = [
-            ToolMessage(
-                content=json.dumps(
-                    {
-                        "status": "success",
-                        "claim_id": result.get("claim", {}).get("claim_id"),
-                        "source_id": source_id,
-                        "subquestion_auto_updated": closed is not None,
-                        "unresolved_requirements": unresolved,
-                    },
-                    ensure_ascii=False,
-                ),
-                tool_call_id=runtime.tool_call_id,
-                name="propose_evidence",
-            )
-        ]
-        return command
+        return json.dumps(
+            {
+                "status": "success",
+                "claim_id": result.get("claim", {}).get("claim_id"),
+                "source_id": source_id,
+            },
+            ensure_ascii=False,
+        )
 
     phase_tools = [choose_search_query, select_search_result, propose_evidence]
-    if not legacy_fixture_aliases:
-        return phase_tools
-
-    # Old deterministic fixture scripts name raw tools.  These aliases exist
-    # only in the offline fixture adapter; they delegate to the same guarded
-    # phase actions and never expose a raw retrieval primitive to live models.
-    @tool("web_search")
-    def legacy_web_search(query: str, runtime: ToolRuntime) -> str | Command:
-        """Fixture compatibility alias for the guarded query decision."""
-        return choose_search_query.func(
-            query=query,
-            task_type="single_fact_lookup",
-            runtime=runtime,
-        )
-
-    @tool("fetch_url")
-    def legacy_fetch_url(url: str, runtime: ToolRuntime) -> str | Command:
-        """Fixture compatibility alias selecting only a scoped candidate URL."""
-        scope = runtime.state.get("active_search_scope", {})
-        candidates = scope.get("candidates", []) if isinstance(scope, dict) else []
-        match = next(
-            (
-                item
-                for item in candidates
-                if isinstance(item, dict) and str(item.get("url")) == url
-            ),
-            None,
-        )
-        if match is None:
-            return _phase_rejection(
-                runtime, tool_name="fetch_url", expected="NEED_RESULT_SELECTION"
-            )
-        return select_search_result.func(
-            result_id=str(match["result_id"]),
-            reason="fixture scoped selection",
-            runtime=runtime,
-        )
-
-    @tool("record_evidence")
-    def legacy_record_evidence(
-        source_id: str,
-        claim: str,
-        quote: str,
-        runtime: ToolRuntime,
-        stance: Literal["supports", "contradicts"] = "supports",
-        claim_id: str = "",
-    ) -> str | Command:
-        """Fixture compatibility alias mapping an exact quote to its Q#."""
-        del claim_id
-        scope = runtime.state.get("active_fetch_scope", {})
-        candidates = (
-            scope.get("quote_candidates", {}) if isinstance(scope, dict) else {}
-        )
-        if not isinstance(scope, dict) or source_id != scope.get("source_id"):
-            return _phase_rejection(
-                runtime, tool_name="record_evidence", expected="NEED_EVIDENCE"
-            )
-        quote_id = next(
-            (key for key, value in candidates.items() if value == quote), None
-        )
-        if quote_id is None:
-            return _phase_rejection(
-                runtime, tool_name="record_evidence", expected="NEED_EVIDENCE"
-            )
-        return propose_evidence.func(
-            claim=claim,
-            quote_id=str(quote_id),
-            stance="support" if stance == "supports" else "contradict",
-            runtime=runtime,
-        )
-
-    @tool("update_subquestion")
-    def legacy_update_subquestion(
-        subquestion_id: str,
-        status: str,
-        evidence_source_ids: list[str],
-        note: str,
-        runtime: ToolRuntime,
-    ) -> str:
-        """Accept an obsolete fixture no-op after code has closed an SQ."""
-        del subquestion_id, status, evidence_source_ids, note, runtime
-        return json.dumps({"status": "ignored", "reason": "phase_fsm_auto_updates"})
-
-    return [
-        *phase_tools,
-        legacy_web_search,
-        legacy_fetch_url,
-        legacy_record_evidence,
-        legacy_update_subquestion,
-    ]
+    for item in phase_tools:
+        item.metadata = {**(item.metadata or {}), "phase_action_drain": store.drain}
+    return phase_tools
 
 
 class DraftSubquestion(BaseModel):
@@ -2148,6 +2012,7 @@ def build_research_graph(
     token_budget_snapshot: TokenBudgetSnapshot | None = None,
     token_budget_can_start: TokenBudgetCanStart | None = None,
     model_budget_snapshot: ModelBudgetSnapshot | None = None,
+    phase_action_drain: PhaseActionDrain | None = None,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
@@ -2266,7 +2131,6 @@ def build_research_graph(
                 list(state.get("compact_checkpoints", [])) if resuming_plan else []
             ),
             "active_token_slice_exhausted": None,
-            "active_research_phase": "NEED_QUERY",
             "active_search_scope": {},
             "active_fetch_scope": {},
             "active_evidence_attempts": {},
@@ -2276,6 +2140,8 @@ def build_research_graph(
             "phase_timings": list(state.get("phase_timings", []))
             if resuming_plan
             else [],
+            "active_phase_turn_index": int(state.get("active_phase_turn_index", 0)),
+            "last_phase_action": {},
         }
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
@@ -2390,10 +2256,11 @@ def build_research_graph(
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
             "active_token_slice_exhausted": None,
-            "active_research_phase": "NEED_QUERY" if active else "SQ_DONE",
             "active_search_scope": {},
             "active_fetch_scope": {},
             "active_evidence_attempts": {},
+            "active_phase_turn_index": 0,
+            "last_phase_action": {},
         }
 
     def route_after_select(state: TongAgentState) -> Route:
@@ -2453,6 +2320,122 @@ CURRENT CODE-OWNED PHASE: {phase}
             ],
             "workflow_phase": "researching",
         }
+
+    def fsm_controller_node(state: TongAgentState) -> dict[str, Any]:
+        """The sole writer of `active_research_phase` and scoped FSM state."""
+
+        active_id = str(state.get("active_subquestion_id") or "")
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        previous = str(state.get("active_research_phase") or "")
+        action_bundle = phase_action_drain(state) if phase_action_drain else None
+        if not active_id:
+            return {"active_research_phase": "SQ_DONE", "last_phase_action": {}}
+        if not previous:
+            next_phase = "NEED_QUERY"
+            action: dict[str, Any] = {"action": "initialize", "status": "ready"}
+            ignored: list[dict[str, Any]] = []
+        elif action_bundle is None:
+            if phase_action_drain is None:
+                return {}
+            next_phase = "SQ_BLOCKED"
+            action = {"action": "none", "status": "no_model_action"}
+            ignored = []
+        else:
+            action = dict(action_bundle.get("action") or {})
+            ignored = [dict(item) for item in action_bundle.get("ignored", [])]
+            status = str(action.get("status", "missing"))
+            name = str(action.get("action", ""))
+            if name == "search":
+                next_phase = (
+                    "NEED_RESULT_SELECTION" if status == "success" else "SQ_BLOCKED"
+                )
+            elif name == "fetch":
+                next_phase = "NEED_EVIDENCE" if status == "success" else "SQ_BLOCKED"
+            elif name == "record_evidence":
+                requirement = str(action.get("requirement_id", ""))
+                attempts = dict(state.get("active_evidence_attempts", {}))
+                attempts[requirement] = max(
+                    int(attempts.get(requirement, 0)), int(action.get("attempt", 0))
+                )
+                action["evidence_attempts"] = attempts
+                if status == "success":
+                    unresolved = _unresolved_active_requirements(
+                        budget_snapshot(), active_id
+                    )
+                    next_phase = "SQ_DONE" if not unresolved else "NEED_QUERY"
+                    action["unresolved_requirements"] = unresolved
+                else:
+                    next_phase = (
+                        "NEED_EVIDENCE" if action.get("retryable") else "SQ_BLOCKED"
+                    )
+            else:
+                next_phase = "SQ_BLOCKED"
+        events = list(state.get("research_events", []))
+        for item in ignored:
+            events = append_research_event(
+                events,
+                "phase_action_ignored",
+                plan_id=str(plan.get("plan_id", "")),
+                subquestion_id=active_id,
+                details=item,
+            )
+        elapsed = float(action.get("elapsed_seconds", 0.0) or 0.0)
+        events = _phase_event(
+            events,
+            plan_id=str(plan.get("plan_id", "")),
+            subquestion_id=active_id,
+            previous=previous or "UNINITIALIZED",
+            current=next_phase,
+            action=str(action.get("action", "controller")),
+            elapsed_seconds=elapsed,
+            details={
+                "status": action.get("status"),
+                "ignored_action_count": len(ignored),
+                "source_id": action.get("source_id"),
+                "requirement_id": action.get("requirement_id"),
+            },
+        )
+        timings = list(state.get("phase_timings", []))
+        timings.append(
+            {
+                "phase": str(action.get("action", "controller")),
+                "subquestion_id": active_id,
+                "elapsed_seconds": round(max(0.0, elapsed), 6),
+            }
+        )
+        updates: dict[str, Any] = {
+            "active_research_phase": next_phase,
+            "research_events": events,
+            "phase_timings": timings,
+            "phase_transition_log": [
+                *list(state.get("phase_transition_log", [])),
+                {
+                    "subquestion_id": active_id,
+                    "from": previous or "UNINITIALIZED",
+                    "to": next_phase,
+                    "action": action.get("action", "controller"),
+                },
+            ],
+            "active_phase_turn_index": int(state.get("active_phase_turn_index", 0)) + 1,
+            "last_phase_action": action,
+        }
+        if str(action.get("action")) == "search" and action.get("scope"):
+            updates["active_search_scope"] = action["scope"]
+        if str(action.get("action")) == "fetch" and action.get("scope"):
+            updates["active_fetch_scope"] = action["scope"]
+        if action.get("evidence_attempts"):
+            updates["active_evidence_attempts"] = action["evidence_attempts"]
+        return updates
+
+    def route_after_fsm_controller(
+        state: TongAgentState,
+    ) -> Literal["research", "evaluate", "report"]:
+        if not state.get("active_subquestion_id"):
+            return "report"
+        phase = str(state.get("active_research_phase") or "")
+        if phase in {"SQ_DONE", "SQ_BLOCKED"}:
+            return "evaluate"
+        return "research"
 
     def evaluate_node(state: TongAgentState) -> dict[str, Any]:
         plan = deepcopy(state["research_plan"])
@@ -3197,13 +3180,28 @@ ALLOWED CAVEAT LINES:
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "select")
-    builder.add_conditional_edges(
-        "select",
-        route_after_select,
-        {"research": "prepare_research", "report": "prepare_report"},
-    )
-    builder.add_edge("prepare_research", "research_agent")
-    builder.add_edge("research_agent", "evaluate")
+    if phase_action_drain is None:
+        builder.add_conditional_edges(
+            "select",
+            route_after_select,
+            {"research": "prepare_research", "report": "prepare_report"},
+        )
+        builder.add_edge("prepare_research", "research_agent")
+        builder.add_edge("research_agent", "evaluate")
+    else:
+        builder.add_node("fsm_controller", fsm_controller_node)
+        builder.add_edge("select", "fsm_controller")
+        builder.add_conditional_edges(
+            "fsm_controller",
+            route_after_fsm_controller,
+            {
+                "research": "prepare_research",
+                "evaluate": "evaluate",
+                "report": "prepare_report",
+            },
+        )
+        builder.add_edge("prepare_research", "research_agent")
+        builder.add_edge("research_agent", "fsm_controller")
     builder.add_conditional_edges(
         "evaluate",
         route_after_evaluate,

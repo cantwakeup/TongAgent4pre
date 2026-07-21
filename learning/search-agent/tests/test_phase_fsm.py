@@ -43,14 +43,8 @@ def _state() -> dict[str, Any]:
         "active_fetch_scope": {},
         "active_evidence_attempts": {},
         "phase_timings": [],
+        "active_phase_turn_index": 0,
     }
-
-
-def _apply(state: dict[str, Any], command: Any) -> dict[str, Any]:
-    state.update(
-        {key: value for key, value in command.update.items() if key != "messages"}
-    )
-    return state
 
 
 def _tools(*, fail_first_fetch: bool = False) -> tuple[list[Any], list[str]]:
@@ -177,6 +171,13 @@ def _tools(*, fail_first_fetch: bool = False) -> tuple[list[Any], list[str]]:
     ), fetched
 
 
+def _drain(tools: list[Any], state: dict[str, Any]) -> dict[str, Any]:
+    drain = tools[0].metadata["phase_action_drain"]
+    result = drain(state)
+    assert result is not None
+    return result
+
+
 def test_parallel_dependent_actions_are_rejected_without_fetch_budget() -> None:
     tools, fetched = _tools()
     choose, select, _ = tools
@@ -190,15 +191,25 @@ def test_parallel_dependent_actions_are_rejected_without_fetch_budget() -> None:
     # This mirrors the old one-message search -> fetch request.  The fetch
     # sees the immutable pre-search NEED_QUERY state and cannot run.
     rejected = select.func(
-        result_id="R1", reason="guess", runtime=_runtime(_state(), "parallel-fetch")
+        result_id="R1", reason="guess", runtime=_runtime(state, "parallel-fetch")
+    )
+    repeated = choose.func(
+        query="A second parallel query",
+        task_type="single_fact_lookup",
+        runtime=_runtime(state, "parallel-search"),
     )
 
     assert state["active_research_phase"] == "NEED_QUERY"
-    _apply(state, search)
-    assert state["active_research_phase"] == "NEED_RESULT_SELECTION"
+    assert json.loads(search)["status"] == "success"
     assert fetched == []
-    payload = json.loads(rejected.update["messages"][0].content)
-    assert payload["failure_type"] == "invalid_phase_action"
+    assert json.loads(rejected)["status"] == "ignored"
+    assert json.loads(repeated)["status"] == "ignored"
+    action = _drain(tools, state)
+    assert action["action"]["action"] == "search"
+    assert [item["tool"] for item in action["ignored"]] == [
+        "select_search_result",
+        "choose_search_query",
+    ]
     assert fetched == []
 
 
@@ -206,72 +217,64 @@ def test_scoped_result_id_and_real_quote_complete_the_only_legal_path() -> None:
     tools, fetched = _tools()
     choose, select, evidence = tools
     state = _state()
-    _apply(
-        state,
-        choose.func(
-            query="Primary fact attribute",
-            task_type="single_fact_lookup",
-            runtime=_runtime(state, "search"),
-        ),
+    choose.func(
+        query="Primary fact attribute",
+        task_type="single_fact_lookup",
+        runtime=_runtime(state, "search"),
     )
+    search_action = _drain(tools, state)["action"]
+    state["active_research_phase"] = "NEED_RESULT_SELECTION"
+    state["active_search_scope"] = search_action["scope"]
+    state["active_phase_turn_index"] = 1
     guessed = select.func(
         result_id="R999", reason="not in scope", runtime=_runtime(state, "guessed")
     )
-    assert (
-        json.loads(guessed.update["messages"][0].content)["failure_type"]
-        == "invalid_phase_action"
-    )
+    assert json.loads(guessed)["status"] == "invalid_result_id"
+    _drain(tools, state)
     assert fetched == []
-    _apply(
-        state,
-        select.func(
-            result_id="R1", reason="top candidate", runtime=_runtime(state, "fetch")
-        ),
+    state["active_phase_turn_index"] = 2
+    select.func(
+        result_id="R1", reason="top candidate", runtime=_runtime(state, "fetch")
     )
+    fetch_action = _drain(tools, state)["action"]
     assert fetched == ["https://public.example/primary"]
-    assert state["active_research_phase"] == "NEED_EVIDENCE"
-    _apply(
-        state,
-        evidence.func(
-            claim="The primary fact is exactly forty two.",
-            quote_id="Q1",
-            stance="support",
-            runtime=_runtime(state, "evidence"),
-        ),
+    state["active_research_phase"] = "NEED_EVIDENCE"
+    state["active_fetch_scope"] = fetch_action["scope"]
+    state["active_phase_turn_index"] = 3
+    result = evidence.func(
+        claim="The primary fact is exactly forty two.",
+        quote_id="Q1",
+        stance="support",
+        runtime=_runtime(state, "evidence"),
     )
-    assert state["active_research_phase"] == "SQ_DONE"
-    transitions = [
-        item
-        for item in state["research_events"]
-        if item["event"] == "research_phase_transition"
-    ]
-    assert [item["details"]["to"] for item in transitions] == [
-        "NEED_RESULT_SELECTION",
-        "NEED_EVIDENCE",
-        "SQ_DONE",
-    ]
+    assert json.loads(result)["status"] == "success"
+    assert _drain(tools, state)["action"]["action"] == "record_evidence"
 
 
 def test_selected_access_blocked_candidate_uses_one_scoped_fallback() -> None:
     tools, fetched = _tools(fail_first_fetch=True)
     choose, select, _ = tools
     state = _state()
-    _apply(
-        state,
-        choose.func(
-            query="Primary fact attribute",
-            task_type="single_fact_lookup",
-            runtime=_runtime(state, "search"),
-        ),
+    choose.func(
+        query="Primary fact attribute",
+        task_type="single_fact_lookup",
+        runtime=_runtime(state, "search"),
     )
-    fetch = select.func(
+    search_action = _drain(tools, state)["action"]
+    state.update(
+        {
+            "active_research_phase": "NEED_RESULT_SELECTION",
+            "active_search_scope": search_action["scope"],
+            "active_phase_turn_index": 1,
+        }
+    )
+    select.func(
         result_id="R1", reason="top candidate", runtime=_runtime(state, "fetch")
     )
-    _apply(state, fetch)
+    fetch_action = _drain(tools, state)["action"]
     assert fetched == [
         "https://public.example/primary",
         "https://fallback.example/primary",
     ]
-    assert state["active_research_phase"] == "NEED_EVIDENCE"
-    transition = state["research_events"][-1]["details"]
-    assert transition["fallback_count"] == 1
+    assert fetch_action["scope"]["source_id"] == "S1"
+    assert len(fetch_action["attempts"]) == 2

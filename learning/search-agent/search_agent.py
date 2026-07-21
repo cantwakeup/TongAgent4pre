@@ -3360,8 +3360,20 @@ def build_agent(
                 else False
             ),
         )
-        if {"web_search", "fetch_url"}.issubset(by_network_name)
+        if {
+            "web_search",
+            "fetch_url",
+        }.issubset(by_network_name)
+        and not (
+            runtime_dependencies is not None
+            and runtime_dependencies.phase_fixture_compatibility
+        )
         else []
+    )
+    phase_action_drain = (
+        (phase_research_tools[0].metadata or {}).get("phase_action_drain")
+        if phase_research_tools
+        else None
     )
     _disable_general_purpose_subagent(model)
     subagents = _build_subagents(
@@ -3408,7 +3420,12 @@ def build_agent(
     main_tools = (
         [source_ledger_tool, evidence_tools[1], *phase_research_tools]
         if topology == "single" and phase_research_tools
-        else [*state_tools, source_ledger_tool, *parent_evidence_tools]
+        else [
+            *state_tools,
+            source_ledger_tool,
+            *parent_evidence_tools,
+            *(network_tools if topology == "single" else []),
+        ]
     )
     research_inner_agent = create_deep_agent(
         model=model,
@@ -3467,6 +3484,7 @@ def build_agent(
         token_budget_snapshot=token_budget_snapshot,
         token_budget_can_start=token_budget_can_start,
         model_budget_snapshot=model_budget_snapshot,
+        phase_action_drain=phase_action_drain,
         report_read=lambda: report_path.read_text() if report_path.is_file() else "",
         report_clear=lambda: report_path.unlink(missing_ok=True),
         checkpointer=checkpointer,

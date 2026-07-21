@@ -225,6 +225,40 @@ class TongAgentRunner:
                 exception_type=type(exc).__name__,
                 message=_safe_exception_message(exc),
             )
+        finally:
+            # Publish a minimal diagnostic atomically even when graph/model/tool
+            # execution failed before a normal native artifact could be built.
+            _atomic_json(
+                tongagent_directory / "phase_runtime_snapshot.json",
+                {
+                    "current_phase": (
+                        native_state.get("active_research_phase")
+                        if native_state is not None
+                        else "unknown"
+                    ),
+                    "active_subquestion_id": (
+                        native_state.get("active_subquestion_id")
+                        if native_state is not None
+                        else None
+                    ),
+                    "last_legal_action": (
+                        native_state.get("last_phase_action", {})
+                        if native_state is not None
+                        else {}
+                    ),
+                    "current_tool": (
+                        native_state.get("last_phase_action", {}).get("action")
+                        if native_state is not None
+                        else None
+                    ),
+                    "budget_snapshot": (
+                        runtime.research_budget.snapshot()
+                        if runtime is not None
+                        else {}
+                    ),
+                    "caught_exception": type(caught).__name__ if caught else None,
+                },
+            )
 
         ledger = runtime.research_budget.snapshot() if runtime is not None else {}
         plan = _native_plan(native_state)
@@ -775,11 +809,20 @@ def _write_tongagent_artifacts(
             {
                 "current_phase": native_state.get("active_research_phase"),
                 "active_subquestion_id": native_state.get("active_subquestion_id"),
+                "last_legal_action": native_state.get("last_phase_action", {}),
+                "current_tool": native_state.get("last_phase_action", {}).get("action"),
+                "budget_snapshot": ledger,
                 "transitions": list(native_state.get("phase_transition_log", [])),
                 "timings": list(native_state.get("phase_timings", [])),
             }
             if native_state is not None
-            else {}
+            else {
+                "current_phase": "unknown",
+                "active_subquestion_id": None,
+                "last_legal_action": {},
+                "current_tool": None,
+                "budget_snapshot": ledger,
+            }
         ),
     )
     _atomic_json(

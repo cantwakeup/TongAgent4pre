@@ -18,6 +18,7 @@ from evaluation.execution import (
     EvaluationStateError,
     FairnessMismatchError,
     WorkerJob,
+    _experiment_lock,
     atomic_write_json,
     load_jsonl_dataset,
     persist_terminal_result,
@@ -941,3 +942,16 @@ def test_dry_run_has_no_side_effect_and_env_is_sanitized(tmp_path: Path) -> None
     assert "TAVILY_API_KEY" not in env
     assert "LANGSMITH_TRACING" not in env
     assert "MODEL_NAME" not in env
+
+
+def test_active_experiment_lock_rejects_second_launcher_without_attempts(
+    tmp_path: Path,
+) -> None:
+    experiment = tmp_path / "evaluations" / "locked"
+    manifest = {"experiment_id": "locked", "dataset_digest": "sha256:test"}
+    with _experiment_lock(experiment, manifest=manifest):
+        with pytest.raises(EvaluationStateError, match="active primary launcher"):
+            with _experiment_lock(experiment, manifest=manifest):
+                pass
+        assert not list(experiment.rglob("attempt-0002"))
+    assert not (experiment / ".experiment.lock").exists()

@@ -265,3 +265,5 @@ class TongAgentState(DeepAgentState, total=False):
     active_evidence_attempts: dict[str, int]
     phase_transition_log: list[dict[str, Any]]
     phase_timings: list[dict[str, Any]]
+    active_phase_turn_index: int
+    last_phase_action: dict[str, Any]

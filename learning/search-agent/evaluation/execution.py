@@ -18,6 +18,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -405,81 +406,97 @@ def run_evaluation(
         )
 
     outcomes: list[JobOutcome] = []
-    for system_id in normalized_systems:
-        for task in tasks:
-            task_root = experiment_directory / system_id / task.id
-            prospective_attempt, prospective_config = prospective[(system_id, task.id)]
-            terminal = _inspect_existing_attempts(
-                task_root,
-                task=task,
-                expected_config=prospective_config,
-                expected_git_sha=current_git_sha,
-            )
-            if resume and not rerun and terminal is not None:
-                outcomes.append(
-                    JobOutcome(
-                        system_id=system_id,
-                        task_id=task.id,
-                        action="skipped",
-                        attempt_directory=Path(terminal.artifact_directory),
-                        result=terminal,
+    lock = (
+        nullcontext()
+        if dry_run
+        else _experiment_lock(
+            experiment_directory,
+            manifest={
+                "experiment_id": experiment_id,
+                "dataset_digest": dataset_digest,
+                "systems": list(normalized_systems),
+                "seed": seed,
+            },
+        )
+    )
+    with lock:
+        for system_id in normalized_systems:
+            for task in tasks:
+                task_root = experiment_directory / system_id / task.id
+                prospective_attempt, prospective_config = prospective[
+                    (system_id, task.id)
+                ]
+                terminal = _inspect_existing_attempts(
+                    task_root,
+                    task=task,
+                    expected_config=prospective_config,
+                    expected_git_sha=current_git_sha,
+                )
+                if resume and not rerun and terminal is not None:
+                    outcomes.append(
+                        JobOutcome(
+                            system_id=system_id,
+                            task_id=task.id,
+                            action="skipped",
+                            attempt_directory=Path(terminal.artifact_directory),
+                            result=terminal,
+                        )
                     )
-                )
-                continue
+                    continue
 
-            if dry_run:
-                outcomes.append(
-                    JobOutcome(
-                        system_id=system_id,
-                        task_id=task.id,
-                        action="dry_run",
-                        attempt_directory=prospective_attempt,
-                        result=None,
+                if dry_run:
+                    outcomes.append(
+                        JobOutcome(
+                            system_id=system_id,
+                            task_id=task.id,
+                            action="dry_run",
+                            attempt_directory=prospective_attempt,
+                            result=None,
+                        )
                     )
-                )
-                continue
+                    continue
 
-            attempt_directory = _create_next_attempt(task_root)
-            config = config_factory(
-                system_id,
-                dataset_digest,
-                seed,
-                attempt_directory,
-            )
-            _validate_config_identity(
-                config,
-                system_id=system_id,
-                dataset_digest=dataset_digest,
-                seed=seed,
-                attempt_directory=attempt_directory,
-            )
-            if fairness and config.fairness_fingerprint not in fairness:
-                raise FairnessMismatchError(
-                    "config changed after fairness preflight; refusing execution"
+                attempt_directory = _create_next_attempt(task_root)
+                config = config_factory(
+                    system_id,
+                    dataset_digest,
+                    seed,
+                    attempt_directory,
                 )
-            job = WorkerJob(
-                run_id=f"run-{uuid.uuid4().hex}",
-                git_sha=current_git_sha,
-            )
-            _write_attempt_inputs(attempt_directory, task, config, job)
-            result = _run_worker_subprocess(
-                attempt_directory,
-                task=task,
-                config=config,
-                job=job,
-                worker_module=worker_module,
-                worker_cwd=worker_directory,
-                timeout_seconds=subprocess_timeout_seconds,
-            )
-            outcomes.append(
-                JobOutcome(
+                _validate_config_identity(
+                    config,
                     system_id=system_id,
-                    task_id=task.id,
-                    action="executed",
+                    dataset_digest=dataset_digest,
+                    seed=seed,
                     attempt_directory=attempt_directory,
-                    result=result,
                 )
-            )
+                if fairness and config.fairness_fingerprint not in fairness:
+                    raise FairnessMismatchError(
+                        "config changed after fairness preflight; refusing execution"
+                    )
+                job = WorkerJob(
+                    run_id=f"run-{uuid.uuid4().hex}",
+                    git_sha=current_git_sha,
+                )
+                _write_attempt_inputs(attempt_directory, task, config, job)
+                result = _run_worker_subprocess(
+                    attempt_directory,
+                    task=task,
+                    config=config,
+                    job=job,
+                    worker_module=worker_module,
+                    worker_cwd=worker_directory,
+                    timeout_seconds=subprocess_timeout_seconds,
+                )
+                outcomes.append(
+                    JobOutcome(
+                        system_id=system_id,
+                        task_id=task.id,
+                        action="executed",
+                        attempt_directory=attempt_directory,
+                        result=result,
+                    )
+                )
 
     return ExecutionReport(
         experiment_id=experiment_id,
@@ -883,6 +900,56 @@ def atomic_write_text(
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _experiment_lock(experiment_directory: Path, *, manifest: Mapping[str, Any]):
+    """Prevent two launchers from allocating competing attempts for one run."""
+
+    experiment_directory.mkdir(parents=True, exist_ok=True)
+    lock_path = experiment_directory / ".experiment.lock"
+    payload = {
+        "pid": os.getpid(),
+        "manifest": dict(manifest),
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        stale = False
+        try:
+            existing = json.loads(lock_path.read_text(encoding="utf-8"))
+            pid = int(existing.get("pid", -1))
+            if pid > 0:
+                os.kill(pid, 0)
+        except ProcessLookupError:
+            stale = True
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        if not stale:
+            raise EvaluationStateError(
+                f"experiment already has an active primary launcher: {lock_path}"
+            ) from exc
+        lock_path.unlink(missing_ok=True)
+        try:
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as retry_exc:
+            raise EvaluationStateError(
+                f"experiment lock raced with another launcher: {lock_path}"
+            ) from retry_exc
+    try:
+        assert descriptor is not None
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
 
 
 def resolve_git_sha(cwd: Path) -> str:
