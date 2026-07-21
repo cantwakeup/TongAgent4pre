@@ -1401,6 +1401,7 @@ def prepare_runtime(
     enable_tongagent_context_compaction: bool = False,
     search_query_normalizer: Callable[[str], str] | None = None,
     reserve_final_synthesis: bool | None = None,
+    allow_retrieval_extension: bool = False,
 ) -> PreparedRuntime:
     """Resolve model and raw providers, then install shared semantic wrappers."""
 
@@ -1457,6 +1458,7 @@ def prepare_runtime(
         policy=semantic_policy,
         strategy=semantic_strategy,
         enable_tongagent_evidence_state=enable_tongagent_evidence_state,
+        allow_retrieval_extension=allow_retrieval_extension,
         external_guard=middleware.external_tool_guard,
         search_query_normalizer=search_query_normalizer,
     )
@@ -1835,6 +1837,7 @@ def _semantic_network_tools(
     policy: EffortPolicy | None = None,
     strategy: SemanticStrategy = "fixed",
     enable_tongagent_evidence_state: bool = False,
+    allow_retrieval_extension: bool = False,
     external_guard: Callable[[str], Mapping[str, Any] | None] | None = None,
     search_query_normalizer: Callable[[str], str] | None = None,
 ) -> tuple[list[BaseTool], Any]:
@@ -1868,6 +1871,12 @@ def _semantic_network_tools(
         or policy.max_fetches != limits.max_fetch_calls
         or policy.max_results_per_search != limits.max_results_per_search
         or policy.max_chars_per_page != limits.max_page_chars
+    ) and not (
+        allow_retrieval_extension
+        and policy.max_searches >= limits.max_search_calls
+        and policy.max_fetches >= limits.max_fetch_calls
+        and policy.max_results_per_search == limits.max_results_per_search
+        and policy.max_chars_per_page == limits.max_page_chars
     ):
         msg = "semantic policy network limits must equal the shared evaluation budget"
         raise ValueError(msg)

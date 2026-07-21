@@ -142,6 +142,10 @@ class PermissiveWorkflowConfig(FrozenStrictModel):
     enable_posthoc_verifier: bool = True
     require_exact_quote_for_core_claims: bool = True
     allow_low_confidence_answer: bool = True
+    enable_fact_gap_retrieval: bool = False
+    repair_max_search_calls: NonNegativeInt = 6
+    repair_max_fetch_calls: NonNegativeInt = 6
+    repair_max_queries_per_slot: Annotated[int, Field(ge=1, le=2)] = 2
 
 
 class ResolvedConfig(FrozenStrictModel):
@@ -224,21 +228,35 @@ class ResolvedConfig(FrozenStrictModel):
         legacy_fairness = _fingerprint(
             self._fingerprint_payload(fairness=True, include_runtime_mode=False)
         )
+        # Fact-Gap controls were added after the first permissive experiments.
+        # Old frozen artifacts omit them, so accept their exact prior identity
+        # only when the newly added controls retain the disabled defaults.
+        legacy_fact_gap_complete = _fingerprint(
+            self._fingerprint_payload(fairness=False, include_fact_gap=False)
+        )
+        legacy_fact_gap_fairness = _fingerprint(
+            self._fingerprint_payload(fairness=True, include_fact_gap=False)
+        )
         legacy_match = (
             self._is_legacy_strict_default()
             and self.config_fingerprint == legacy_complete
             and self.fairness_fingerprint == legacy_fairness
         )
+        legacy_fact_gap_match = (
+            self._is_fact_gap_default()
+            and self.config_fingerprint == legacy_fact_gap_complete
+            and self.fairness_fingerprint == legacy_fact_gap_fairness
+        )
         if self.config_fingerprint and self.config_fingerprint != complete:
-            if not legacy_match:
+            if not legacy_match and not legacy_fact_gap_match:
                 msg = "persisted config_fingerprint does not match resolved config"
                 raise ValueError(msg)
-            complete = legacy_complete
+            complete = legacy_complete if legacy_match else legacy_fact_gap_complete
         if self.fairness_fingerprint and self.fairness_fingerprint != fairness:
-            if not legacy_match:
+            if not legacy_match and not legacy_fact_gap_match:
                 msg = "persisted fairness_fingerprint does not match resolved config"
                 raise ValueError(msg)
-            fairness = legacy_fairness
+            fairness = legacy_fairness if legacy_match else legacy_fact_gap_fairness
         object.__setattr__(self, "config_fingerprint", complete)
         object.__setattr__(self, "fairness_fingerprint", fairness)
         return self
@@ -248,6 +266,7 @@ class ResolvedConfig(FrozenStrictModel):
         *,
         fairness: bool,
         include_runtime_mode: bool = True,
+        include_fact_gap: bool = True,
     ) -> dict[str, JsonValue]:
         """Return the canonical payload for one fingerprint scope."""
         excluded = {
@@ -259,7 +278,18 @@ class ResolvedConfig(FrozenStrictModel):
             excluded.update({"system_id", "system_options"})
         if not include_runtime_mode:
             excluded.update({"runtime_mode", "permissive_workflow"})
-        return self.model_dump(mode="json", exclude=excluded)
+        payload = self.model_dump(mode="json", exclude=excluded)
+        if include_runtime_mode and not include_fact_gap:
+            permissive = dict(payload.get("permissive_workflow", {}))
+            for name in (
+                "enable_fact_gap_retrieval",
+                "repair_max_search_calls",
+                "repair_max_fetch_calls",
+                "repair_max_queries_per_slot",
+            ):
+                permissive.pop(name, None)
+            payload["permissive_workflow"] = permissive
+        return payload
 
     def _is_legacy_strict_default(self) -> bool:
         """Whether an old persisted fingerprint is semantically equivalent."""
@@ -267,6 +297,14 @@ class ResolvedConfig(FrozenStrictModel):
         return (
             self.runtime_mode == "strict"
             and self.permissive_workflow == PermissiveWorkflowConfig()
+        )
+
+    def _is_fact_gap_default(self) -> bool:
+        return (
+            not self.permissive_workflow.enable_fact_gap_retrieval
+            and self.permissive_workflow.repair_max_search_calls == 6
+            and self.permissive_workflow.repair_max_fetch_calls == 6
+            and self.permissive_workflow.repair_max_queries_per_slot == 2
         )
 
     def fairness_payload(self) -> dict[str, JsonValue]:

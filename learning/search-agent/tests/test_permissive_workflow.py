@@ -463,6 +463,11 @@ def test_permissive_controlled_two_hop_workflow_verifies_before_answer(
         "answer_plan",
         "calculation_trace",
         "answer_execution",
+        "required_fact_slots",
+        "fact_coverage",
+        "fact_gaps",
+        "fact_gap_repair_trace",
+        "fact_gap_final_coverage",
     }
     for filename in artifacts.values():
         payload = json.loads((tmp_path / "native" / "tongagent" / filename).read_text())

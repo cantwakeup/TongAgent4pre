@@ -25,6 +25,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
+from agent_policy import EffortPolicy
 from evidence_graph import (
     MAX_QUOTE_CHARS,
     normalize_evidence_text,
@@ -38,7 +39,17 @@ from retrieval_quality import (
 )
 
 from ..budget import BudgetExceeded, ExecutionBudget
-from ..config import ResolvedConfig
+from ..config import BudgetLimits, ResolvedConfig
+from ..fact_gap import (
+    FactGap,
+    RequiredFactSlot,
+    SlotFactCandidate,
+    SlotCoverage,
+    fallback_slots,
+    gaps_from_coverage,
+    match_slots,
+    repair_queries,
+)
 from ..offline import FixtureBackend
 from ..schema import Citation, CompletionStatus, EvalTask, RunResult
 from ..tracing import TraceCollector, sanitize_trace_value
@@ -112,6 +123,10 @@ class PermissiveSubquestion(_StrictModel):
 class PermissivePlan(_StrictModel):
     objective: str = Field(min_length=1)
     subquestions: list[PermissiveSubquestion] = Field(min_length=1, max_length=3)
+
+
+class RequiredFactSlotPlan(_StrictModel):
+    slots: list[RequiredFactSlot] = Field(min_length=1, max_length=8)
 
 
 class ResearchQueryDecision(_StrictModel):
@@ -196,6 +211,9 @@ class TypedFact(_StrictModel):
     fact_type: TypedFactType
     value: Any
     unit: str | None = None
+    entity: str | None = None
+    attribute: str = ""
+    relation: str | None = None
     qualifier: dict[str, Any] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
     claim_ids: list[str] = Field(default_factory=list)
@@ -288,6 +306,35 @@ def _status_for_fact_claims(claims: Sequence[VerifiedClaim]) -> VerifiedStatus:
     return "partially_supported"
 
 
+def _fact_semantics(text: str) -> tuple[str | None, str, str | None]:
+    """Conservative semantic labels used by deterministic slot matching."""
+
+    entity_match = re.search(
+        r"\b([A-Z][A-Za-z.'-]*(?:\s+(?:[A-Z][A-Za-z.'-]*|of|the|and))*)", text
+    )
+    entity = entity_match.group(1) if entity_match else None
+    folded = text.casefold()
+    attribute = next(
+        (
+            name
+            for needle, name in (
+                ("height", "height"),
+                ("deep", "depth"),
+                ("imprison", "imprisonment_dates"),
+                ("born", "birth_date"),
+                ("birthplace", "birthplace"),
+                ("hometown", "hometown"),
+                ("admitted", "admission_to_union"),
+                ("album", "discography"),
+            )
+            if needle in folded
+        ),
+        "fact",
+    )
+    relation = "in" if " in " in folded else None
+    return entity, attribute, relation
+
+
 def _heuristic_typed_facts(
     *,
     claim: DraftClaim,
@@ -306,6 +353,8 @@ def _heuristic_typed_facts(
         return []
     facts: list[TypedFact] = []
     raw = claim.text
+    entity, attribute, relation = _fact_semantics(raw)
+    evidence = list(verified_claim.exact_quotes)
     for match in _ISO_DATE.finditer(raw):
         facts.append(
             TypedFact(
@@ -316,6 +365,10 @@ def _heuristic_typed_facts(
                 source_ids=source_ids,
                 claim_ids=[claim.claim_id],
                 verification_status=verified_claim.status,
+                entity=entity,
+                attribute=attribute,
+                relation=relation,
+                qualifier={"exact_quotes": evidence},
                 raw_text=raw,
             )
         )
@@ -349,6 +402,10 @@ def _heuristic_typed_facts(
                 source_ids=source_ids,
                 claim_ids=[claim.claim_id],
                 verification_status=verified_claim.status,
+                entity=entity,
+                attribute=attribute,
+                relation=relation,
+                qualifier={"exact_quotes": evidence},
                 raw_text=raw,
             )
         )
@@ -1066,6 +1123,181 @@ def research_query(
     )
 
 
+def _repair_slot_facts(
+    *,
+    runtime: PreparedRuntime,
+    slots: Sequence[RequiredFactSlot],
+    gaps: Sequence[FactGap],
+    sources: dict[str, ResearchSource],
+    max_searches: int,
+    max_fetches: int,
+    max_queries_per_slot: int,
+) -> tuple[list[TypedFact], list[dict[str, Any]]]:
+    """Run bounded, slot-specific retrieval and register only canonical facts."""
+
+    by_slot = {item.slot_id: item for item in slots}
+    search_tool = next(tool for tool in runtime.tools if tool.name == "web_search")
+    fetch_tool = next(tool for tool in runtime.tools if tool.name == "fetch_url")
+    repairs: list[TypedFact] = []
+    trace: list[dict[str, Any]] = []
+    used_searches = 0
+    used_fetches = 0
+    for gap in gaps:
+        slot = by_slot.get(gap.slot_id)
+        if slot is None or not gap.repairable:
+            continue
+        for query in repair_queries(slot, gap)[:max_queries_per_slot]:
+            if used_searches >= max_searches or used_fetches >= max_fetches:
+                trace.append(
+                    {
+                        "slot_id": slot.slot_id,
+                        "status": "repair_budget_exhausted",
+                        "search_used": used_searches,
+                        "fetch_used": used_fetches,
+                    }
+                )
+                break
+            if slot.subquestion_id:
+                runtime.research_budget.activate_subquestion(slot.subquestion_id)
+                runtime.middleware.activate_token_subquestion(slot.subquestion_id)
+            bundle = research_query(
+                query=query.query,
+                task_type=(
+                    "list_or_enumeration"
+                    if slot.cardinality == "list"
+                    else "date_or_numeric_lookup"
+                    if slot.fact_type
+                    in {"integer", "float", "year", "date", "duration"}
+                    else "single_fact_lookup"
+                ),
+                subquestion=PermissiveSubquestion(
+                    id=slot.subquestion_id or "repair",
+                    question=f"{slot.entity or ''} {slot.attribute}".strip(),
+                    task_type=(
+                        "list_or_enumeration"
+                        if slot.cardinality == "list"
+                        else "date_or_numeric_lookup"
+                        if slot.fact_type
+                        in {"integer", "float", "year", "date", "duration"}
+                        else "single_fact_lookup"
+                    ),
+                ),
+                search_tool=search_tool,
+                fetch_tool=fetch_tool,
+                max_sources=2,
+            )
+            used_searches += 1
+            used_fetches += len(bundle.sources)
+            sources.update({item.source_id: item for item in bundle.sources})
+            record: dict[str, Any] = {
+                "slot_id": slot.slot_id,
+                "query": query.model_dump(mode="json"),
+                "source_ids": [item.source_id for item in bundle.sources],
+                "failures": bundle.failures,
+                "candidates": [],
+            }
+            for source in bundle.sources:
+                response = _accounted_structured(
+                    runtime=runtime,
+                    schema=_schema_variant(
+                        SlotFactCandidate, f"{slot.slot_id}_{source.source_id}"
+                    ),
+                    prompt=(
+                        "Extract at most one fact for this RequiredFactSlot from this "
+                        "canonical fetched passage. Return an empty/low-confidence value "
+                        "only when the passage does not establish the slot. The exact_quote "
+                        "must be a continuous literal substring. Never use outside knowledge.\n\n"
+                        f"Slot: {json.dumps(slot.model_dump(mode='json'), ensure_ascii=False)}\n"
+                        f"Gap: {json.dumps(gap.model_dump(mode='json'), ensure_ascii=False)}\n"
+                        f"Source: {json.dumps(source.model_dump(mode='json'), ensure_ascii=False)}"
+                    )[:11_000],
+                    label=f"tongagent.permissive.fact_gap.extract.{slot.slot_id}",
+                    stage="evidence_selection",
+                )
+                try:
+                    candidate = (
+                        SlotFactCandidate.model_validate(response) if response else None
+                    )
+                except Exception:
+                    candidate = None
+                if candidate is None or candidate.source_id != source.source_id:
+                    record["candidates"].append(
+                        {"source_id": source.source_id, "status": "no_valid_candidate"}
+                    )
+                    continue
+                quote = normalize_evidence_text(candidate.exact_quote)
+                if not quote or quote not in normalize_evidence_text(source.passage):
+                    record["candidates"].append(
+                        {"source_id": source.source_id, "status": "noncanonical_quote"}
+                    )
+                    continue
+                raw_fact = TypedFact(
+                    fact_id=f"RF{len(repairs) + 1}",
+                    subquestion_id=slot.subquestion_id or "repair",
+                    fact_type=candidate.fact_type,
+                    value=candidate.value,
+                    unit=candidate.unit,
+                    entity=candidate.entity,
+                    attribute=candidate.attribute,
+                    relation=candidate.relation,
+                    qualifier={
+                        **candidate.qualifiers,
+                        "exact_quotes": [quote],
+                        "slot_id": slot.slot_id,
+                        "complete_list": candidate.qualifiers.get(
+                            "complete_list", False
+                        ),
+                    },
+                    source_ids=[source.source_id],
+                    verification_status="verified",
+                    raw_text=quote,
+                )
+                normalized = _normalise_fact_value(raw_fact)
+                if (
+                    normalized is None
+                    or match_slots([slot], [normalized])[0].status != "satisfied"
+                ):
+                    record["candidates"].append(
+                        {"source_id": source.source_id, "status": "slot_mismatch"}
+                    )
+                    continue
+                claim_text = (
+                    f"{slot.entity or 'The source'} {slot.attribute.replace('_', ' ')} "
+                    f"is {normalized.value}."
+                )
+                try:
+                    evidence = runtime.research_budget.record_evidence(
+                        source_id=source.source_id,
+                        claim=claim_text,
+                        quote=quote,
+                        stance="supports",
+                    )
+                except Exception as exc:
+                    record["candidates"].append(
+                        {
+                            "source_id": source.source_id,
+                            "status": "registration_failed",
+                            "reason": type(exc).__name__,
+                        }
+                    )
+                    continue
+                accepted = normalized.model_copy(
+                    update={"claim_ids": [str(evidence["claim"]["claim_id"])]}
+                )
+                repairs.append(accepted)
+                record["candidates"].append(
+                    {
+                        "source_id": source.source_id,
+                        "status": "accepted",
+                        "fact_id": accepted.fact_id,
+                    }
+                )
+            trace.append(record)
+            if any(item.qualifier.get("slot_id") == slot.slot_id for item in repairs):
+                break
+    return repairs, trace
+
+
 def _schema_variant(model: type[BaseModel], suffix: str) -> type[BaseModel]:
     return create_model(f"{model.__name__}_{suffix}", __base__=model)
 
@@ -1197,6 +1429,79 @@ Question: {task.question}"""
     return (repaired or _fallback_plan(task)), True
 
 
+def _required_fact_slots(
+    *, runtime: PreparedRuntime, task: EvalTask, plan: PermissivePlan
+) -> tuple[list[RequiredFactSlot], bool]:
+    """Plan answer inputs before retrieval, with a deterministic fallback."""
+
+    plan_payload = plan.model_dump(mode="json")
+    response = _accounted_structured(
+        runtime=runtime,
+        schema=RequiredFactSlotPlan,
+        prompt=(
+            "Identify the source-grounded facts needed to answer this question. "
+            "Return RequiredFactSlot objects, never values or answers. Make date "
+            "differences two slots, and make list/count requirements explicit about "
+            "completeness, filters, time range, and de-duplication.\n\n"
+            f"Question: {task.question}\nResearch plan: "
+            + json.dumps(plan_payload, ensure_ascii=False)
+        )[:10_000],
+        label="tongagent.permissive.required_fact_slots.initial",
+        stage="planner",
+    )
+    try:
+        parsed = RequiredFactSlotPlan.model_validate(response) if response else None
+    except Exception:
+        parsed = None
+    if parsed is None:
+        repair = _accounted_structured(
+            runtime=runtime,
+            schema=_schema_variant(RequiredFactSlotPlan, "Repair"),
+            prompt=(
+                "Return only valid RequiredFactSlot objects for this question and "
+                "research plan. Do not return fact values.\n"
+                f"Question: {task.question}\nPlan: "
+                + json.dumps(plan_payload, ensure_ascii=False)
+            )[:8_000],
+            label="tongagent.permissive.required_fact_slots.repair",
+            stage="planner",
+        )
+        try:
+            parsed = RequiredFactSlotPlan.model_validate(repair) if repair else None
+        except Exception:
+            parsed = None
+    if parsed is not None:
+        unique: set[str] = set()
+        plan_ids = {item.id for item in plan.subquestions}
+        slots: list[RequiredFactSlot] = []
+        for index, slot in enumerate(parsed.slots, start=1):
+            slot_id = slot.slot_id.strip() or f"slot-{index}"
+            if slot_id in unique:
+                slot_id = f"slot-{index}"
+            unique.add(slot_id)
+            slots.append(
+                slot.model_copy(
+                    update={
+                        "slot_id": slot_id,
+                        "subquestion_id": (
+                            slot.subquestion_id
+                            if slot.subquestion_id in plan_ids
+                            else None
+                        ),
+                    }
+                )
+            )
+        if slots:
+            return slots, False
+    return (
+        fallback_slots(
+            question=task.question,
+            subquestions=[item.model_dump(mode="json") for item in plan.subquestions],
+        ),
+        True,
+    )
+
+
 def _query_decision(
     *,
     runtime: PreparedRuntime,
@@ -1272,8 +1577,9 @@ def _note(
             "claim candidate must name at least one supplied source ID. Do not invent "
             "facts or URLs. Also emit TypedFact objects only for explicit values in "
             "the supplied passages: preserve raw_text, source_ids, a precise type, "
-            "and a value; leave fact_id and claim_ids empty because code binds them "
-            "after verification. Never infer an unstated unit or list item.\n\n"
+            "and a value; include entity, attribute, relation, and qualifiers; leave "
+            "fact_id and claim_ids empty because code binds them after verification. "
+            "Never infer an unstated unit or list item.\n\n"
             f"Subquestion: {subquestion.question}\n"
             + json.dumps(
                 [source.model_dump(mode="json") for source in sources],
@@ -1913,6 +2219,41 @@ def _write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def _fact_gap_runtime_limits(
+    resolved_config: ResolvedConfig,
+) -> tuple[BudgetLimits, EffortPolicy | None]:
+    """Add only the declared repair allowance to TongAgent's retrieval budget."""
+
+    settings = resolved_config.permissive_workflow
+    if not settings.enable_fact_gap_retrieval:
+        return resolved_config.budget, None
+    base = resolved_config.budget
+    limits = base.model_copy(
+        update={
+            "max_search_calls": base.max_search_calls
+            + settings.repair_max_search_calls,
+            "max_fetch_calls": base.max_fetch_calls + settings.repair_max_fetch_calls,
+            "max_total_tool_calls": base.max_total_tool_calls
+            + settings.repair_max_search_calls
+            + settings.repair_max_fetch_calls,
+        }
+    )
+    return (
+        limits,
+        EffortPolicy(
+            name="high",
+            max_searches=limits.max_search_calls,
+            max_fetches=limits.max_fetch_calls,
+            min_successful_sources=0,
+            max_results_per_search=limits.max_results_per_search,
+            max_chars_per_page=limits.max_page_chars,
+            max_output_tokens=resolved_config.model.max_output_tokens or 1,
+            max_subquestions=3,
+            require_reviewer=False,
+        ),
+    )
+
+
 def run_permissive_workflow(
     task: EvalTask,
     resolved_config: ResolvedConfig,
@@ -1927,7 +2268,8 @@ def run_permissive_workflow(
     started_at = datetime.now(UTC)
     started = time.perf_counter()
     trace = TraceCollector()
-    execution_budget = ExecutionBudget(resolved_config.budget)
+    effective_limits, fact_gap_policy = _fact_gap_runtime_limits(resolved_config)
+    execution_budget = ExecutionBudget(effective_limits)
     run_id = f"tongagent-{task.id}-{uuid.uuid4().hex}"
     runtime: PreparedRuntime | None = None
     caught: Exception | None = None
@@ -1937,6 +2279,11 @@ def run_permissive_workflow(
     verified: list[VerifiedClaim] = []
     typed_facts: list[TypedFact] = []
     typed_fact_failures: list[dict[str, str]] = []
+    required_slots: list[RequiredFactSlot] = []
+    initial_coverage: list[SlotCoverage] = []
+    final_coverage: list[SlotCoverage] = []
+    fact_gaps: list[FactGap] = []
+    repair_trace: list[dict[str, Any]] = []
     answer_plan: AnswerPlan | None = None
     answer_execution = AnswerExecution(
         status="abstain", failure_reason="workflow did not reach answer execution"
@@ -1960,13 +2307,14 @@ def run_permissive_workflow(
             trace=trace,
             injected_backend=fixture_backend,
             injected_model=model,
-            semantic_policy=None,
+            semantic_policy=fact_gap_policy,
             semantic_strategy="fixed",
             enable_tongagent_evidence_state=True,
             enable_tongagent_token_control=True,
             enable_tongagent_context_compaction=True,
             search_query_normalizer=None,
             reserve_final_synthesis=False,
+            allow_retrieval_extension=fact_gap_policy is not None,
         )
         trace.record("permissive_phase", phase="PLAN", runtime_mode="permissive")
         plan, planner_repaired = _plan(runtime=runtime, task=task)
@@ -1976,6 +2324,15 @@ def run_permissive_workflow(
         runtime.middleware.configure_token_partitions(
             [item.id for item in plan.subquestions]
         )
+        if resolved_config.permissive_workflow.enable_fact_gap_retrieval:
+            required_slots, slots_repaired = _required_fact_slots(
+                runtime=runtime, task=task, plan=plan
+            )
+            trace.record(
+                "fact_gap_slots_planned",
+                slot_count=len(required_slots),
+                planner_repaired=slots_repaired,
+            )
         all_sources: dict[str, ResearchSource] = {}
         for subquestion in plan.subquestions:
             runtime.research_budget.activate_subquestion(subquestion.id)
@@ -2041,15 +2398,57 @@ def run_permissive_workflow(
         typed_facts, verified, typed_fact_failures = _collect_typed_facts(
             notes=notes, draft=draft, verified=verified
         )
+        if resolved_config.permissive_workflow.enable_fact_gap_retrieval:
+            initial_coverage = match_slots(required_slots, typed_facts)
+            fact_gaps = gaps_from_coverage(initial_coverage)
+            repaired_facts, repair_trace = _repair_slot_facts(
+                runtime=runtime,
+                slots=required_slots,
+                gaps=fact_gaps,
+                sources=all_sources,
+                max_searches=resolved_config.permissive_workflow.repair_max_search_calls,
+                max_fetches=resolved_config.permissive_workflow.repair_max_fetch_calls,
+                max_queries_per_slot=resolved_config.permissive_workflow.repair_max_queries_per_slot,
+            )
+            typed_facts.extend(repaired_facts)
+            final_coverage = match_slots(required_slots, typed_facts)
+            trace.record(
+                "fact_gap_repair_complete",
+                initial_gaps=len(fact_gaps),
+                repaired_facts=len(repaired_facts),
+                remaining_gaps=sum(
+                    item.status != "satisfied" for item in final_coverage
+                ),
+            )
         # Answer planning is deliberately separated from draft prose.  It is
         # the only final-stage model decision and can select only source-bound
         # Fact IDs; code performs every arithmetic/list operation afterwards.
-        answer_plan = _answer_plan(runtime=runtime, task=task, facts=typed_facts)
-        answer_execution = _execute_answer_plan(
-            plan=answer_plan,
-            facts=typed_facts,
-            allow_partial=resolved_config.permissive_workflow.allow_low_confidence_answer,
+        eligible_fact_ids = (
+            {
+                fact_id
+                for item in final_coverage
+                if item.status == "satisfied"
+                for fact_id in item.matching_fact_ids
+            }
+            if final_coverage
+            else {item.fact_id for item in typed_facts}
         )
+        eligible_facts = [
+            item for item in typed_facts if item.fact_id in eligible_fact_ids
+        ]
+        if final_coverage and any(
+            item.status != "satisfied" for item in final_coverage
+        ):
+            answer_execution = AnswerExecution(
+                status="abstain", failure_reason="required_fact_slots_unresolved"
+            )
+        else:
+            answer_plan = _answer_plan(runtime=runtime, task=task, facts=eligible_facts)
+            answer_execution = _execute_answer_plan(
+                plan=answer_plan,
+                facts=eligible_facts,
+                allow_partial=resolved_config.permissive_workflow.allow_low_confidence_answer,
+            )
         trace.record("permissive_phase", phase="FINALIZE")
         final_answer, final_status, finalization_decision = _typed_finalize(
             facts=typed_facts,
@@ -2142,6 +2541,17 @@ def run_permissive_workflow(
             else None,
             "answer_execution_status": answer_execution.status,
             "typed_calculation_success": answer_execution.status == "success",
+            "required_fact_slot_count": len(required_slots),
+            "initially_satisfied_slots": sum(
+                item.status == "satisfied" for item in initial_coverage
+            ),
+            "finally_satisfied_slots": sum(
+                item.status == "satisfied" for item in final_coverage
+            ),
+            "fact_gap_count": len(fact_gaps),
+            "fact_gap_repair_count": sum(
+                len(item.get("candidates", [])) for item in repair_trace
+            ),
             "evidence_graph_errors": graph_errors,
         }
         native_output = {"final_answer": final_answer}
@@ -2230,6 +2640,70 @@ def run_permissive_workflow(
             },
         )
         _write_json(
+            native_directory / "required_fact_slots.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "required_fact_slots": [
+                    item.model_dump(mode="json") for item in required_slots
+                ],
+            },
+        )
+        _write_json(
+            native_directory / "fact_coverage_report.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "coverage": [item.model_dump(mode="json") for item in initial_coverage],
+            },
+        )
+        _write_json(
+            native_directory / "fact_gap_report.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "gaps": [item.model_dump(mode="json") for item in fact_gaps],
+                "gap_counts": {
+                    status: sum(item.status == status for item in fact_gaps)
+                    for status in sorted({item.status for item in fact_gaps})
+                },
+            },
+        )
+        _write_json(
+            native_directory / "fact_gap_repair_trace.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "repair_budget": {
+                    "max_search_calls": resolved_config.permissive_workflow.repair_max_search_calls,
+                    "max_fetch_calls": resolved_config.permissive_workflow.repair_max_fetch_calls,
+                    "max_queries_per_slot": resolved_config.permissive_workflow.repair_max_queries_per_slot,
+                },
+                "repairs": repair_trace,
+            },
+        )
+        _write_json(
+            native_directory / "fact_conflict_resolution.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "conflicting_slots": [
+                    item.model_dump(mode="json")
+                    for item in final_coverage
+                    if item.status == "conflicting"
+                ],
+                "resolution": "no conflict promotion; unresolved conflicts remain unusable",
+            },
+        )
+        _write_json(
+            native_directory / "fact_gap_final_coverage.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "coverage": [item.model_dump(mode="json") for item in final_coverage],
+            },
+        )
+        _write_json(
             native_directory / "answer_plan.json",
             {
                 "schema_version": 1,
@@ -2296,6 +2770,11 @@ def run_permissive_workflow(
                     "answer_plan": "answer_plan.json",
                     "calculation_trace": "calculation_trace.json",
                     "answer_execution": "answer_execution.json",
+                    "required_fact_slots": "required_fact_slots.json",
+                    "fact_coverage": "fact_coverage_report.json",
+                    "fact_gaps": "fact_gap_report.json",
+                    "fact_gap_repair_trace": "fact_gap_repair_trace.json",
+                    "fact_gap_final_coverage": "fact_gap_final_coverage.json",
                 },
             },
         )
