@@ -97,6 +97,18 @@ def _river_task() -> EvalTask:
                     ],
                     "unresolved_points": [],
                     "confidence": "high",
+                    "typed_facts": [
+                        {
+                            "fact_id": "F1",
+                            "subquestion_id": "SQ1",
+                            "fact_type": "entity",
+                            "value": "Alton Valley",
+                            "source_ids": ["S1"],
+                            "claim_ids": [],
+                            "verification_status": "partially_supported",
+                            "raw_text": "Lunarite Mine is located in Alton Valley.",
+                        }
+                    ],
                 },
                 "ResearchNote_SQ2": {
                     "subquestion_id": "SQ2",
@@ -109,6 +121,18 @@ def _river_task() -> EvalTask:
                     ],
                     "unresolved_points": [],
                     "confidence": "high",
+                    "typed_facts": [
+                        {
+                            "fact_id": "F2",
+                            "subquestion_id": "SQ2",
+                            "fact_type": "entity",
+                            "value": "Arden River",
+                            "source_ids": ["S2"],
+                            "claim_ids": [],
+                            "verification_status": "partially_supported",
+                            "raw_text": "The Arden River passes through Alton Valley.",
+                        }
+                    ],
                 },
                 "DraftAnswer": {
                     "claims": [
@@ -134,6 +158,13 @@ def _river_task() -> EvalTask:
                     "proposed_answer": "The Arden River.",
                     "confidence": "high",
                     "missing_information": [],
+                },
+                "AnswerPlan": {
+                    "operation": "direct_lookup",
+                    "required_fact_ids": ["F2"],
+                    "output_type": "entity",
+                    "output_unit": None,
+                    "parameters": {},
                 },
             }
         },
@@ -185,6 +216,19 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         ],
                         "unresolved_points": [],
                         "confidence": "high",
+                        "typed_facts": [
+                            {
+                                "fact_id": "F1",
+                                "subquestion_id": "SQ1",
+                                "fact_type": "year",
+                                "value": 1974,
+                                "unit": "year",
+                                "source_ids": ["S1"],
+                                "claim_ids": [],
+                                "verification_status": "partially_supported",
+                                "raw_text": "Aurora Bridge opened in 1974.",
+                            }
+                        ],
                     },
                     "ResearchNote_SQ2": {
                         "subquestion_id": "SQ2",
@@ -197,6 +241,19 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         ],
                         "unresolved_points": [],
                         "confidence": "high",
+                        "typed_facts": [
+                            {
+                                "fact_id": "F2",
+                                "subquestion_id": "SQ2",
+                                "fact_type": "year",
+                                "value": 1974,
+                                "unit": "year",
+                                "source_ids": ["S2"],
+                                "claim_ids": [],
+                                "verification_status": "partially_supported",
+                                "raw_text": "The Meridian Monument was dedicated in 1974.",
+                            }
+                        ],
                     },
                     "DraftAnswer": {
                         "claims": [
@@ -219,6 +276,13 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         "proposed_answer": "Yes. Both events occurred in 1974.",
                         "confidence": "high",
                         "missing_information": [],
+                    },
+                    "AnswerPlan": {
+                        "operation": "compare",
+                        "required_fact_ids": ["F1", "F2"],
+                        "output_type": "boolean",
+                        "output_unit": None,
+                        "parameters": {"direction": "equals"},
                     },
                 }
             },
@@ -266,6 +330,19 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         ],
                         "unresolved_points": [],
                         "confidence": "medium",
+                        "typed_facts": [
+                            {
+                                "fact_id": "F1",
+                                "subquestion_id": "SQ1",
+                                "fact_type": "year",
+                                "value": 1950,
+                                "unit": "year",
+                                "source_ids": ["S1"],
+                                "claim_ids": [],
+                                "verification_status": "partially_supported",
+                                "raw_text": "The local history says Harbor Light Station was completed in 1950.",
+                            }
+                        ],
                     },
                     "ResearchNote_SQ2": {
                         "subquestion_id": "SQ2",
@@ -278,6 +355,19 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         ],
                         "unresolved_points": [],
                         "confidence": "medium",
+                        "typed_facts": [
+                            {
+                                "fact_id": "F2",
+                                "subquestion_id": "SQ2",
+                                "fact_type": "year",
+                                "value": 1952,
+                                "unit": "year",
+                                "source_ids": ["S2"],
+                                "claim_ids": [],
+                                "verification_status": "partially_supported",
+                                "raw_text": "The preservation file says Harbor Light Station was completed in 1952.",
+                            }
+                        ],
                     },
                     "DraftAnswer": {
                         "claims": [
@@ -300,6 +390,13 @@ def _additional_controlled_tasks() -> list[EvalTask]:
                         "proposed_answer": "No. The records conflict: 1950 versus 1952.",
                         "confidence": "medium",
                         "missing_information": [],
+                    },
+                    "AnswerPlan": {
+                        "operation": "compare",
+                        "required_fact_ids": ["F1", "F2"],
+                        "output_type": "boolean",
+                        "output_unit": None,
+                        "parameters": {"direction": "equals"},
                     },
                 }
             },
@@ -339,7 +436,7 @@ def test_permissive_controlled_two_hop_workflow_verifies_before_answer(
     assert result.runtime_mode == "permissive"
     assert result.completion_status == CompletionStatus.COMPLETED
     assert result.final_answer is not None
-    assert "FINAL_ANSWER: The Arden River." in result.final_answer
+    assert "FINAL_ANSWER: Arden River" in result.final_answer
     assert result.search_calls == 2
     # The bundled acquisition also inspects one lower-ranked same-entity page
     # in the bounded two-source window; the graph only registers claims that
@@ -362,6 +459,10 @@ def test_permissive_controlled_two_hop_workflow_verifies_before_answer(
         "verified_claims",
         "evidence_graph",
         "finalization_decision",
+        "typed_facts",
+        "answer_plan",
+        "calculation_trace",
+        "answer_execution",
     }
     for filename in artifacts.values():
         payload = json.loads((tmp_path / "native" / "tongagent" / filename).read_text())

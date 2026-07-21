@@ -15,7 +15,8 @@ import traceback
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
@@ -60,6 +61,27 @@ VerifiedStatus = Literal[
     "partially_supported",
     "unsupported",
     "contested",
+]
+TypedFactType = Literal[
+    "integer",
+    "float",
+    "date",
+    "year",
+    "duration",
+    "entity",
+    "string",
+    "list",
+    "boolean",
+]
+AnswerOperation = Literal[
+    "direct_lookup",
+    "subtract",
+    "date_difference",
+    "add",
+    "filter_and_count",
+    "compare",
+    "list_intersection",
+    "boolean",
 ]
 
 _MAX_SOURCES_PER_QUERY = 3
@@ -131,6 +153,7 @@ class ResearchNote(_StrictModel):
     supporting_passages: list[str] = Field(default_factory=list)
     unresolved_points: list[str] = Field(default_factory=list)
     confidence: Literal["high", "medium", "low"] = "low"
+    typed_facts: list[TypedFact] = Field(default_factory=list)
 
 
 class DraftClaim(_StrictModel):
@@ -157,6 +180,512 @@ class VerifiedClaim(_StrictModel):
     explanation: str
     canonical_claim_id: str | None = None
     registration_failures: list[dict[str, str]] = Field(default_factory=list)
+    typed_facts: list[TypedFact] = Field(default_factory=list)
+
+
+class TypedFact(_StrictModel):
+    """A source- and claim-bound value suitable for deterministic execution.
+
+    Facts are intentionally data, not executable expressions.  The model may
+    propose them in a research note, but code validates both their values and
+    their existing canonical Source/Claim links before they are usable.
+    """
+
+    fact_id: str = ""
+    subquestion_id: str
+    fact_type: TypedFactType
+    value: Any
+    unit: str | None = None
+    qualifier: dict[str, Any] = Field(default_factory=dict)
+    source_ids: list[str] = Field(default_factory=list)
+    claim_ids: list[str] = Field(default_factory=list)
+    verification_status: VerifiedStatus = "partially_supported"
+    raw_text: str = ""
+
+
+class AnswerPlan(_StrictModel):
+    operation: AnswerOperation
+    required_fact_ids: list[str] = Field(min_length=1, max_length=12)
+    output_type: str = Field(min_length=1, max_length=80)
+    output_unit: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class AnswerExecution(_StrictModel):
+    """Auditable outcome of the non-LLM answer executor."""
+
+    status: Literal["success", "abstain"]
+    answer_value: Any | None = None
+    answer_text: str | None = None
+    output_type: str | None = None
+    output_unit: str | None = None
+    fact_ids: list[str] = Field(default_factory=list)
+    calculation_trace: list[dict[str, Any]] = Field(default_factory=list)
+    failure_reason: str | None = None
+
+
+_NUMBER_WITH_UNIT = re.compile(
+    r"(?<![\w.])(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*"
+    r"(feet|foot|ft|met(?:er|re|ers|res)|m|years?|months?|days?|percent|%)?\b",
+    re.IGNORECASE,
+)
+_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_YEAR = re.compile(r"\b(1[0-9]{3}|20[0-9]{2})\b")
+
+
+def _normalise_fact_value(fact: TypedFact) -> TypedFact | None:
+    """Validate model-proposed values without inferring an unstated unit."""
+
+    value = fact.value
+    try:
+        if fact.fact_type == "integer":
+            if isinstance(value, bool):
+                return None
+            normalized: Any = int(str(value).replace(",", ""))
+        elif fact.fact_type == "float":
+            if isinstance(value, bool):
+                return None
+            normalized = str(Decimal(str(value).replace(",", "")).normalize())
+        elif fact.fact_type == "year":
+            normalized = int(str(value))
+            if not 1000 <= normalized <= 2999:
+                return None
+            if fact.unit not in {None, "year", "years"}:
+                return None
+        elif fact.fact_type == "date":
+            normalized = date.fromisoformat(str(value)).isoformat()
+        elif fact.fact_type == "duration":
+            if isinstance(value, bool) or not fact.unit:
+                return None
+            normalized = str(Decimal(str(value).replace(",", "")).normalize())
+        elif fact.fact_type == "list":
+            if not isinstance(value, list):
+                return None
+            normalized = value
+        elif fact.fact_type == "boolean":
+            if not isinstance(value, bool):
+                return None
+            normalized = value
+        elif fact.fact_type in {"entity", "string"}:
+            normalized = " ".join(str(value).split())
+            if not normalized:
+                return None
+        else:  # pragma: no cover - Literal is enforced by Pydantic.
+            return None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return fact.model_copy(update={"value": normalized})
+
+
+def _status_for_fact_claims(claims: Sequence[VerifiedClaim]) -> VerifiedStatus:
+    statuses = {item.status for item in claims}
+    if "contested" in statuses:
+        return "contested"
+    if "unsupported" in statuses:
+        return "unsupported"
+    if "verified" in statuses:
+        return "verified"
+    return "partially_supported"
+
+
+def _heuristic_typed_facts(
+    *,
+    claim: DraftClaim,
+    verified_claim: VerifiedClaim,
+    next_id: int,
+) -> list[TypedFact]:
+    """Conservative fallback for old notes which predate typed-fact output.
+
+    The fallback never creates a value from model memory: it reads only the
+    already source-bound draft claim and is useful for ordinary years, dates,
+    and explicit numbers.  Rich lists remain model-proposed typed facts.
+    """
+
+    source_ids = list(verified_claim.source_ids)
+    if not source_ids:
+        return []
+    facts: list[TypedFact] = []
+    raw = claim.text
+    for match in _ISO_DATE.finditer(raw):
+        facts.append(
+            TypedFact(
+                fact_id=f"F{next_id + len(facts)}",
+                subquestion_id=claim.subquestion_id,
+                fact_type="date",
+                value=match.group(1),
+                source_ids=source_ids,
+                claim_ids=[claim.claim_id],
+                verification_status=verified_claim.status,
+                raw_text=raw,
+            )
+        )
+    for match in _NUMBER_WITH_UNIT.finditer(raw):
+        number, unit = match.groups()
+        # A date has already been represented as one atomic fact; do not turn
+        # its year/month/day fragments into unrelated numeric operands.
+        if match.start() and raw[max(0, match.start() - 1) : match.start()] == "-":
+            continue
+        compact = number.replace(",", "")
+        if "." in compact:
+            fact_type: TypedFactType = "float"
+            value: Any = str(Decimal(compact).normalize())
+        else:
+            integer = int(compact)
+            fact_type = (
+                "year" if unit is None and 1000 <= integer <= 2999 else "integer"
+            )
+            value = integer
+        facts.append(
+            TypedFact(
+                fact_id=f"F{next_id + len(facts)}",
+                subquestion_id=claim.subquestion_id,
+                fact_type=fact_type,
+                value=value,
+                unit=(
+                    unit.casefold()
+                    if unit
+                    else ("year" if fact_type == "year" else None)
+                ),
+                source_ids=source_ids,
+                claim_ids=[claim.claim_id],
+                verification_status=verified_claim.status,
+                raw_text=raw,
+            )
+        )
+    return facts
+
+
+def _collect_typed_facts(
+    *,
+    notes: Sequence[ResearchNote],
+    draft: DraftAnswer,
+    verified: Sequence[VerifiedClaim],
+) -> tuple[list[TypedFact], list[VerifiedClaim], list[dict[str, str]]]:
+    """Bind note facts to existing verified claims, then normalize them.
+
+    This is the boundary which guarantees that no TypedFact becomes usable
+    merely because an LLM printed it.  Each retained fact has an actual
+    fetched source and one or more pre-existing draft/verified claims.
+    """
+
+    draft_by_sq: dict[str, list[DraftClaim]] = {}
+    for claim in draft.claims:
+        draft_by_sq.setdefault(claim.subquestion_id, []).append(claim)
+    verified_by_id = {item.claim_id: item for item in verified}
+    facts: list[TypedFact] = []
+    failures: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add(candidate: TypedFact, origin: str) -> None:
+        source_ids = list(dict.fromkeys(candidate.source_ids))
+        candidates = [
+            claim
+            for claim in draft_by_sq.get(candidate.subquestion_id, [])
+            if set(claim.source_ids).intersection(source_ids)
+            and claim.claim_id in verified_by_id
+        ]
+        if not source_ids or not candidates:
+            failures.append(
+                {
+                    "category": "unmapped_typed_fact",
+                    "origin": origin,
+                    "fact_id": candidate.fact_id or "",
+                }
+            )
+            return
+        verified_claims = [verified_by_id[item.claim_id] for item in candidates]
+        status = _status_for_fact_claims(verified_claims)
+        normalized = _normalise_fact_value(
+            candidate.model_copy(
+                update={
+                    "fact_id": candidate.fact_id or f"F{len(facts) + 1}",
+                    "source_ids": source_ids,
+                    "claim_ids": [item.claim_id for item in candidates],
+                    "verification_status": status,
+                }
+            )
+        )
+        if normalized is None:
+            failures.append(
+                {
+                    "category": "invalid_typed_fact_value",
+                    "origin": origin,
+                    "fact_id": candidate.fact_id or "",
+                }
+            )
+            return
+        key = (
+            normalized.subquestion_id,
+            normalized.fact_type,
+            json.dumps(normalized.value, sort_keys=True, default=str),
+            "|".join(sorted(normalized.source_ids)),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        facts.append(normalized)
+
+    for note in notes:
+        for candidate in note.typed_facts:
+            add(candidate, "research_note")
+    for claim in draft.claims:
+        checked = verified_by_id.get(claim.claim_id)
+        if checked is None:
+            continue
+        for candidate in _heuristic_typed_facts(
+            claim=claim, verified_claim=checked, next_id=len(facts) + 1
+        ):
+            add(candidate, "verified_claim_fallback")
+
+    facts_by_claim: dict[str, list[TypedFact]] = {}
+    for fact in facts:
+        for claim_id in fact.claim_ids:
+            facts_by_claim.setdefault(claim_id, []).append(fact)
+    updated_verified = [
+        item.model_copy(update={"typed_facts": facts_by_claim.get(item.claim_id, [])})
+        for item in verified
+    ]
+    return facts, updated_verified, failures
+
+
+def _usable_fact(
+    fact: TypedFact,
+    *,
+    allow_partial: bool,
+) -> bool:
+    return fact.verification_status == "verified" or (
+        allow_partial and fact.verification_status == "partially_supported"
+    )
+
+
+def _decimal_operand(fact: TypedFact) -> Decimal | None:
+    if fact.fact_type not in {"integer", "float", "year", "duration"}:
+        return None
+    try:
+        return Decimal(str(fact.value))
+    except InvalidOperation:
+        return None
+
+
+def _format_decimal(value: Decimal) -> str:
+    integral = value.to_integral_value()
+    return str(int(integral)) if value == integral else format(value.normalize(), "f")
+
+
+def _execute_answer_plan(
+    *,
+    plan: AnswerPlan | None,
+    facts: Sequence[TypedFact],
+    allow_partial: bool,
+) -> AnswerExecution:
+    """Execute a whitelisted calculation without evaluating model-authored code."""
+
+    if plan is None:
+        return AnswerExecution(status="abstain", failure_reason="missing_answer_plan")
+    by_id = {item.fact_id: item for item in facts}
+    required = [by_id.get(item) for item in plan.required_fact_ids]
+    if len(set(plan.required_fact_ids)) != len(plan.required_fact_ids) or any(
+        item is None for item in required
+    ):
+        return AnswerExecution(
+            status="abstain", failure_reason="missing_required_typed_fact"
+        )
+    operands = [cast(TypedFact, item) for item in required]
+    unusable = [
+        item.fact_id
+        for item in operands
+        if not _usable_fact(item, allow_partial=allow_partial)
+    ]
+    if unusable:
+        return AnswerExecution(
+            status="abstain",
+            fact_ids=[item.fact_id for item in operands],
+            failure_reason="unsupported_or_contested_typed_fact",
+            calculation_trace=[{"unusable_fact_ids": unusable}],
+        )
+    trace: list[dict[str, Any]] = []
+    try:
+        if plan.operation == "direct_lookup":
+            if len(operands) != 1:
+                raise ValueError("direct_lookup_requires_one_fact")
+            value = operands[0].value
+            trace.append(
+                {
+                    "operation": "direct_lookup",
+                    "fact_id": operands[0].fact_id,
+                    "value": value,
+                }
+            )
+        elif plan.operation in {"subtract", "add"}:
+            if len(operands) != 2:
+                raise ValueError("numeric_operation_requires_two_facts")
+            left, right = (_decimal_operand(item) for item in operands)
+            if left is None or right is None:
+                raise ValueError("numeric_operand_type_mismatch")
+            units = {item.unit for item in operands if item.unit}
+            if len(units) > 1:
+                raise ValueError("unit_conflict")
+            value = left - right if plan.operation == "subtract" else left + right
+            trace.append(
+                {
+                    "operation": plan.operation,
+                    "operand_a": {
+                        "fact_id": operands[0].fact_id,
+                        "value": str(left),
+                        "unit": operands[0].unit,
+                    },
+                    "operand_b": {
+                        "fact_id": operands[1].fact_id,
+                        "value": str(right),
+                        "unit": operands[1].unit,
+                    },
+                    "result": str(value),
+                    "unit": plan.output_unit or operands[0].unit,
+                }
+            )
+            value = _format_decimal(value)
+        elif plan.operation == "date_difference":
+            if len(operands) != 2 or any(
+                item.fact_type not in {"date", "year"} for item in operands
+            ):
+                raise ValueError("date_difference_requires_two_dates_or_years")
+            if all(item.fact_type == "year" for item in operands):
+                value = int(operands[1].value) - int(operands[0].value)
+                rule = "calendar_year_difference"
+            else:
+                start = date.fromisoformat(str(operands[0].value))
+                end = date.fromisoformat(str(operands[1].value))
+                value = (
+                    end.year
+                    - start.year
+                    - ((end.month, end.day) < (start.month, start.day))
+                )
+                rule = "completed_anniversaries"
+            trace.append(
+                {
+                    "operation": "date_difference",
+                    "start_fact": operands[0].fact_id,
+                    "end_fact": operands[1].fact_id,
+                    "rounding": rule,
+                    "result": value,
+                    "unit": "years",
+                }
+            )
+        elif plan.operation == "filter_and_count":
+            if not operands or operands[0].fact_type != "list":
+                raise ValueError("filter_and_count_requires_list_fact")
+            field = str(plan.parameters.get("field", "")).strip()
+            if not field:
+                raise ValueError("filter_and_count_requires_field")
+            lower_id = str(plan.parameters.get("gte_fact_id", "")).strip()
+            upper_id = str(plan.parameters.get("lte_fact_id", "")).strip()
+            lower = _decimal_operand(by_id[lower_id]) if lower_id in by_id else None
+            upper = _decimal_operand(by_id[upper_id]) if upper_id in by_id else None
+            if lower_id and lower is None or upper_id and upper is None:
+                raise ValueError("filter_bound_missing_or_non_numeric")
+            included: list[Any] = []
+            excluded: list[Any] = []
+            for item in cast(list[Any], operands[0].value):
+                if not isinstance(item, Mapping) or field not in item:
+                    excluded.append(item)
+                    continue
+                candidate = Decimal(str(item[field]))
+                if (lower is None or candidate >= lower) and (
+                    upper is None or candidate <= upper
+                ):
+                    included.append(item)
+                else:
+                    excluded.append(item)
+            value = len(included)
+            trace.append(
+                {
+                    "operation": "filter_and_count",
+                    "list_fact": operands[0].fact_id,
+                    "field": field,
+                    "lower": str(lower) if lower is not None else None,
+                    "upper": str(upper) if upper is not None else None,
+                    "included": included,
+                    "excluded": excluded,
+                    "result": value,
+                }
+            )
+        elif plan.operation == "compare":
+            if len(operands) != 2:
+                raise ValueError("compare_requires_two_facts")
+            direction = str(plan.parameters.get("direction", "equals"))
+            left, right = operands[0].value, operands[1].value
+            if direction == "equals":
+                value = left == right
+            elif direction == "greater_than":
+                value = Decimal(str(left)) > Decimal(str(right))
+            elif direction == "less_than":
+                value = Decimal(str(left)) < Decimal(str(right))
+            else:
+                raise ValueError("unsupported_comparison_direction")
+            trace.append(
+                {
+                    "operation": "compare",
+                    "direction": direction,
+                    "left_fact": operands[0].fact_id,
+                    "right_fact": operands[1].fact_id,
+                    "result": value,
+                }
+            )
+        elif plan.operation == "list_intersection":
+            if len(operands) != 2 or any(item.fact_type != "list" for item in operands):
+                raise ValueError("list_intersection_requires_two_list_facts")
+            right = {
+                json.dumps(item, sort_keys=True, default=str)
+                for item in operands[1].value
+            }
+            value = [
+                item
+                for item in operands[0].value
+                if json.dumps(item, sort_keys=True, default=str) in right
+            ]
+            if plan.output_type == "count":
+                value = len(value)
+            trace.append(
+                {
+                    "operation": "list_intersection",
+                    "left_fact": operands[0].fact_id,
+                    "right_fact": operands[1].fact_id,
+                    "result": value,
+                }
+            )
+        elif plan.operation == "boolean":
+            if len(operands) != 1 or operands[0].fact_type != "boolean":
+                raise ValueError("boolean_requires_one_boolean_fact")
+            value = operands[0].value
+            trace.append(
+                {
+                    "operation": "boolean",
+                    "fact_id": operands[0].fact_id,
+                    "result": value,
+                }
+            )
+        else:  # pragma: no cover - Literal is enforced by Pydantic.
+            raise ValueError("unsupported_answer_operation")
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        return AnswerExecution(
+            status="abstain",
+            fact_ids=[item.fact_id for item in operands],
+            calculation_trace=trace,
+            failure_reason=str(exc),
+        )
+    unit = plan.output_unit
+    answer_text = str(value)
+    if unit and str(unit).casefold() not in {"none", "null"}:
+        answer_text = f"{answer_text} {unit}"
+    return AnswerExecution(
+        status="success",
+        answer_value=value,
+        answer_text=answer_text,
+        output_type=plan.output_type,
+        output_unit=unit,
+        fact_ids=[item.fact_id for item in operands],
+        calculation_trace=trace,
+    )
 
 
 @dataclass(frozen=True)
@@ -741,7 +1270,10 @@ def _note(
         prompt=(
             "Create a research note from only these fetched source passages. Every "
             "claim candidate must name at least one supplied source ID. Do not invent "
-            "facts or URLs.\n\n"
+            "facts or URLs. Also emit TypedFact objects only for explicit values in "
+            "the supplied passages: preserve raw_text, source_ids, a precise type, "
+            "and a value; leave fact_id and claim_ids empty because code binds them "
+            "after verification. Never infer an unstated unit or list item.\n\n"
             f"Subquestion: {subquestion.question}\n"
             + json.dumps(
                 [source.model_dump(mode="json") for source in sources],
@@ -838,6 +1370,55 @@ def _draft(
     if not claims and any(note.source_ids for note in notes):
         return _fallback_draft(notes)
     return draft.model_copy(update={"claims": claims})
+
+
+def _answer_plan(
+    *,
+    runtime: PreparedRuntime,
+    task: EvalTask,
+    facts: Sequence[TypedFact],
+) -> AnswerPlan | None:
+    """Ask for a constrained plan, never an expression or computed answer."""
+
+    if not facts:
+        return None
+    fact_payload = [item.model_dump(mode="json") for item in facts]
+    prompt = (
+        "Create an AnswerPlan using only the supplied Typed Facts. Choose one "
+        "whitelisted operation and list only existing fact IDs. Do not calculate "
+        "the answer, write code, use a URL, or introduce a fact. For filter_and_count "
+        "use parameters.field plus optional gte_fact_id/lte_fact_id. For compare use "
+        "parameters.direction of equals, greater_than, or less_than. For date "
+        "differences list start then end fact IDs. Return the schema only.\n\n"
+        f"Question: {task.question}\nTyped Facts:\n"
+        + json.dumps(fact_payload, ensure_ascii=False)
+    )[:14_000]
+    response = _accounted_structured(
+        runtime=runtime,
+        schema=AnswerPlan,
+        prompt=prompt,
+        label="tongagent.permissive.answer_plan.initial",
+        stage="final_synthesis",
+    )
+    try:
+        return AnswerPlan.model_validate(response) if response is not None else None
+    except Exception:
+        pass
+    repair = _accounted_structured(
+        runtime=runtime,
+        schema=_schema_variant(AnswerPlan, "Repair"),
+        prompt=(
+            "Return only one valid AnswerPlan. Existing fact IDs are: "
+            f"{', '.join(item.fact_id for item in facts)}. Do not calculate or add facts. "
+            f"Question: {task.question}"
+        ),
+        label="tongagent.permissive.answer_plan.repair",
+        stage="final_synthesis",
+    )
+    try:
+        return AnswerPlan.model_validate(repair) if repair is not None else None
+    except Exception:
+        return None
 
 
 def _meaningful_tokens(value: str) -> set[str]:
@@ -1169,6 +1750,139 @@ def _finalize(
     )
 
 
+def _typed_finalization_decision(
+    *,
+    notes: Sequence[ResearchNote],
+    facts: Sequence[TypedFact],
+    plan: AnswerPlan | None,
+    execution: AnswerExecution,
+    config: ResolvedConfig,
+    required_subquestion_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Route solely from executor output and source-bound fact statuses."""
+
+    fact_by_id = {item.fact_id: item for item in facts}
+    required = (
+        [fact_by_id[item] for item in plan.required_fact_ids if item in fact_by_id]
+        if plan
+        else []
+    )
+    missing_sq = sorted(item.subquestion_id for item in notes if not item.source_ids)
+    noted_ids = {item.subquestion_id for item in notes}
+    unresearched = sorted(set(required_subquestion_ids) - noted_ids)
+    statuses = {item.verification_status for item in required}
+    all_verified = bool(required) and statuses == {"verified"}
+    low = (
+        bool(required)
+        and "verified" in statuses
+        and statuses.issubset({"verified", "partially_supported"})
+        and config.permissive_workflow.allow_low_confidence_answer
+    )
+    executable = execution.status == "success"
+    answer_status = (
+        "answered"
+        if executable and not missing_sq and not unresearched and all_verified
+        else "answered_low_confidence"
+        if executable and not missing_sq and not unresearched and low
+        else "abstain"
+    )
+    return {
+        "schema_version": 1,
+        "answer_status": answer_status,
+        "confidence": "high"
+        if answer_status == "answered"
+        else "low"
+        if answer_status == "answered_low_confidence"
+        else "none",
+        "all_required_sq_researched": not unresearched,
+        "missing_source_subquestions": missing_sq,
+        "unresearched_subquestions": unresearched,
+        "required_fact_ids": plan.required_fact_ids if plan else [],
+        "required_fact_statuses": {
+            item.fact_id: item.verification_status for item in required
+        },
+        "unsupported_or_contested_fact_ids": [
+            item.fact_id
+            for item in required
+            if item.verification_status in {"unsupported", "contested"}
+        ],
+        "missing_answer_plan": plan is None,
+        "execution_failure_reason": execution.failure_reason,
+        "calculation_executed": executable,
+        "low_confidence_reason": (
+            "One or more calculation facts are partially supported but every "
+            "required fact has a canonical source and no fact is unsupported."
+            if answer_status == "answered_low_confidence"
+            else None
+        ),
+    }
+
+
+def _typed_finalize(
+    *,
+    facts: Sequence[TypedFact],
+    plan: AnswerPlan | None,
+    execution: AnswerExecution,
+    notes: Sequence[ResearchNote],
+    config: ResolvedConfig,
+    required_subquestion_ids: Sequence[str],
+) -> tuple[str, str, dict[str, Any]]:
+    decision = _typed_finalization_decision(
+        notes=notes,
+        facts=facts,
+        plan=plan,
+        execution=execution,
+        config=config,
+        required_subquestion_ids=required_subquestion_ids,
+    )
+    if decision["answer_status"] == "abstain":
+        missing = sorted(
+            set(
+                list(decision["missing_source_subquestions"])
+                + list(decision["unresearched_subquestions"])
+                + list(decision["unsupported_or_contested_fact_ids"])
+            )
+        )
+        reason = decision["execution_failure_reason"] or (
+            "missing_required_typed_fact"
+            if decision["missing_answer_plan"]
+            else "incomplete_evidence"
+        )
+        return (
+            "## Answer\nINSUFFICIENT_EVIDENCE\nABSTAIN\n"
+            f"- Missing or unsupported: {', '.join(missing) or reason}\n"
+            f"- Executor: {reason}\nFINAL_ANSWER: ABSTAIN",
+            "abstain",
+            decision,
+        )
+    fact_by_id = {item.fact_id: item for item in facts}
+    used = [fact_by_id[item] for item in execution.fact_ids if item in fact_by_id]
+    citations = sorted({source for item in used for source in item.source_ids})
+    fact_lines = [
+        f"- {item.fact_id}: {item.value} {item.unit or ''}".rstrip()
+        + f" [sources: {', '.join(item.source_ids)}]"
+        for item in used
+    ]
+    answer = str(execution.answer_text or "").strip()
+    low = decision["answer_status"] == "answered_low_confidence"
+    return (
+        "## Answer\n"
+        f"{answer}\n\n"
+        f"Sources: {' '.join(f'[{item}]' for item in citations)}\n"
+        f"Confidence: {decision['confidence']}.\n"
+        "Calculation facts:\n"
+        + "\n".join(fact_lines)
+        + (
+            f"\n- Low confidence reason: {decision['low_confidence_reason']}"
+            if low
+            else ""
+        )
+        + f"\nFINAL_ANSWER: {answer}",
+        "answer_low_confidence" if low else "answer",
+        decision,
+    )
+
+
 def _citations(runtime: PreparedRuntime) -> list[Citation]:
     snapshot = runtime.research_budget.snapshot()
     claims = {
@@ -1221,6 +1935,12 @@ def run_permissive_workflow(
     notes: list[ResearchNote] = []
     bundles: dict[str, list[ResearchBundle]] = {}
     verified: list[VerifiedClaim] = []
+    typed_facts: list[TypedFact] = []
+    typed_fact_failures: list[dict[str, str]] = []
+    answer_plan: AnswerPlan | None = None
+    answer_execution = AnswerExecution(
+        status="abstain", failure_reason="workflow did not reach answer execution"
+    )
     draft = DraftAnswer()
     final_answer = "FINAL_ANSWER: ABSTAIN"
     final_status = "abstain"
@@ -1318,27 +2038,40 @@ def run_permissive_workflow(
         trace.record("permissive_phase", phase="VERIFY_DRAFT")
         if runtime is not None:
             verified = _verify(runtime=runtime, draft=draft, sources=all_sources)
+        typed_facts, verified, typed_fact_failures = _collect_typed_facts(
+            notes=notes, draft=draft, verified=verified
+        )
+        # Answer planning is deliberately separated from draft prose.  It is
+        # the only final-stage model decision and can select only source-bound
+        # Fact IDs; code performs every arithmetic/list operation afterwards.
+        answer_plan = _answer_plan(runtime=runtime, task=task, facts=typed_facts)
+        answer_execution = _execute_answer_plan(
+            plan=answer_plan,
+            facts=typed_facts,
+            allow_partial=resolved_config.permissive_workflow.allow_low_confidence_answer,
+        )
         trace.record("permissive_phase", phase="FINALIZE")
-        finalization_decision = _finalization_decision(
-            draft=draft,
+        final_answer, final_status, finalization_decision = _typed_finalize(
+            facts=typed_facts,
+            plan=answer_plan,
+            execution=answer_execution,
             notes=notes,
-            verified=verified,
             config=resolved_config,
             required_subquestion_ids=[item.id for item in plan.subquestions],
         )
-        final_answer, final_status, removed_claims = _finalize(
-            task=task,
-            draft=draft,
-            notes=notes,
-            verified=verified,
-            config=resolved_config,
-            required_subquestion_ids=[item.id for item in plan.subquestions],
-        )
+        removed_claims = [
+            item.claim_id
+            for item in verified
+            if item.status in {"unsupported", "contested"}
+        ]
         trace.record(
             "permissive_finalized",
             answer_status=final_status,
             planner_repaired=planner_repaired,
             verifier_removed_claims=removed_claims,
+            typed_fact_count=len(typed_facts),
+            answer_operation=answer_plan.operation if answer_plan is not None else None,
+            answer_execution_status=answer_execution.status,
         )
     except Exception as exc:
         caught = exc
@@ -1402,6 +2135,13 @@ def run_permissive_workflow(
                     "contested",
                 )
             },
+            "typed_fact_count": len(typed_facts),
+            "typed_fact_failures": typed_fact_failures,
+            "answer_operation": answer_plan.operation
+            if answer_plan is not None
+            else None,
+            "answer_execution_status": answer_execution.status,
+            "typed_calculation_success": answer_execution.status == "success",
             "evidence_graph_errors": graph_errors,
         }
         native_output = {"final_answer": final_answer}
@@ -1481,6 +2221,42 @@ def run_permissive_workflow(
             },
         )
         _write_json(
+            native_directory / "typed_facts.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "typed_facts": [item.model_dump(mode="json") for item in typed_facts],
+                "validation_failures": typed_fact_failures,
+            },
+        )
+        _write_json(
+            native_directory / "answer_plan.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "answer_plan": answer_plan.model_dump(mode="json")
+                if answer_plan
+                else None,
+            },
+        )
+        _write_json(
+            native_directory / "calculation_trace.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "calculation_trace": answer_execution.calculation_trace,
+                "fact_ids": answer_execution.fact_ids,
+            },
+        )
+        _write_json(
+            native_directory / "answer_execution.json",
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "execution": answer_execution.model_dump(mode="json"),
+            },
+        )
+        _write_json(
             native_directory / "evidence_graph.json",
             {
                 "schema_version": 1,
@@ -1516,6 +2292,10 @@ def run_permissive_workflow(
                     "verified_claims": "verified_claims.json",
                     "evidence_graph": "evidence_graph.json",
                     "finalization_decision": "finalization_decision.json",
+                    "typed_facts": "typed_facts.json",
+                    "answer_plan": "answer_plan.json",
+                    "calculation_trace": "calculation_trace.json",
+                    "answer_execution": "answer_execution.json",
                 },
             },
         )
@@ -1557,6 +2337,8 @@ def preflight_permissive_workflow(
 
 
 __all__ = [
+    "AnswerExecution",
+    "AnswerPlan",
     "DraftAnswer",
     "PermissivePlan",
     "PermissiveSubquestion",
@@ -1564,6 +2346,7 @@ __all__ = [
     "ResearchNote",
     "ResearchQueryDecision",
     "ResearchSource",
+    "TypedFact",
     "VerifiedClaim",
     "preflight_permissive_workflow",
     "research_query",
