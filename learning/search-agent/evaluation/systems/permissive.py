@@ -909,6 +909,7 @@ def research_query(
     search_tool: BaseTool,
     fetch_tool: BaseTool,
     max_sources: int = _MAX_SOURCES_PER_QUERY,
+    max_fetch_attempts: int | None = None,
 ) -> ResearchBundle:
     """Search and fetch a bounded, canonical source bundle.
 
@@ -1013,7 +1014,11 @@ def research_query(
     sources: list[ResearchSource] = []
     seen_urls: set[str] = set()
     failed_hosts: set[str] = set()
+    fetch_attempts = 0
     limit = max(1, min(int(max_sources), _MAX_SOURCES_PER_QUERY))
+    attempt_limit = (
+        None if max_fetch_attempts is None else max(1, int(max_fetch_attempts))
+    )
     # Preserve the deterministic ranking while giving a healthy second host a
     # chance before consuming the remaining quota on the first host.  This is
     # especially important after an access-blocked response; it is not a
@@ -1030,6 +1035,8 @@ def research_query(
             if host:
                 candidate_hosts.add(host)
     for candidate in [*primary, *deferred_same_host]:
+        if attempt_limit is not None and fetch_attempts >= attempt_limit:
+            break
         url = str(candidate.get("url", "")).strip()
         if not url or url in seen_urls:
             continue
@@ -1048,6 +1055,7 @@ def research_query(
             _set_candidate_fetch_status(candidate_audit, url, "skipped_failed_host")
             continue
         seen_urls.add(url)
+        fetch_attempts += 1
         payload = _json_tool_call(fetch_tool, {"url": url, "max_chars": 12_000})
         _set_candidate_fetch_status(
             candidate_audit, url, str(payload.get("status", "error"))

@@ -8,9 +8,12 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+from evaluation.budget import ExecutionBudget
 from evaluation.execution import resolve_system_config
 from evaluation.offline import FixtureBackend, FixtureChatModel
 from evaluation.schema import AnswerStatus, CompletionStatus, EvalTask
+from evaluation.systems.common import prepare_runtime
+from evaluation.systems.permissive import PermissiveSubquestion, research_query
 from evaluation.systems.score_first import (
     LightweightPlan,
     ScoreFirstNote,
@@ -19,6 +22,7 @@ from evaluation.systems.score_first import (
     deterministic_calculation,
 )
 from evaluation.systems.tongagent import TongAgentRunner
+from evaluation.tracing import TraceCollector
 
 
 pytestmark = pytest.mark.usefixtures("socket_disabled")
@@ -323,6 +327,70 @@ def test_score_first_fairness_fingerprint_matches_all_three_systems(
         )
         == 1
     )
+
+
+def test_score_first_source_selection_bounds_fetch_attempts_per_subquestion(
+    tmp_path: Path,
+) -> None:
+    urls = [f"https://source-{index}.fixture.test/page" for index in range(3)]
+    backend = FixtureBackend(
+        searches={
+            "target entity attribute": {
+                "results": [
+                    {
+                        "title": f"Target Entity source {index}",
+                        "url": url,
+                        "snippet": "Target Entity attribute value.",
+                    }
+                    for index, url in enumerate(urls, start=1)
+                ]
+            }
+        },
+        pages={
+            url: {
+                "title": f"Target Entity source {index}",
+                "content": "Target Entity attribute value is documented here. " * 20,
+            }
+            for index, url in enumerate(urls, start=1)
+        },
+    )
+    task = EvalTask(id="bounded-selection", question="Target Entity attribute")
+    config = _config(tmp_path, backend)
+    runtime = prepare_runtime(
+        task,
+        config,
+        system_id="tongagent",
+        execution_budget=ExecutionBudget(config.budget),
+        trace=TraceCollector(),
+        injected_backend=backend,
+        injected_model=FixtureChatModel.from_task(task, system_id="tongagent"),
+        semantic_strategy="fixed",
+        enable_tongagent_evidence_state=True,
+        enable_tongagent_token_control=True,
+        enable_tongagent_context_compaction=True,
+        reserve_final_synthesis=False,
+    )
+    runtime.research_budget.configure_subquestions(["SQ1"])
+    runtime.research_budget.activate_subquestion("SQ1")
+    tools = {tool.name: tool for tool in runtime.tools}
+
+    bundle = research_query(
+        query="Target Entity attribute",
+        task_type="single_fact_lookup",
+        subquestion=PermissiveSubquestion(
+            id="SQ1",
+            question=task.question,
+            task_type="single_fact_lookup",
+            required_for_final_answer=True,
+        ),
+        search_tool=tools["web_search"],
+        fetch_tool=tools["fetch_url"],
+        max_sources=2,
+        max_fetch_attempts=1,
+    )
+
+    assert len(bundle.sources) == 1
+    assert runtime.research_budget.snapshot()["fetch_calls"] == 1
 
 
 def test_score_first_posthoc_audit_never_changes_benchmark_answer(

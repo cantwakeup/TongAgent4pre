@@ -514,6 +514,7 @@ def run_score_first_workflow(
                     tool for tool in runtime.tools if tool.name == "fetch_url"
                 ),
                 max_sources=2,
+                max_fetch_attempts=2,
             )
             bundles.append(bundle)
             sources.update({item.source_id: item for item in bundle.sources})
