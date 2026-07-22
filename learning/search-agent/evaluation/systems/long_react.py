@@ -22,7 +22,7 @@ from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict
 
-from ..budget import ExecutionBudget
+from ..budget import BudgetExceeded, ExecutionBudget
 from ..config import ResolvedConfig
 from ..offline import FixtureBackend
 from ..schema import (
@@ -91,7 +91,9 @@ def build_answer_contract(question: str) -> AnswerContract:
     if re.search(r"\b(?:when|what year|which year|what date|which date)\b", lowered):
         return AnswerContract(answer_type="date")
     if re.search(
-        r"\b(?:where|which city|which country|which place|what location)\b", lowered
+        r"\b(?:where|which city|what city|which country|what country|which place|"
+        r"what location|birthplace|hometown|born)\b",
+        lowered,
     ):
         return AnswerContract(answer_type="location")
     if re.search(
@@ -486,13 +488,55 @@ def _format_short_answer(question: str, draft: str | None) -> str:
         else:
             number = _NUMBER.search(compact)
             value = number.group().replace(",", "") if number else ""
+    elif contract.answer_type == "location":
+        labelled = re.findall(
+            r"\b(?:birthplace|hometown|location)\s*:\s*([^;|]+)",
+            compact,
+            re.IGNORECASE,
+        )
+        if labelled:
+            values = list(dict.fromkeys(item.strip(" ,.;") for item in labelled))
+            value = "; ".join(values)
+        else:
+            value = re.split(
+                r",\s+(?:associated|which|who|where)\b|\s+[—–-]\s+",
+                compact,
+                maxsplit=1,
+            )[0].strip(". ")
     else:
         value = re.sub(r"\s*\([^)]*\)\s*$", "", compact).strip()
         value = re.split(
-            r"\s+(?:is|was|has|had|because|which|who|where)\b", value, maxsplit=1
+            r",\s+(?:associated|which|who|where)\b|\s+[—–-]\s+|"
+            r"\s+(?:is|was|has|had|because)\b",
+            value,
+            maxsplit=1,
         )[0].strip()
         value = value.rstrip(". ")
     return f"FINAL_ANSWER: {value}" if value else "FINAL_ANSWER: ABSTAIN"
+
+
+def _answer_from_successful_python(
+    question: str,
+    tool_calls: Sequence[Any],
+) -> str | None:
+    """Recover an already-computed answer when the next model turn is denied."""
+
+    contract = build_answer_contract(question)
+    if contract.answer_type not in {"number", "count", "duration", "date"}:
+        return None
+    for call in reversed(tool_calls):
+        if call.tool_name != "python" or call.status != ToolCallStatus.SUCCESS:
+            continue
+        payload = call.result if isinstance(call.result, Mapping) else {}
+        value = payload.get("result")
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            continue
+        if isinstance(value, int | float) and re.search(
+            r"\b(?:round|rounded|whole number|nearest)\b", question, re.I
+        ):
+            value = round(float(value))
+        return _format_short_answer(question, str(value))
+    return None
 
 
 def _posthoc_source_mapping(result: RunResult) -> list[dict[str, Any]]:
@@ -581,14 +625,30 @@ def run_long_react_workflow(
         )
         draft = extract_final_answer(native_output)
         if resolved_config.backend_kind == "live":
+            contract_hint = (
+                "Required short-answer type: "
+                f"{contract.answer_type}; unit: {contract.output_unit or 'none'}.\n"
+            )
             draft = runtime.middleware.finalize_answer(
                 runtime.model,
                 question=task.question,
-                draft=draft,
+                draft=contract_hint + (draft or ""),
             )
         final_answer = _format_short_answer(task.question, draft)
     except Exception as exc:
         caught = exc
+        if isinstance(exc, BudgetExceeded) and runtime is not None:
+            recovered = _answer_from_successful_python(
+                task.question,
+                runtime.middleware.tool_calls,
+            )
+            if recovered is not None:
+                final_answer = recovered
+                trace.record(
+                    "long_react_answer_recovered_from_python",
+                    final_answer=final_answer,
+                    termination_resource=exc.resource,
+                )
         trace.record(
             "run_exception",
             phase="long_react",

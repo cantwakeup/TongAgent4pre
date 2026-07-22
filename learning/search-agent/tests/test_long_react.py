@@ -10,8 +10,10 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from evaluation.execution import resolve_system_config
 from evaluation.offline import FixtureBackend, FixtureChatModel
-from evaluation.schema import AnswerStatus, CompletionStatus, EvalTask
+from evaluation.schema import AnswerStatus, CompletionStatus, EvalTask, ToolCallStatus
 from evaluation.systems.long_react import (
+    _answer_from_successful_python,
+    _format_short_answer,
     build_answer_contract,
     build_python_tool,
     compact_long_react_messages,
@@ -80,6 +82,7 @@ def _task() -> EvalTask:
     [
         ("Who wrote the novel?", "entity", None),
         ("Where was the author born?", "location", None),
+        ("What is the birthplace and hometown of the scorer?", "location", None),
         ("How many albums were released?", "count", None),
         ("When did the bridge open?", "date", None),
         ("How many years older was A than B?", "duration", "years"),
@@ -139,6 +142,41 @@ def test_python_tool_rejects_arbitrary_code() -> None:
 
     assert payload["status"] == "error"
     assert payload["error"] == "ValueError"
+
+
+def test_synthesis_recovers_rounded_python_result_after_budget_stop() -> None:
+    class Call:
+        tool_name = "python"
+        status = ToolCallStatus.SUCCESS
+        result = {
+            "status": "success",
+            "operation": "arithmetic",
+            "result": 28.0282,
+        }
+
+    answer = _answer_from_successful_python(
+        "How many times would it fit? Give a rounded whole number.",
+        [Call()],
+    )
+
+    assert answer == "FINAL_ANSWER: 28"
+
+
+def test_synthesis_strips_location_labels_and_entity_explanation() -> None:
+    assert (
+        _format_short_answer(
+            "What is the birthplace and hometown of the scorer?",
+            "FINAL_ANSWER: Sidney Crosby — birthplace: Halifax; hometown: Cole Harbour",
+        )
+        == "FINAL_ANSWER: Halifax; Cole Harbour"
+    )
+    assert (
+        _format_short_answer(
+            "Which famous house is described?",
+            "FINAL_ANSWER: Chatsworth House, associated with the historical clues",
+        )
+        == "FINAL_ANSWER: Chatsworth House"
+    )
 
 
 def test_context_manager_keeps_five_recent_tools_and_summarizes_older() -> None:
