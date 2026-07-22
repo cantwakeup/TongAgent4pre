@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "manifest_type": "score_first_formal_holdout",
+  "created_before_score_first_implementation": true,
+  "source_dataset": "google/frames-benchmark",
+  "source_revision": "58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef",
+  "source_sha256": "sha256:4255093c93b595b5b04c7c8dde290b48ec87d72ca0fb0b760d9dd02740d669ff",
+  "source_row_count": 824,
+  "selection_seed": 20260722,
+  "selection_algorithm": "python-random-v1-shuffle-unseen-source-indices-then-first-5",
+  "historically_seen_task_ids": [
+    "frames-test-0016",
+    "frames-test-0123",
+    "frames-test-0191",
+    "frames-test-0664",
+    "frames-test-0718"
+  ],
+  "selected_tasks": [
+    {
+      "task_id": "frames-test-0485",
+      "source_index": 485,
+      "question_sha256": "sha256:3c22f87d6bef33b1d3ccde81481255eaf918577d5302d728bb6bd941de19be63"
+    },
+    {
+      "task_id": "frames-test-0326",
+      "source_index": 326,
+      "question_sha256": "sha256:08b1a66b532123bc353502e6fe32d91edd9e803c99734cb82d085771b4dbb59e"
+    },
+    {
+      "task_id": "frames-test-0235",
+      "source_index": 235,
+      "question_sha256": "sha256:864b4a1ef0f3f417a152b1051c14f4e295c4476b1ceba8d2102cdf5d6d96655f"
+    },
+    {
+      "task_id": "frames-test-0109",
+      "source_index": 109,
+      "question_sha256": "sha256:51bad18d50782c9027284bb25b241bba5af71e864d0bc3d99f7c8b474f17ab06"
+    },
+    {
+      "task_id": "frames-test-0504",
+      "source_index": 504,
+      "question_sha256": "sha256:de083b55639503049d57cd1e83dd9f457c5ddfa0f48e0f49de322c89b4207173"
+    }
+  ],
+  "selection_inputs_accessed": ["source_index", "question_text_for_sha256_only"],
+  "selection_inputs_not_accessed": ["reference_answer", "source_urls", "reasoning_types"],
+  "immutable_after_creation": true
+}
