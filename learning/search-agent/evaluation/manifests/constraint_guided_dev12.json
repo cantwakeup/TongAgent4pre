@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "manifest_type": "constraint_guided_dev12",
+  "created_before_constraint_guided_core_changes": true,
+  "source_commit": "b4a0289c695c222128f758dd80ce4b0897df322a",
+  "source_dataset": "google/frames-benchmark",
+  "source_revision": "58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef",
+  "source_sha256": "sha256:4255093c93b595b5b04c7c8dde290b48ec87d72ca0fb0b760d9dd02740d669ff",
+  "source_row_count": 824,
+  "selection_seed": 20260725,
+  "selection_algorithm": "question-only-word-boundary-regex-category-then-sha256-sort-first-3-v1",
+  "selection_inputs_accessed": [
+    "source_index",
+    "question_text"
+  ],
+  "selection_inputs_not_accessed": [
+    "Answer",
+    "wikipedia_link_*",
+    "reasoning_types",
+    "wiki_links"
+  ],
+  "excluded_task_ids": [
+    "frames-test-0016",
+    "frames-test-0048",
+    "frames-test-0109",
+    "frames-test-0123",
+    "frames-test-0144",
+    "frames-test-0191",
+    "frames-test-0235",
+    "frames-test-0326",
+    "frames-test-0391",
+    "frames-test-0485",
+    "frames-test-0504",
+    "frames-test-0664",
+    "frames-test-0673",
+    "frames-test-0681",
+    "frames-test-0718"
+  ],
+  "category_order": [
+    "relation_chain",
+    "enumeration_count",
+    "numeric_date_ratio",
+    "obscure_source_fetch_sensitive"
+  ],
+  "selected_tasks": [
+    {
+      "task_id": "frames-test-0360",
+      "source_index": 360,
+      "category": "relation_chain",
+      "question_sha256": "sha256:e2c20373054edf650e06fd5d4b662083922ca6e0105b497c02e412c66e3d372e",
+      "selection_key_sha256": "sha256:0041a4cdea693f411a55fa4e3916d5f9bfab2e5a519af6b092a6760b5c570eb6"
+    },
+    {
+      "task_id": "frames-test-0615",
+      "source_index": 615,
+      "category": "relation_chain",
+      "question_sha256": "sha256:1a40d4eee581a5fb06eb5874a6531e4a7bc89abecee7f892e4244b36ca14a459",
+      "selection_key_sha256": "sha256:007f72080e197b1cb7541c02755509f54636f0fca3f149b77e2e1c309bd122ce"
+    },
+    {
+      "task_id": "frames-test-0299",
+      "source_index": 299,
+      "category": "relation_chain",
+      "question_sha256": "sha256:8e69f0807d0b5683d5f5bd3c6d43bb981b0bbbfe5d0dc72ebc8820a4920606e2",
+      "selection_key_sha256": "sha256:00c75cab1eadcf3a4b67548f717cabd41d8e02b59e77dec8e54346ec24e9ab7c"
+    },
+    {
+      "task_id": "frames-test-0473",
+      "source_index": 473,
+      "category": "enumeration_count",
+      "question_sha256": "sha256:8d5b36f64a193be97711fad6cc8c610a224c52929abd8ea5b099bbf83fa786f2",
+      "selection_key_sha256": "sha256:011f295daa6f3efe1574bb5f9fa7e0166ff3d25bc0b19bb52babb9821b863e53"
+    },
+    {
+      "task_id": "frames-test-0750",
+      "source_index": 750,
+      "category": "enumeration_count",
+      "question_sha256": "sha256:3da0eea036e6f14d4e76b76a8e7bca02a7cc9d98142acbf36cfb74c4eedbf4d6",
+      "selection_key_sha256": "sha256:0943b69aca3435ca62a71147bafee2ba55339e7a74701958c3339ccd19fb618b"
+    },
+    {
+      "task_id": "frames-test-0132",
+      "source_index": 132,
+      "category": "enumeration_count",
+      "question_sha256": "sha256:fc208e9d8cac96fc56b6cf8941417f9f58d2392a0794e2bd31334f49e25b9fa8",
+      "selection_key_sha256": "sha256:0ec340ac2aaceb51f355b9d892a5cbe544d1d83add1dccb907298f1fe403cbc0"
+    },
+    {
+      "task_id": "frames-test-0637",
+      "source_index": 637,
+      "category": "numeric_date_ratio",
+      "question_sha256": "sha256:4327b8e8e6521a6d3c929998bc061b4b58b6b6ceda2e6daf4546a094b0bd2883",
+      "selection_key_sha256": "sha256:018625aded3f9b1cf3cb8c44580a59b65d23102514e89243bcaffac433dbe632"
+    },
+    {
+      "task_id": "frames-test-0163",
+      "source_index": 163,
+      "category": "numeric_date_ratio",
+      "question_sha256": "sha256:3b1a14366dbb7d6fc0faa291a6171f3b9a402d6f758de1a20a44069e50fd91f2",
+      "selection_key_sha256": "sha256:03006f5d0f24e86c2adc93bc267390c6b493c2c2799c388efc109039108be019"
+    },
+    {
+      "task_id": "frames-test-0069",
+      "source_index": 69,
+      "category": "numeric_date_ratio",
+      "question_sha256": "sha256:38f07860e5da4179caaf1e7da6b209daf46efc31d18cd4d60b4e8a789ce88a37",
+      "selection_key_sha256": "sha256:06754e4128c132403233235e2fea4bf94d4795c5f46a9545c8e7a74fa31c5d94"
+    },
+    {
+      "task_id": "frames-test-0452",
+      "source_index": 452,
+      "category": "obscure_source_fetch_sensitive",
+      "question_sha256": "sha256:978e9616743ccceeeb37656c2d1c2bba4f81d1acac46e802c8c7d74e5906f72f",
+      "selection_key_sha256": "sha256:1b43d6a65fc9aab4d4d5fd5a143211320e136ad7721ec1b0a3f487a4087d3bcd"
+    },
+    {
+      "task_id": "frames-test-0087",
+      "source_index": 87,
+      "category": "obscure_source_fetch_sensitive",
+      "question_sha256": "sha256:dd649eac53c00ab2da278d4a51d85c9f1e5f55e402545ce350ec10b94f4579e2",
+      "selection_key_sha256": "sha256:1fab2d8e1c4c9c042a92bd1d5ea3b11f4d12f321de627406acf6984a5d08fc72"
+    },
+    {
+      "task_id": "frames-test-0612",
+      "source_index": 612,
+      "category": "obscure_source_fetch_sensitive",
+      "question_sha256": "sha256:fa9133159ac9d757db4d4545b749331b73fe129d0b38e420c2fd0daa9fba01cf",
+      "selection_key_sha256": "sha256:25e63d5c6b8d860d3b0974e363b1d2b777b6485fc35d9ecc7062dae4e88e57fe"
+    }
+  ],
+  "immutable_after_creation": true
+}

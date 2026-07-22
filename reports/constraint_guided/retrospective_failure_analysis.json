@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "source_commit": "b4a0289c695c222128f758dd80ce4b0897df322a",
+  "source_experiment": "long-react-formal-holdout-20260722T081627Z",
+  "analysis_policy": "Retrospective only. Gold answers were used to label historical divergence and are not runtime inputs.",
+  "tasks": [
+    {
+      "task_id": "frames-test-0048",
+      "correct_evidence_ever_seen": false,
+      "correct_candidate_ever_seen": false,
+      "first_divergence_turn": 1,
+      "failure_stage": "search",
+      "premature_candidate": "Washington state, followed by Spain",
+      "missing_relation_or_operand": "state matching the 1928 motto-adoption clue -> language at 0.94% -> language's native country",
+      "trace_basis": "Four searches and one Washington page fetch never surfaced Philippines, Tagalog, or Filipino. The first search committed to a Washington interpretation without satisfying the adoption-date relation."
+    },
+    {
+      "task_id": "frames-test-0144",
+      "correct_evidence_ever_seen": false,
+      "correct_candidate_ever_seen": false,
+      "first_divergence_turn": 1,
+      "failure_stage": "fetch",
+      "premature_candidate": "Hula Lake",
+      "missing_relation_or_operand": "Haryana state bird -> Israeli lake supporting a population of that bird",
+      "trace_basis": "The initial search promoted Hahula/Hula Lake; both candidate fetches failed with tls_error. Sea of Galilee or Kinneret never appeared, and the final alternate-domain page only described Haryana birding."
+    },
+    {
+      "task_id": "frames-test-0673",
+      "correct_evidence_ever_seen": false,
+      "correct_candidate_ever_seen": false,
+      "first_divergence_turn": 1,
+      "failure_stage": "operation",
+      "premature_candidate": "47",
+      "missing_relation_or_operand": "complete election-year enumeration from 1924 through August 2024, paired Texas/California nominees, deduplication by election year, and equality count",
+      "trace_basis": "The trajectory fetched only the two 1924 state-election pages, never built a full year-by-year coverage set, and never invoked the deterministic count tool before returning 47."
+    },
+    {
+      "task_id": "frames-test-0681",
+      "correct_evidence_ever_seen": false,
+      "correct_candidate_ever_seen": false,
+      "first_divergence_turn": 4,
+      "failure_stage": "selection",
+      "premature_candidate": "Maastricht",
+      "missing_relation_or_operand": "Treaty signing city -> country containing that city -> capital of that country",
+      "trace_basis": "Search established Maastricht as the signing city. The only Amsterdam occurrence referred to the Treaty of Amsterdam, not the capital relation. Final selection returned the intermediate city without completing Netherlands -> Amsterdam."
+    },
+    {
+      "task_id": "frames-test-0391",
+      "correct_evidence_ever_seen": true,
+      "correct_candidate_ever_seen": true,
+      "first_divergence_turn": 0,
+      "failure_stage": null,
+      "premature_candidate": null,
+      "missing_relation_or_operand": null,
+      "trace_basis": "The first search returned multiple snippets naming Bryn Celli Ddu and matching the summer-solstice, chamber-light, and quartz-stone constraints; final selection preserved the correct entity despite a later TLS fetch failure."
+    }
+  ]
+}
