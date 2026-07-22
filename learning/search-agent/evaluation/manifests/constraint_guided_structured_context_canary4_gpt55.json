@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "manifest_type": "constraint_guided_structured_context_model_canary4",
+  "parent_manifest": "constraint_guided_structured_context_canary4.json",
+  "parent_experiment": "constraint-guided-structured-context-canary-20260722T130936Z",
+  "dataset": "evaluation/datasets/constraint_guided_structured_context_canary4.jsonl",
+  "task_ids": [
+    "frames-test-0069",
+    "frames-test-0615",
+    "frames-test-0612",
+    "frames-test-0637"
+  ],
+  "hypothesis": "model_capacity_is_the_primary_remaining_bottleneck",
+  "single_changed_variable": "model",
+  "model": {
+    "name": "gpt-5.5",
+    "temperature": 1.0,
+    "temperature_reason": "the configured endpoint rejects temperature 0 for gpt-5.5"
+  },
+  "unchanged": [
+    "runtime_mode",
+    "structured_context",
+    "seed",
+    "retrieval_backend",
+    "search_budget",
+    "fetch_budget",
+    "token_budget",
+    "model_call_budget",
+    "watchdog",
+    "formatter",
+    "task_selection"
+  ],
+  "usage_guard": {
+    "currency": "USD",
+    "session_cap": 30.0,
+    "input_usd_per_million_tokens": 5.0,
+    "output_usd_per_million_tokens": 30.0,
+    "cached_input_discount_applied": false,
+    "scope": "usage delta from the pre-run endpoint snapshot",
+    "limitation": "the endpoint does not expose daily or per-model cost breakdown"
+  },
+  "immutable_after_creation": true
+}
