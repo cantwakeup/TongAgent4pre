@@ -7,7 +7,10 @@ from copy import deepcopy
 
 from agent_policy import EFFORT_POLICIES
 from evidence_graph import (
+    allowed_report_caveat_lines,
+    closest_evidence_quotes,
     independent_evidence_source_ids,
+    normalize_evidence_text,
     report_claim_mapping_errors,
     text_sha256,
     validate_evidence_graph,
@@ -96,6 +99,45 @@ class EvidenceGraphStoreTests(unittest.TestCase):
 
         self.assertEqual(budget.snapshot()["claims"], [])
         self.assertEqual(budget.snapshot()["evidence_units"], [])
+
+    def test_typographic_quote_normalization_preserves_exact_canonical_span(
+        self,
+    ) -> None:
+        budget = _active_budget()
+        content = (
+            "The archive states: “Alpha\u00a0— Beta” was published on 1 January 2020."
+        )
+        budget.record_fetch(
+            _page("https://official.example/archive", "Archive", content)
+        )
+
+        result = budget.record_evidence(
+            source_id="S1",
+            claim="The archive states that Alpha to Beta was published in 2020.",
+            quote='The archive states: "Alpha - Beta" was published on 1 January 2020.',
+            stance="supports",
+        )
+
+        canonical = normalize_evidence_text(content)
+        self.assertIn(result["evidence"]["quote"], canonical)
+        self.assertIn("“Alpha — Beta”", result["evidence"]["quote"])
+
+    def test_quote_mismatch_candidates_are_literal_page_substrings(self) -> None:
+        page = (
+            "The first paragraph discusses a general topic. "
+            "The verified table lists a depth of 8,200 metres below sea level. "
+            "A final paragraph gives methodology."
+        )
+
+        candidates, similarity = closest_evidence_quotes(
+            page,
+            "The verified table lists the depth as 8,250 meters below sea level.",
+        )
+
+        self.assertTrue(candidates)
+        self.assertGreater(similarity, 0.5)
+        canonical = normalize_evidence_text(page)
+        self.assertTrue(all(candidate in canonical for candidate in candidates))
 
     def test_short_topic_label_is_not_accepted_as_a_canonical_claim(self) -> None:
         budget = _active_budget()
@@ -704,6 +746,44 @@ An invented fact after Sources.
         )
 
         self.assertTrue(errors["invalid_sources_section_lines"])
+
+    def test_only_state_derived_citation_free_caveats_are_allowed(self) -> None:
+        plan = {
+            "status": "partial",
+            "subquestions": [{"id": "SQ1", "status": "blocked", "claim_ids": []}],
+        }
+        allowed = allowed_report_caveat_lines(plan)
+        valid_report = """## Short Answer
+## Key Findings
+## Conflicts and Caveats
+- Structural subquestion coverage is partial; unsupported subquestions: SQ1.
+- No canonical claim passed the evidence gate.
+## Sources
+"""
+        invented_report = """## Short Answer
+## Key Findings
+## Conflicts and Caveats
+- 北京研究院已于2025年关闭。
+## Sources
+"""
+
+        valid_errors = report_claim_mapping_errors(
+            valid_report,
+            plan_claim_ids=set(),
+            claims=[],
+            evidence_units=[],
+            allowed_caveat_lines=allowed,
+        )
+        invented_errors = report_claim_mapping_errors(
+            invented_report,
+            plan_claim_ids=set(),
+            claims=[],
+            evidence_units=[],
+            allowed_caveat_lines=allowed,
+        )
+
+        self.assertTrue(all(not value for value in valid_errors.values()))
+        self.assertTrue(invented_errors["unauthorized_caveat_lines"])
 
 
 if __name__ == "__main__":

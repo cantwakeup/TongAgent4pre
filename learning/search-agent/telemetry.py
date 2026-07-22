@@ -65,7 +65,21 @@ def write_plan_snapshot(
         plan: Latest plan state.
         budget: Latest serializable budget snapshot.
     """
-    payload = {"thread_id": thread_id, "plan": plan, "budget": budget}
+    payload = {
+        "thread_id": thread_id,
+        "plan": plan,
+        "budget": budget,
+        "metric_semantics": {
+            "structural_subquestion_coverage": (
+                "fraction of subquestions with structurally valid supported claims; "
+                "null for legacy source-only schemas"
+            ),
+            "coverage": (
+                "deprecated alias for structural_subquestion_coverage; not accuracy, "
+                "semantic coverage, completeness, or citation entailment"
+            ),
+        },
+    }
     _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 

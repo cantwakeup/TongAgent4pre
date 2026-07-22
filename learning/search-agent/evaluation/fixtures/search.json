@@ -1,0 +1,118 @@
+{
+  "stage d one hop aurora archive": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Aurora Observatory archive notice",
+        "url": "https://aurora-observatory.fixture.test/archive-notice",
+        "snippet": "The Aurora Observatory opened its public archive in 2024.",
+        "relevance_score": 100
+      },
+      {
+        "title": "Northbridge library archive index",
+        "url": "https://northbridge-library.fixture.test/aurora-index",
+        "snippet": "The public catalog independently dates the Aurora archive opening to 2024.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d cedar registration source": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Cedar Program registration rules",
+        "url": "https://cedar-program.fixture.test/registration",
+        "snippet": "Registration and a signed consent form are both required.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d cedar consent corroboration": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Elm University Cedar participation guide",
+        "url": "https://elm-university.fixture.test/cedar-guide",
+        "snippet": "The independent guide confirms both required participation steps.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d missing lunar certificate": {
+    "status": "success",
+    "provider_success": true,
+    "nonempty_search": true,
+    "relevant_search": false,
+    "relevant_results": 0,
+    "results": [
+      {
+        "title": "Seaside cooking calendar",
+        "url": "https://noise.fixture.test/cooking-calendar",
+        "snippet": "A weekly calendar of soup recipes and market opening times.",
+        "relevance_score": 0
+      },
+      {
+        "title": "Garden irrigation notes",
+        "url": "https://other-noise.fixture.test/irrigation",
+        "snippet": "Unrelated notes about watering schedules for tomato plants.",
+        "relevance_score": 0
+      }
+    ]
+  },
+  "stage d ember trial official": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Ember Trial official timeline",
+        "url": "https://ember-trial.fixture.test/timeline",
+        "snippet": "The official timeline gives 15 March 2025 as the start date.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d ember trial independent check": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Westhaven correction notice",
+        "url": "https://westhaven.fixture.test/ember-correction",
+        "snippet": "The correction disputes the reported 15 March start date.",
+        "relevance_score": 100
+      },
+      {
+        "title": "Pine Research registry",
+        "url": "https://pine-registry.fixture.test/ember-entry",
+        "snippet": "The registry independently records 15 March 2025 as the start date.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d delta archive retry": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Delta Archive catalog",
+        "url": "https://delta-archive.fixture.test/catalog",
+        "snippet": "The catalog lists 17 verified field notebooks.",
+        "relevance_score": 100
+      },
+      {
+        "title": "Quarry Museum Delta finding aid",
+        "url": "https://quarry-museum.fixture.test/delta-finding-aid",
+        "snippet": "The independent finding aid also lists 17 verified notebooks.",
+        "relevance_score": 100
+      }
+    ]
+  },
+  "stage d budget ceiling probe": {
+    "status": "success",
+    "results": [
+      {
+        "title": "Budget ceiling probe",
+        "url": "https://budget-probe.fixture.test/result",
+        "snippet": "A deterministic relevant result used only to consume a search allowance.",
+        "relevance_score": 100
+      }
+    ]
+  }
+}

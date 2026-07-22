@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "description": "Sanitized offline regressions derived from the FRAMES seed-17 pilot. Reserved example domains replace observed URLs, and no dataset answer or source metadata is included.",
+  "cases": [
+    {
+      "case_id": "frames-0664-rhcp-discography",
+      "query": "Red Hot Chili Peppers studio albums release dates list",
+      "drift_results": [
+        {
+          "title": "RED professional cameras",
+          "url": "https://camera-noise.invalid/red",
+          "snippet": "Professional digital cinema cameras and imaging products."
+        },
+        {
+          "title": "Definition of red",
+          "url": "https://dictionary-noise.invalid/red",
+          "snippet": "A dictionary entry for the English colour word red."
+        }
+      ],
+      "relevant_results": [
+        {
+          "title": "Red Hot Chili Peppers discography",
+          "url": "https://music-evidence.example/red-hot-chili-peppers-discography",
+          "snippet": "The band's discography lists its studio albums and their release dates."
+        }
+      ],
+      "rewrite_required_term_groups": [
+        [
+          "red hot chili peppers"
+        ],
+        [
+          "discography",
+          "studio albums"
+        ]
+      ]
+    },
+    {
+      "case_id": "frames-0664-mandela-imprisonment",
+      "query": "Nelson Mandela imprisoned years 1964 1990 prison release date",
+      "historical_long_query": "Nelson Mandela entered prison date 1962 27 years released 1990 February 11 exact date prison released",
+      "drift_results": [
+        {
+          "title": "Nelson learning resources",
+          "url": "https://publisher-noise.invalid/nelson",
+          "snippet": "Classroom learning materials from a publisher named Nelson."
+        },
+        {
+          "title": "Travel in Nelson",
+          "url": "https://travel-noise.invalid/nelson",
+          "snippet": "A visitor guide for the Nelson region and nearby parks."
+        }
+      ],
+      "relevant_results": [
+        {
+          "title": "Nelson Mandela imprisonment chronology",
+          "url": "https://history-evidence.example/nelson-mandela-imprisonment",
+          "snippet": "Mandela was sentenced in 1964 and released from prison in 1990."
+        }
+      ],
+      "weak_association_results": [
+        {
+          "title": "Angolan Civil War",
+          "url": "https://history-noise.invalid/angolan-civil-war",
+          "snippet": "An Angola retrospective briefly mentions Nelson Mandela in a broad conflict history."
+        },
+        {
+          "title": "George Michael",
+          "url": "https://music-noise.invalid/george-michael",
+          "snippet": "The singer participated in the Nelson Mandela 70th Birthday Tribute."
+        },
+        {
+          "title": "Invictus",
+          "url": "https://film-noise.invalid/invictus",
+          "snippet": "A film page notes that an actor portrays Nelson Mandela in a rugby story."
+        }
+      ],
+      "numeric_mismatch_result": {
+        "title": "Nelson Mandela imprisonment chronology",
+        "url": "https://history-evidence.example/nelson-mandela-imprisonment",
+        "snippet": "A chronology containing unrelated dates 1910 and 2005."
+      },
+      "numeric_weight_probe": {
+        "matching": {
+          "title": "Nelson Mandela chronology",
+          "url": "https://history-evidence.example/mandela-chronology-1964-1990",
+          "snippet": "An imprisonment timeline covering 1964 through 1990."
+        },
+        "mismatching": {
+          "title": "Nelson Mandela chronology",
+          "url": "https://history-evidence.example/mandela-chronology-other-years",
+          "snippet": "An archival timeline covering 1910 through 2005."
+        }
+      },
+      "rewrite_required_term_groups": [
+        [
+          "nelson mandela"
+        ],
+        [
+          "imprisoned",
+          "imprisonment"
+        ],
+        [
+          "1964"
+        ],
+        [
+          "1990"
+        ]
+      ]
+    },
+    {
+      "case_id": "frames-0016-new-britain-trench",
+      "query": "New Britain Trench depth meters bottom to sea level",
+      "drift_results": [
+        {
+          "title": "Definition of new",
+          "url": "https://dictionary-noise.invalid/new",
+          "snippet": "A dictionary entry for the common English word new."
+        },
+        {
+          "title": "A new online game",
+          "url": "https://game-noise.invalid/new-world",
+          "snippet": "Launch information for an unrelated online game."
+        }
+      ],
+      "relevant_results": [
+        {
+          "title": "New Britain Trench bathymetry",
+          "url": "https://ocean-evidence.example/new-britain-trench-depth",
+          "snippet": "A survey reports the trench's measured depth in metres below sea level."
+        }
+      ],
+      "rewrite_required_term_groups": [
+        [
+          "new britain trench"
+        ],
+        [
+          "depth",
+          "bathymetry"
+        ]
+      ]
+    },
+    {
+      "case_id": "frames-0016-san-francisco-building",
+      "query": "San Francisco tallest building height meters 2024 Salesforce Tower",
+      "drift_results": [
+        {
+          "title": "What is a SAN?",
+          "url": "https://storage-noise.invalid/san",
+          "snippet": "An introduction to storage area networks, NAS, and DAS."
+        },
+        {
+          "title": "Tallest people",
+          "url": "https://people-noise.invalid/tallest",
+          "snippet": "A list of unusually tall people."
+        }
+      ],
+      "relevant_results": [
+        {
+          "title": "Salesforce Tower is San Francisco's tallest building",
+          "url": "https://architecture-evidence.example/salesforce-tower-height",
+          "snippet": "The San Francisco skyscraper profile gives the tower's height in metres and identifies it as the city's tallest building in 2024."
+        }
+      ],
+      "numeric_mismatch_result": {
+        "title": "Salesforce Tower is San Francisco's tallest building",
+        "url": "https://architecture-evidence.example/salesforce-tower-height",
+        "snippet": "The same building profile is an archived edition dated 2011."
+      },
+      "numeric_weight_probe": {
+        "matching": {
+          "title": "San Francisco skyline record",
+          "url": "https://architecture-evidence.example/san-francisco-2024",
+          "snippet": "The tallest-building record in the 2024 edition."
+        },
+        "mismatching": {
+          "title": "San Francisco skyline record",
+          "url": "https://architecture-evidence.example/san-francisco-2011",
+          "snippet": "The tallest-building record in the 2011 edition."
+        }
+      },
+      "rewrite_required_term_groups": [
+        [
+          "san francisco"
+        ],
+        [
+          "salesforce tower"
+        ],
+        [
+          "height",
+          "meters",
+          "metres"
+        ],
+        [
+          "2024"
+        ]
+      ]
+    }
+  ]
+}

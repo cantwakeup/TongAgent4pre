@@ -16,7 +16,15 @@ class ResearchBudgetTests(unittest.TestCase):
     def test_search_budget_is_enforced(self) -> None:
         tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
         search = next(item for item in tools if item.name == "web_search")
-        raw_result = json.dumps({"status": "success", "query": "test", "results": []})
+        raw_result = json.dumps(
+            {
+                "status": "success",
+                "query": "test",
+                "results": [{"url": "https://example.com", "relevance_score": 100}],
+                "relevant_results": 1,
+                "search_quality": "relevant",
+            }
+        )
 
         with patch("search_agent.web_search") as raw_search:
             raw_search.invoke.return_value = raw_result
@@ -63,6 +71,58 @@ class ResearchBudgetTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(snapshot["search_calls"], 1)
         self.assertEqual(snapshot["successful_searches"], 0)
+
+    def test_low_relevance_result_search_is_tracked_separately(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        search = next(item for item in tools if item.name == "web_search")
+        raw_result = json.dumps(
+            {
+                "status": "success",
+                "query": "generic noise",
+                "results": [
+                    {
+                        "url": "https://noise.example/page",
+                        "relevance_score": 0,
+                    }
+                ],
+                "relevant_results": 0,
+                "search_quality": "low_relevance",
+            }
+        )
+
+        with patch("search_agent.web_search") as raw_search:
+            raw_search.invoke.return_value = raw_result
+            result = json.loads(search.invoke({"query": "generic noise"}))
+
+        snapshot = budget.snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(snapshot["search_calls"], 1)
+        self.assertEqual(snapshot["successful_searches"], 1)
+        self.assertEqual(snapshot["relevant_searches"], 0)
+        self.assertEqual(snapshot["tool_attempts"][0]["outcome"], "low_relevance")
+        self.assertEqual(snapshot["tool_attempts"][0]["failure_class"], "content")
+        self.assertTrue(snapshot["tool_attempts"][0]["retryable"])
+
+    def test_empty_search_result_does_not_satisfy_success_gate(self) -> None:
+        tools, budget = build_budgeted_tools(EFFORT_POLICIES["low"])
+        search = next(item for item in tools if item.name == "web_search")
+        raw_result = json.dumps(
+            {
+                "status": "success",
+                "query": "nothing",
+                "results": [],
+                "relevant_results": 0,
+                "search_quality": "low_relevance",
+            }
+        )
+
+        with patch("search_agent.web_search") as raw_search:
+            raw_search.invoke.return_value = raw_result
+            search.invoke({"query": "nothing"})
+
+        snapshot = budget.snapshot()
+        self.assertEqual(snapshot["successful_searches"], 0)
+        self.assertEqual(snapshot["tool_attempts"][0]["outcome"], "empty_results")
 
     def test_plan_budget_is_partitioned_between_subquestions(self) -> None:
         _, budget = build_budgeted_tools(EFFORT_POLICIES["medium"])
@@ -167,9 +227,9 @@ class ResearchBudgetTests(unittest.TestCase):
             fetch.invoke({"url": responses[0]["url"]})
             fetch.invoke({"url": responses[1]["url"]})
             first_snapshot = budget.snapshot()
-            fetch.invoke({"url": responses[2]["url"]})
+            fetch.invoke({"url": responses[2]["url"], "force_refresh": True})
             drifted_snapshot = budget.snapshot()
-            fetch.invoke({"url": responses[3]["url"]})
+            fetch.invoke({"url": responses[3]["url"], "force_refresh": True})
             final_snapshot = budget.snapshot()
 
         self.assertEqual(

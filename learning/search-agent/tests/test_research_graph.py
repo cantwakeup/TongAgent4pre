@@ -15,7 +15,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph import MessagesState
 
+from evidence_graph import EvidenceQuoteMismatch, text_sha256
 from research_graph import (
+    build_active_research_context,
+    build_evidence_graph_tools,
     DraftSubquestion,
     build_model_planner,
     build_research_graph,
@@ -53,6 +56,7 @@ class _FakeLedger:
         self.claims: list[dict[str, Any]] = []
         self.evidence_units: list[dict[str, Any]] = []
         self.conflicts: list[dict[str, Any]] = []
+        self.searches_by_subquestion: dict[str, int] = {}
 
     def add_source(
         self,
@@ -66,10 +70,15 @@ class _FakeLedger:
         claim_id = f"C{len(self.claims) + 1}"
         evidence_id = f"E{len(self.evidence_units) + 1}"
         canonical_hash = content_hash or f"{len(self.sources) + 1:064x}"
+        quote = f"Exact evidence quote for {subquestion_id}."
+        url = f"https://source{len(self.sources) + 1}.example/{source_id}"
+        self.searches_by_subquestion[subquestion_id] = (
+            self.searches_by_subquestion.get(subquestion_id, 0) + 1
+        )
         self.sources.append(
             {
                 "source_id": source_id,
-                "url": f"https://example.com/{source_id}",
+                "url": url,
                 "title": source_id,
                 "content_chars": 800,
                 "content_sha256": canonical_hash,
@@ -106,7 +115,12 @@ class _FakeLedger:
                 "subquestion_id": subquestion_id,
                 "source_id": source_id,
                 "stance": "supports",
+                "quote": quote,
+                "quote_sha256": text_sha256(quote),
                 "source_content_sha256": canonical_hash,
+                "url": url,
+                "title": source_id,
+                "evidence_quality": "full",
             }
         )
         return source_id
@@ -116,13 +130,29 @@ class _FakeLedger:
         return {
             "effort": "test",
             "search_calls": len(self.sources),
+            "provider_successes": len(self.sources),
+            "nonempty_searches": len(self.sources),
             "successful_searches": len(self.sources),
+            "relevant_searches": len(self.sources),
+            "evidence_producing_searches": len(self.evidence_units),
             "max_searches": 10,
             "fetch_calls": len(self.sources),
             "max_fetches": 10,
             "min_successful_sources": 1,
             "successful_sources": list(self.sources),
             "failed_sources": [],
+            "subquestion_usage": {
+                subquestion_id: {
+                    "search_calls": count,
+                    "provider_successes": count,
+                    "nonempty_searches": count,
+                    "successful_searches": count,
+                    "relevant_searches": count,
+                    "evidence_producing_searches": count,
+                    "fetch_calls": count,
+                }
+                for subquestion_id, count in self.searches_by_subquestion.items()
+            },
             "evidence_graph_version": 1,
             "claims": list(self.claims),
             "evidence_units": list(self.evidence_units),
@@ -137,6 +167,10 @@ class _FakeLedger:
             dict(item) for item in snapshot.get("evidence_units", [])
         ]
         self.conflicts = [dict(item) for item in snapshot.get("conflicts", [])]
+        self.searches_by_subquestion = {
+            str(key): int(value.get("relevant_searches", 0))
+            for key, value in snapshot.get("subquestion_usage", {}).items()
+        }
 
 
 def _fake_research_agent(
@@ -248,7 +282,7 @@ class ResearchPlanTests(unittest.TestCase):
                 evidence_source_ids=["not-a-source"],
             )
 
-    def test_coverage_and_selection_skip_completed_work(self) -> None:
+    def test_selection_skips_covered_work_but_unaudited_ids_do_not_count(self) -> None:
         plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
         plan = transition_subquestion(
             plan,
@@ -262,7 +296,8 @@ class ResearchPlanTests(unittest.TestCase):
 
         self.assertEqual(active, "SQ2")
         self.assertEqual(selected["subquestions"][0]["attempts"], 1)
-        self.assertEqual(calculate_plan_coverage(selected), 0.5)
+        self.assertEqual(calculate_plan_coverage(selected), 0.0)
+        self.assertFalse(selected["subquestions"][0]["structural_closure_validated"])
 
     def test_blocked_dependency_is_cascaded_instead_of_researched(self) -> None:
         plan, _ = select_next_subquestion(_fixed_plan("topic", 2))
@@ -292,6 +327,8 @@ class ResearchPlanTests(unittest.TestCase):
         migrated = refresh_plan_status(legacy)
 
         self.assertEqual(migrated["evidence_schema_version"], 0)
+        self.assertIsNone(migrated["structural_subquestion_coverage"])
+        self.assertIsNone(migrated["coverage"])
         self.assertEqual(migrated["subquestions"][0]["claim_ids"], [])
         self.assertEqual(migrated["subquestions"][0]["conflict_ids"], [])
 
@@ -345,7 +382,7 @@ class ResearchPlanTests(unittest.TestCase):
         accepted_payload = json.loads(accepted.update["messages"][0].content)
         self.assertEqual(
             accepted_payload["canonical_sources"][0]["url"],
-            "https://example.com/S1",
+            "https://source1.example/S1",
         )
 
         ledger_payload = json.loads(
@@ -392,13 +429,24 @@ class ResearchPlanTests(unittest.TestCase):
             plan_id_factory=lambda: "plan-one",
         )
         plan, active = select_next_subquestion(plan)
-        search_state = {"calls": 1, "successful": 0}
+        search_state = {"calls": 1, "nonempty": 1, "relevant": 1}
 
         def snapshot() -> dict[str, Any]:
             value = ledger.snapshot()
             value["min_successful_sources"] = 2
             value["search_calls"] = search_state["calls"]
-            value["successful_searches"] = search_state["successful"]
+            value["nonempty_searches"] = search_state["nonempty"]
+            value["successful_searches"] = search_state["nonempty"]
+            value["relevant_searches"] = search_state["relevant"]
+            value["subquestion_usage"]["SQ1"]["nonempty_searches"] = search_state[
+                "nonempty"
+            ]
+            value["subquestion_usage"]["SQ1"]["successful_searches"] = search_state[
+                "nonempty"
+            ]
+            value["subquestion_usage"]["SQ1"]["relevant_searches"] = search_state[
+                "relevant"
+            ]
             return value
 
         update_tool = build_research_state_tools(snapshot)[1]
@@ -438,6 +486,7 @@ class ResearchPlanTests(unittest.TestCase):
             "Blocked status is premature", json.loads(premature_block)["error"]
         )
         second = ledger.add_source("SQ1")
+        search_state["relevant"] = 0
         missing_search = update_tool.func(
             subquestion_id="SQ1",
             status="covered",
@@ -446,10 +495,10 @@ class ResearchPlanTests(unittest.TestCase):
             runtime=runtime,
         )
         self.assertIn(
-            "requires at least 1 successful web searches",
+            "requires at least one relevant web_search",
             json.loads(missing_search)["error"],
         )
-        search_state["successful"] = 1
+        search_state["relevant"] = 1
         accepted = update_tool.func(
             subquestion_id="SQ1",
             status="covered",
@@ -669,9 +718,179 @@ class ResearchPlanTests(unittest.TestCase):
         )
         self.assertEqual(accepted.update["research_plan"]["coverage"], 0.5)
 
+    def test_active_context_is_current_sq_only_and_classifies_enumeration(self) -> None:
+        plan = create_research_plan(
+            "Count releases in a time window",
+            [
+                DraftSubquestion(question="Establish the time window"),
+                DraftSubquestion(
+                    question=(
+                        "Which albums are in the complete discography and how many "
+                        "were released during that window?"
+                    ),
+                    depends_on=[1],
+                ),
+            ],
+            plan_id_factory=lambda: "plan-context",
+        )
+        plan["subquestions"][0]["status"] = "covered"
+        plan["subquestions"][1]["status"] = "researching"
+        ledger = _FakeLedger()
+        ledger.add_source("SQ1")
+        snapshot = ledger.snapshot()
+        snapshot["subquestion_limits"] = {"SQ2": {"max_searches": 2, "max_fetches": 3}}
+        snapshot["subquestion_usage"]["SQ2"] = {
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "relevant_searches": 0,
+        }
+
+        context = build_active_research_context(
+            plan=plan,
+            active_subquestion_id="SQ2",
+            budget=snapshot,
+            model_budget={"remaining_model_calls": 11},
+        )
+
+        self.assertEqual(context.query_task_type, "list_or_enumeration")
+        self.assertEqual(context.remaining_search_budget, 2)
+        self.assertEqual(context.remaining_fetch_budget, 3)
+        self.assertEqual(context.remaining_model_calls, 11)
+        self.assertEqual(context.canonical_claims, [])
+        self.assertEqual(context.relevant_sources, [])
+        self.assertEqual(context.active_subquestion["id"], "SQ2")
+
+    def test_record_evidence_auto_updates_sq_without_read_or_update_tool(self) -> None:
+        ledger = _FakeLedger()
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+
+        def record(**_kwargs: Any) -> dict[str, Any]:
+            ledger.add_source("SQ1")
+            return {
+                "claim": dict(ledger.claims[-1]),
+                "evidence": dict(ledger.evidence_units[-1]),
+                "conflict": None,
+            }
+
+        tool = build_evidence_graph_tools(
+            record,
+            ledger.snapshot,
+            auto_update_subquestion=True,
+        )[0]
+        runtime = ToolRuntime(
+            state={
+                "research_plan": plan,
+                "research_events": [],
+                "active_subquestion_id": active,
+            },
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id="auto-evidence",
+            store=None,
+        )
+
+        result = tool.func(
+            source_id="S1",
+            claim="The primary fact is supported by the canonical source.",
+            quote="Exact evidence quote for SQ1.",
+            runtime=runtime,
+        )
+        payload = json.loads(result.update["messages"][0].content)
+
+        self.assertTrue(payload["subquestion_auto_updated"])
+        self.assertEqual(payload["next_state"], "covered")
+        self.assertEqual(
+            result.update["research_plan"]["subquestions"][0]["status"],
+            "covered",
+        )
+        self.assertIn(
+            "subquestion_updated",
+            [item["event"] for item in result.update["research_events"]],
+        )
+
+    def test_quote_mismatch_allows_one_correction_and_blocks_duplicate(self) -> None:
+        plan, active = select_next_subquestion(_fixed_plan("topic", 2))
+
+        def reject(**_kwargs: Any) -> dict[str, Any]:
+            raise EvidenceQuoteMismatch(
+                "S1",
+                candidate_quotes=["A literal canonical candidate quote from the page."],
+                normalized_similarity=0.91,
+            )
+
+        tool = build_evidence_graph_tools(reject, _FakeLedger().snapshot)[0]
+
+        def runtime(events: list[dict[str, Any]], call_id: str) -> ToolRuntime:
+            return ToolRuntime(
+                state={
+                    "research_plan": plan,
+                    "research_events": events,
+                    "active_subquestion_id": active,
+                },
+                context=None,
+                config={},
+                stream_writer=lambda _value: None,
+                tool_call_id=call_id,
+                store=None,
+            )
+
+        first = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A rejected approximate quote that is not on the page.",
+            runtime=runtime([], "quote-1"),
+        )
+        first_payload = json.loads(first.update["messages"][0].content)
+        self.assertEqual(first_payload["status"], "quote_mismatch")
+        self.assertTrue(first_payload["retryable"])
+        self.assertEqual(len(first_payload["candidate_quotes"]), 1)
+
+        duplicate = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A rejected approximate quote that is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-2"),
+        )
+        duplicate_payload = json.loads(duplicate.update["messages"][0].content)
+        self.assertEqual(duplicate_payload["status"], "duplicate_retry_blocked")
+        self.assertFalse(duplicate_payload["retryable"])
+
+        second_correction = tool.func(
+            source_id="S1",
+            claim="The canonical source supports one report-ready proposition.",
+            quote="A different rejected correction that also is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-3"),
+        )
+        correction_payload = json.loads(second_correction.update["messages"][0].content)
+        self.assertEqual(correction_payload["status"], "quote_mismatch")
+        self.assertFalse(correction_payload["retryable"])
+
+        changed_claim = tool.func(
+            source_id="S1",
+            claim="The same source supports differently worded model prose.",
+            quote="Another rejected approximate quote that is not on the page.",
+            runtime=runtime(first.update["research_events"], "quote-4"),
+        )
+        changed_payload = json.loads(changed_claim.update["messages"][0].content)
+        self.assertFalse(changed_payload["retryable"])
+
 
 class ResearchGraphTests(unittest.TestCase):
     """Verify graph ordering, bounded retries, and cross-process recovery."""
+
+    def test_graph_requires_an_explicit_synthesis_agent(self) -> None:
+        ledger = _FakeLedger()
+
+        with self.assertRaisesRegex(ValueError, "synthesis-only report_agent"):
+            build_research_graph(
+                research_agent=_fake_research_agent(ledger),
+                planner=_fixed_plan,
+                budget_snapshot=ledger.snapshot,
+                checkpointer=None,
+                max_subquestions=2,
+                max_research_cycles=4,
+            )
 
     def test_graph_completes_each_subquestion_before_reporting(self) -> None:
         ledger = _FakeLedger()
@@ -683,6 +902,7 @@ class ResearchGraphTests(unittest.TestCase):
 
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=planner,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -712,6 +932,7 @@ class ResearchGraphTests(unittest.TestCase):
         activated: list[str | None] = []
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             budget_configure=lambda ids: configured.append(list(ids)),
@@ -735,6 +956,7 @@ class ResearchGraphTests(unittest.TestCase):
         ledger = _FakeLedger()
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger, produce_evidence=False),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -764,6 +986,7 @@ class ResearchGraphTests(unittest.TestCase):
         ledger = _FakeLedger()
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger, claim_evidence=False),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -799,6 +1022,7 @@ class ResearchGraphTests(unittest.TestCase):
         injected = refresh_plan_status(injected)
         graph = build_research_graph(
             research_agent=_fake_research_agent(ledger),
+            report_agent=_fake_research_agent(ledger),
             planner=_fixed_plan,
             budget_snapshot=ledger.snapshot,
             checkpointer=None,
@@ -838,6 +1062,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 interrupted = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -861,6 +1086,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 resumed = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -886,6 +1112,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 interrupted = build_research_graph(
                     research_agent=_fake_research_agent(first_ledger),
+                    report_agent=_fake_research_agent(first_ledger),
                     planner=_fixed_plan,
                     budget_snapshot=first_ledger.snapshot,
                     checkpointer=checkpointer,
@@ -913,6 +1140,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 resumed = build_research_graph(
                     research_agent=_fake_research_agent(fresh_ledger),
+                    report_agent=_fake_research_agent(fresh_ledger),
                     planner=_fixed_plan,
                     budget_snapshot=fresh_ledger.snapshot,
                     checkpointer=checkpointer,
@@ -957,6 +1185,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 graph = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=_fixed_plan,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,
@@ -997,6 +1226,7 @@ class ResearchGraphTests(unittest.TestCase):
             with SqliteSaver.from_conn_string(str(database)) as checkpointer:
                 graph = build_research_graph(
                     research_agent=_fake_research_agent(ledger),
+                    report_agent=_fake_research_agent(ledger),
                     planner=planner,
                     budget_snapshot=ledger.snapshot,
                     checkpointer=checkpointer,

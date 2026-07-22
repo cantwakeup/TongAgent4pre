@@ -1,0 +1,61 @@
+{
+  "search_cases": [
+    {
+      "id": "python-docs",
+      "query": "Python official documentation",
+      "expected_hosts": ["docs.python.org"]
+    },
+    {
+      "id": "sqlite-docs",
+      "query": "SQLite official documentation",
+      "expected_hosts": ["sqlite.org"]
+    },
+    {
+      "id": "postgresql-docs",
+      "query": "PostgreSQL official documentation",
+      "expected_hosts": ["postgresql.org"]
+    },
+    {
+      "id": "langchain-docs",
+      "query": "LangChain official documentation",
+      "expected_hosts": ["docs.langchain.com"]
+    },
+    {
+      "id": "wikipedia-alan-turing",
+      "query": "Alan Turing biography",
+      "expected_hosts": ["en.wikipedia.org"]
+    }
+  ],
+  "fetch_cases": [
+    {
+      "id": "normal-html",
+      "url": "https://example.com/",
+      "expected": "success"
+    },
+    {
+      "id": "python-docs",
+      "url": "https://docs.python.org/3/",
+      "expected": "success"
+    },
+    {
+      "id": "wikipedia-content",
+      "url": "https://en.wikipedia.org/wiki/Alan_Turing",
+      "expected": "success"
+    },
+    {
+      "id": "localhost",
+      "url": "http://localhost/private",
+      "expected": "unsafe_url"
+    },
+    {
+      "id": "private-ipv4",
+      "url": "http://10.0.0.8/private",
+      "expected": "unsafe_url"
+    },
+    {
+      "id": "private-ipv6",
+      "url": "http://[fd00::8]/private",
+      "expected": "unsafe_url"
+    }
+  ]
+}

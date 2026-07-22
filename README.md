@@ -1,3 +1,72 @@
+# TongAgent4pre
+
+TongAgent4pre 是一个建立在 LangChain、LangGraph 与 Deep Agents 之上的研究型
+Agent 原型。项目目标不是单纯增加 Agent 数量，而是把长程网页研究变成可恢复、
+可审计的闭环：显式拆分子问题，登记 Claim–Evidence–Source 证据链，用确定性
+控制器按证据缺口释放预算，并保存计划、轨迹、控制决策和验收结果。
+
+当前实现已到
+[Stage 03D：证据驱动的自适应控制](learning/stages/stage-03d-adaptive-control.md)；
+仓库可以通过锁定依赖建立可复现环境，并提供可离线测试的统一评测框架，能在
+公平预算下运行 B1（Simple ReAct）、B2（原生 Deep Agents）和
+B3（TongAgent）。离线 fixture 只用于 smoke 和框架回归，不能称为正式
+benchmark 结果；运行合同、严格验收入口与当前 readiness 判定见
+[TongAgent 统一评测指南](learning/search-agent/BENCHMARKING.md)和
+[Benchmark Readiness 报告](learning/search-agent/BENCHMARK_READINESS_REPORT.md)。
+
+```text
+问题
+  -> 显式 ResearchPlan / 原子子问题
+  -> single 或 multi research
+  -> 搜索、抓取、Claim–Evidence–Source 账本
+  -> fixed 或 deterministic adaptive controller
+  -> 受约束的报告合成与结构验收
+  -> checkpoint + JSON/JSONL/Markdown 运行产物
+```
+
+## 安装与离线 smoke
+
+要求 Python `>=3.11,<4.0` 和
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/)。默认从标准
+PyPI 解析依赖；仓库内的 Deep Agents 源码以 editable 方式安装。
+
+```bash
+cd learning/search-agent
+uv sync --group test
+```
+
+先用两个无网络、无付费模型调用的关键测试做低成本 smoke：
+
+```bash
+uv run --group test python -m pytest -q \
+  --disable-socket --allow-unix-socket \
+  tests/test_metric_semantics.py tests/test_adaptive_control.py
+```
+
+完整离线验证从仓库根目录统一运行：
+
+```bash
+bash scripts/check_tongagent.sh
+```
+
+真实联网研究 Agent 的配置、运行和产物说明见
+[learning/search-agent/README.md](learning/search-agent/README.md)。正式 baseline
+不会由单次 `search_agent.py` 演示得出；当前统一 B1/B2/B3 runner、确定性
+Stage D smoke 和 live pilot 的正式入口与边界，以
+[TongAgent 统一评测指南](learning/search-agent/BENCHMARKING.md)为准；仓库内
+还保存了
+[18-run 脱敏 smoke 汇总](learning/search-agent/evaluation/results/stage_d_offline_smoke/summary.md)。
+
+## 上游基线
+
+TongAgent4pre 不是从零实现 Agent runtime。仓库导入并固定了
+[`langchain-ai/deepagents`](https://github.com/langchain-ai/deepagents) 的
+`deepagents==0.6.12` 源码快照；对应上游提交为
+[`4ddb361b99857c1fc23afb9ada0a68162c190f74`](https://github.com/langchain-ai/deepagents/commit/4ddb361b99857c1fc23afb9ada0a68162c190f74)。
+下面保留上游 Deep Agents 的项目介绍和使用资料。
+
+---
+
 <div align="center">
   <a href="https://docs.langchain.com/oss/python/deepagents/overview#deep-agents-overview">
     <picture>

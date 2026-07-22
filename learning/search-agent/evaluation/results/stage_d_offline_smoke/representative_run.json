@@ -1,0 +1,289 @@
+{
+  "record_schema_version": 1,
+  "benchmark_disclaimer": "Deterministic offline fixture smoke test; not a formal benchmark result.",
+  "sanitized_export": true,
+  "sanitization": {
+    "artifact_directory": "replaced with a repository-relative example path",
+    "credentials_present": false,
+    "raw_page_bodies_included": false,
+    "machine_environment_included": false
+  },
+  "task": {
+    "id": "fixture-nonempty-irrelevant",
+    "question": "Which authority issued the fictional Lunar Harbor safety certificate?",
+    "reference_answer": null,
+    "metadata": {
+      "fixture_kind": "deterministic_offline_smoke",
+      "benchmark_status": "smoke_only_not_a_formal_benchmark",
+      "scenario": "nonempty-irrelevant",
+      "strict_fixture_tools": true
+    }
+  },
+  "resolved_config": {
+    "artifact_directory": "evaluation/results/stage_d_offline_smoke/representative_run",
+    "backend_kind": "fixture",
+    "budget": {
+      "max_fetch_calls": 6,
+      "max_model_calls": 30,
+      "max_page_chars": 12000,
+      "max_results_per_search": 5,
+      "max_search_calls": 4,
+      "max_total_tokens": 100000,
+      "max_total_tool_calls": 30,
+      "recursion_limit": 125,
+      "wall_time_seconds": 60.0
+    },
+    "config_fingerprint": "sha256:f6c1c15b26c155181df2f2e7308fbb2ddd81e924f3b5b8d55e4e028faab3d4fb",
+    "dataset_digest": "sha256:b0c8a12630cb71416009128d2f6bd1703a5418ef7926e1807ac73dc71a245487",
+    "fairness_fingerprint": "sha256:d0609f6df2bfa994785e85f525398268037f3d2c1f6a7537685f48c499cec4b8",
+    "fixture_revision": "6f09f8f239d324b03ff8f948e8dfb29dfeacdf3e24c20d146514a06b742b99e9",
+    "judge": null,
+    "model": {
+      "credential_env": [],
+      "max_output_tokens": 5000,
+      "name": "fixture-chat-v1",
+      "parameters": {},
+      "provider": "fixture",
+      "temperature": 0.0
+    },
+    "schema_version": 1,
+    "seed": 0,
+    "system_id": "simple_react",
+    "system_options": {
+      "fixture_dir": "evaluation/fixtures"
+    },
+    "tools": {
+      "fetch_backend": "fixture-fetch",
+      "parameters": {},
+      "search_backend": "fixture-search"
+    }
+  },
+  "run_result": {
+    "artifact_directory": "evaluation/results/stage_d_offline_smoke/representative_run",
+    "citations": [],
+    "completion_status": "completed",
+    "config_fingerprint": "sha256:f6c1c15b26c155181df2f2e7308fbb2ddd81e924f3b5b8d55e4e028faab3d4fb",
+    "estimated_cost": null,
+    "evidence_count": null,
+    "failure": null,
+    "failure_type": null,
+    "fairness_fingerprint": "sha256:d0609f6df2bfa994785e85f525398268037f3d2c1f6a7537685f48c499cec4b8",
+    "fetch_calls": 0,
+    "final_answer": "The non-empty fixture results are unrelated, so no issuing authority can be supported.",
+    "finished_at": "2026-07-19T03:31:04.660844Z",
+    "fixture_smoke": true,
+    "git_sha": "6d51f71715fca01fdb60ac749395953dec2da267",
+    "judge_result": null,
+    "judge_score": null,
+    "normalized_exact_match": null,
+    "relevant_searches": 0,
+    "resolved_config": {
+      "artifact_directory": "evaluation/results/stage_d_offline_smoke/representative_run",
+      "backend_kind": "fixture",
+      "budget": {
+        "max_fetch_calls": 6,
+        "max_model_calls": 30,
+        "max_page_chars": 12000,
+        "max_results_per_search": 5,
+        "max_search_calls": 4,
+        "max_total_tokens": 100000,
+        "max_total_tool_calls": 30,
+        "recursion_limit": 125,
+        "wall_time_seconds": 60.0
+      },
+      "config_fingerprint": "sha256:f6c1c15b26c155181df2f2e7308fbb2ddd81e924f3b5b8d55e4e028faab3d4fb",
+      "dataset_digest": "sha256:b0c8a12630cb71416009128d2f6bd1703a5418ef7926e1807ac73dc71a245487",
+      "fairness_fingerprint": "sha256:d0609f6df2bfa994785e85f525398268037f3d2c1f6a7537685f48c499cec4b8",
+      "fixture_revision": "6f09f8f239d324b03ff8f948e8dfb29dfeacdf3e24c20d146514a06b742b99e9",
+      "judge": null,
+      "model": {
+        "credential_env": [],
+        "max_output_tokens": 5000,
+        "name": "fixture-chat-v1",
+        "parameters": {},
+        "provider": "fixture",
+        "temperature": 0.0
+      },
+      "schema_version": 1,
+      "seed": 0,
+      "system_id": "simple_react",
+      "system_options": {
+        "fixture_dir": "evaluation/fixtures"
+      },
+      "tools": {
+        "fetch_backend": "fixture-fetch",
+        "parameters": {},
+        "search_backend": "fixture-search"
+      }
+    },
+    "run_id": "run-9387d8bd8d0b4dbda7bab9e44386a72d",
+    "search_calls": 1,
+    "started_at": "2026-07-19T03:31:03.998699Z",
+    "structural_subquestion_coverage": null,
+    "system_id": "simple_react",
+    "task_id": "fixture-nonempty-irrelevant",
+    "token_usage": {
+      "cached_input_tokens": null,
+      "input_tokens": 496,
+      "output_tokens": 42,
+      "reasoning_tokens": null,
+      "total_tokens": 538
+    },
+    "tool_calls": [
+      {
+        "arguments": {
+          "query": "stage d missing lunar certificate"
+        },
+        "call_id": "fixture-73dc04c5e1-s001-c0001",
+        "duration_seconds": 0.002485938006429933,
+        "failure": null,
+        "finished_at": "2026-07-19T03:31:04.657905Z",
+        "metadata": {
+          "attempt_id": "A1",
+          "evidence_producing_search": false,
+          "nonempty_search": true,
+          "provider_outcome": "success",
+          "provider_status": "success",
+          "provider_success": true,
+          "relevant_search": false,
+          "retryable": true,
+          "source_id": null
+        },
+        "result": {
+          "attempt_id": "A1",
+          "evidence_producing_search": false,
+          "failure_class": "content",
+          "fixture_response_index": 0,
+          "fixture_revision": "6f09f8f239d324b03ff8f948e8dfb29dfeacdf3e24c20d146514a06b742b99e9",
+          "nonempty_search": true,
+          "outcome": "low_relevance",
+          "provider_failure": false,
+          "provider_outcome": "success",
+          "provider_success": true,
+          "query": "stage d missing lunar certificate",
+          "relevant_results": 0,
+          "relevant_search": false,
+          "reported_relevant_results": 0,
+          "results": [
+            {
+              "relevance_score": 0,
+              "snippet": "A weekly calendar of soup recipes and market opening times.",
+              "title": "Seaside cooking calendar",
+              "url": "https://noise.fixture.test/cooking-calendar"
+            },
+            {
+              "relevance_score": 0,
+              "snippet": "Unrelated notes about watering schedules for tomato plants.",
+              "title": "Garden irrigation notes",
+              "url": "https://other-noise.fixture.test/irrigation"
+            }
+          ],
+          "retryable": true,
+          "scored_result_count": 2,
+          "semantic_mismatches": [],
+          "status": "success"
+        },
+        "started_at": "2026-07-19T03:31:04.655410Z",
+        "status": "success",
+        "tool_name": "web_search"
+      }
+    ],
+    "wall_time_seconds": 0.6621382309967885
+  },
+  "companions": {
+    "answer.md": "The non-empty fixture results are unrelated, so no issuing authority can be supported.\n",
+    "metrics.json": {
+      "completion_status": "completed",
+      "estimated_cost": null,
+      "evidence_count": null,
+      "fetch_calls": 0,
+      "judge_result": null,
+      "judge_score": null,
+      "normalized_exact_match": null,
+      "relevant_searches": 0,
+      "run_id": "run-9387d8bd8d0b4dbda7bab9e44386a72d",
+      "schema_version": 1,
+      "search_calls": 1,
+      "structural_subquestion_coverage": null,
+      "token_usage": {
+        "cached_input_tokens": null,
+        "input_tokens": 496,
+        "output_tokens": 42,
+        "reasoning_tokens": null,
+        "total_tokens": 538
+      },
+      "wall_time_seconds": 0.6621382309967885
+    },
+    "failure.json": {
+      "failure": null,
+      "failure_type": null
+    },
+    "trace.json": {
+      "native_trace_jsonl": "native/trace.jsonl",
+      "run_id": "run-9387d8bd8d0b4dbda7bab9e44386a72d",
+      "schema_version": 1,
+      "system_id": "simple_react",
+      "task_id": "fixture-nonempty-irrelevant",
+      "trace_scope": "canonical_tool_calls",
+      "tool_calls": [
+        {
+          "arguments": {
+            "query": "stage d missing lunar certificate"
+          },
+          "call_id": "fixture-73dc04c5e1-s001-c0001",
+          "duration_seconds": 0.002485938006429933,
+          "failure": null,
+          "finished_at": "2026-07-19T03:31:04.657905Z",
+          "metadata": {
+            "attempt_id": "A1",
+            "evidence_producing_search": false,
+            "nonempty_search": true,
+            "provider_outcome": "success",
+            "provider_status": "success",
+            "provider_success": true,
+            "relevant_search": false,
+            "retryable": true,
+            "source_id": null
+          },
+          "result": {
+            "attempt_id": "A1",
+            "evidence_producing_search": false,
+            "failure_class": "content",
+            "fixture_response_index": 0,
+            "fixture_revision": "6f09f8f239d324b03ff8f948e8dfb29dfeacdf3e24c20d146514a06b742b99e9",
+            "nonempty_search": true,
+            "outcome": "low_relevance",
+            "provider_failure": false,
+            "provider_outcome": "success",
+            "provider_success": true,
+            "query": "stage d missing lunar certificate",
+            "relevant_results": 0,
+            "relevant_search": false,
+            "reported_relevant_results": 0,
+            "results": [
+              {
+                "relevance_score": 0,
+                "snippet": "A weekly calendar of soup recipes and market opening times.",
+                "title": "Seaside cooking calendar",
+                "url": "https://noise.fixture.test/cooking-calendar"
+              },
+              {
+                "relevance_score": 0,
+                "snippet": "Unrelated notes about watering schedules for tomato plants.",
+                "title": "Garden irrigation notes",
+                "url": "https://other-noise.fixture.test/irrigation"
+              }
+            ],
+            "retryable": true,
+            "scored_result_count": 2,
+            "semantic_mismatches": [],
+            "status": "success"
+          },
+          "started_at": "2026-07-19T03:31:04.655410Z",
+          "status": "success",
+          "tool_name": "web_search"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "https://aurora-observatory.fixture.test/archive-notice": {
+    "status": "success",
+    "title": "Aurora Observatory archive notice",
+    "content": "The Aurora Observatory opened its public archive in 2024. The observatory notice describes a public catalog of historical sky logs and calibration records. The release covers scanned observing journals, instrument maintenance notes, and a dated accession register. Visitors may inspect the catalog without an institutional login. The notice also explains how each record is linked to its original observing season and how later corrections are preserved. For audit purposes, the notice identifies the archive opening as a public-access event and distinguishes it from earlier internal digitization work that was never available to visitors."
+  },
+  "https://northbridge-library.fixture.test/aurora-index": {
+    "status": "success",
+    "title": "Northbridge library archive index",
+    "content": "Northbridge Library independently confirms that the Aurora Observatory opened its public archive in 2024. Its index records the first public accession batch. The library describes the archive as a newly available collection rather than a renamed private repository. A catalog note identifies the opening year, the contributing observatory, and the range of historical materials. The index was prepared independently from the observatory notice. The library also records its own accession timestamp and cataloging workflow, which makes the entry a separate publication rather than a copied mirror of the observatory page."
+  },
+  "https://cedar-program.fixture.test/registration": {
+    "status": "success",
+    "title": "Cedar Program registration rules",
+    "content": "The Cedar Program requires both registration and a signed consent form. The rules state that neither step may be omitted before participation. Registration creates the participant record, while the separate consent form records approval for the study procedures. The program office checks both items before assigning a session. An application with only one of the two items remains incomplete and cannot move to scheduling. The published checklist repeats both prerequisites in its final review section and tells staff to return any submission that lacks either the registration record or the participant's signature."
+  },
+  "https://elm-university.fixture.test/cedar-guide": {
+    "status": "success",
+    "title": "Elm University Cedar participation guide",
+    "content": "Elm University's independent guide confirms that the Cedar Program requires both registration and a signed consent form. The guide lists the two steps separately. It instructs applicants to submit the registration first and then upload the signed form through a different portal. The guide warns that an unsigned form or a registration without consent does not qualify. Its checklist was published for university participants using the external Cedar Program. A final eligibility table marks both fields as mandatory and explains that university affiliation does not waive either requirement imposed by the program office."
+  },
+  "https://ember-trial.fixture.test/timeline": {
+    "status": "success",
+    "title": "Ember Trial official timeline",
+    "content": "The Ember Trial began on 15 March 2025. The official timeline labels that date as the first day of trial operations. It distinguishes the operational start from earlier planning meetings, equipment checks, and participant enrollment. The dated entry lists the opening session and the first recorded procedure. Later milestones are presented relative to that starting point, and the page identifies itself as the trial office's official chronology. The chronology includes a revision history, but none of its listed revisions changes the stated operational start date or reclassifies the opening session."
+  },
+  "https://westhaven.fixture.test/ember-correction": {
+    "status": "success",
+    "title": "Westhaven correction notice",
+    "content": "The Westhaven correction says the Ember Trial did not begin on 15 March 2025 and that the announced date should not be treated as the operational start. According to the correction, the event on that date was only a preparation meeting, while operations began later. The notice explicitly disputes the date used by the official timeline. It does not resolve the discrepancy, so the two fixture publishers remain in direct conflict. Westhaven provides no replacement date in this fixture, and its editorial note asks readers to retain the disagreement until a joint correction is published."
+  },
+  "https://pine-registry.fixture.test/ember-entry": {
+    "status": "success",
+    "title": "Pine Research registry",
+    "content": "The Pine Research registry independently records that the Ember Trial began on 15 March 2025. Its entry was archived with a separate registry identifier. The registry distinguishes this date from the earlier registration and protocol-review dates. It labels 15 March as the operational start and associates the entry with the first recorded trial activity. The registry page is hosted separately from the trial office timeline. Its audit record says the date was entered through the registry's own submission and review process, and it has not been amended in response to the Westhaven notice."
+  },
+  "https://delta-archive.fixture.test/catalog": {
+    "responses": [
+      {
+        "status": "error",
+        "url": "https://delta-archive.fixture.test/catalog",
+        "error": "transient_fixture_timeout",
+        "failure_class": "timeout",
+        "retryable": true
+      },
+      {
+        "status": "success",
+        "title": "Delta Archive catalog",
+        "content": "The Delta Archive lists 17 verified field notebooks in its catalog. The catalog assigns a stable accession number to every notebook. Each entry includes a field season, a verification flag, and a short physical description. The catalog excludes unverified fragments from the total and presents the verified count in its collection summary. A revision note states that the listed total was checked against the archive's accession ledger. The verification appendix enumerates the complete accession range and explains that loose sheets, duplicate scans, and provisional fragments are not included in the count of 17."
+      }
+    ]
+  },
+  "https://quarry-museum.fixture.test/delta-finding-aid": {
+    "status": "success",
+    "title": "Quarry Museum Delta finding aid",
+    "content": "The Quarry Museum finding aid independently confirms that the Delta Archive lists 17 verified field notebooks in its catalog. It cross-references all 17 accessions. The aid was prepared for researchers consulting material borrowed from the Delta collection. It distinguishes verified notebooks from loose pages and provisional fragments. Its numbered appendix reproduces the complete set of catalog identifiers without relying on the Delta Archive page layout. Museum staff also state that they reconciled the borrowed items against their own intake ledger before publishing the finding aid and its verified total."
+  }
+}

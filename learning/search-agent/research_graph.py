@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from hashlib import sha256
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -18,12 +20,29 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from evidence_graph import independent_evidence_source_ids
+from adaptive_control import (
+    build_control_assessment,
+    decide_control_action,
+    decision_id_for,
+    initialize_control_state,
+    record_control_decision,
+)
+from evidence_graph import (
+    EVIDENCE_GRAPH_VERSION,
+    EvidenceQuoteMismatch,
+    allowed_report_caveat_lines,
+    corroborating_evidence_source_ids,
+    normalize_evidence_text,
+    validate_evidence_graph,
+)
+from retrieval_quality import classify_query_task_type
 from research_state import (
+    AdaptiveControlState,
     BudgetState,
     EvidenceStance,
     ResearchEvent,
     ResearchPlan,
+    ResearchStrategy,
     SubQuestion,
     SubquestionStatus,
     TongAgentState,
@@ -35,10 +54,681 @@ Planner = Callable[[str, int], ResearchPlan]
 BudgetSnapshot = Callable[[], dict[str, Any]]
 BudgetConfigure = Callable[[list[str]], None]
 BudgetActivate = Callable[[str | None], None]
+BudgetGrant = Callable[..., dict[str, Any]]
+ReportRead = Callable[[], str]
+ReportClear = Callable[[], None]
+TokenBudgetSnapshot = Callable[[], dict[str, Any]]
+TokenBudgetCanStart = Callable[[str], bool]
+ModelBudgetSnapshot = Callable[[], dict[str, Any]]
 EvidenceRecord = Callable[..., dict[str, Any]]
+PhaseActionDrain = Callable[[TongAgentState], dict[str, Any] | None]
+PhaseActionApply = Callable[[TongAgentState, str, dict[str, Any]], dict[str, Any]]
+PhaseDecisionCaller = Callable[[TongAgentState, str, bool, str | None], dict[str, Any]]
 PlanIdFactory = Callable[[], str]
 Route = Literal["research", "report"]
+ControlRoute = Literal["select", "report"]
 SOURCE_ID_PATTERN = re.compile(r"^S[1-9][0-9]*$")
+RESEARCH_PHASES = frozenset(
+    {
+        "NEED_QUERY",
+        "NEED_RESULT_SELECTION",
+        "NEED_EVIDENCE",
+        "SQ_DONE",
+        "SQ_BLOCKED",
+    }
+)
+
+
+def _phase_event(
+    events: list[ResearchEvent],
+    *,
+    plan_id: str,
+    subquestion_id: str,
+    previous: str,
+    current: str,
+    action: str,
+    elapsed_seconds: float = 0.0,
+    details: dict[str, Any] | None = None,
+) -> list[ResearchEvent]:
+    """Persist one code-owned FSM transition in the normal audit stream."""
+
+    return append_research_event(
+        events,
+        "research_phase_transition",
+        plan_id=plan_id,
+        subquestion_id=subquestion_id,
+        details={
+            "from": previous,
+            "to": current,
+            "action": action,
+            "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            **(details or {}),
+        },
+    )
+
+
+def _phase_rejection(
+    runtime: ToolRuntime,
+    *,
+    tool_name: str,
+    expected: str,
+) -> Command:
+    """Reject a model action outside its one permitted FSM phase."""
+
+    actual = str(runtime.state.get("active_research_phase") or "NEED_QUERY")
+    events = list(runtime.state.get("research_events", []))
+    plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+    active_id = str(runtime.state.get("active_subquestion_id") or "")
+    events = append_research_event(
+        events,
+        "invalid_phase_action",
+        plan_id=str(plan.get("plan_id", "")),
+        subquestion_id=active_id,
+        details={"tool": tool_name, "expected_phase": expected, "actual_phase": actual},
+    )
+    return Command(
+        update={
+            "research_events": events,
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "rejected",
+                            "failure_type": "invalid_phase_action",
+                            "expected_phase": expected,
+                            "actual_phase": actual,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=runtime.tool_call_id,
+                    name=tool_name,
+                    status="error",
+                )
+            ],
+        }
+    )
+
+
+def _compact_quote_candidates(content: str, *, limit: int = 3) -> list[str]:
+    """Return real continuous excerpts; source text is never model-controlled."""
+
+    normalized = " ".join(content.split())
+    if not normalized:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    candidates: list[str] = []
+    for sentence in sentences:
+        excerpt = sentence.strip()
+        if len(excerpt) < 24:
+            continue
+        candidates.append(excerpt[:800])
+        if len(candidates) >= limit:
+            return candidates
+    return candidates or [normalized[: min(800, len(normalized))]]
+
+
+class _PhaseActionStore:
+    """In-process handoff from one phase-decision tool to the FSM controller."""
+
+    def __init__(self) -> None:
+        from threading import RLock
+
+        self._lock = RLock()
+        self._actions: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._ignored: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+
+    @staticmethod
+    def _key(runtime: ToolRuntime) -> tuple[str, str, int]:
+        plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+        return (
+            str(plan.get("plan_id", "")),
+            str(runtime.state.get("active_subquestion_id") or ""),
+            int(runtime.state.get("active_phase_turn_index", 0)),
+        )
+
+    def claim(self, runtime: ToolRuntime, *, tool_name: str, expected: str) -> bool:
+        key = self._key(runtime)
+        actual = str(runtime.state.get("active_research_phase") or "NEED_QUERY")
+        with self._lock:
+            if actual != expected or key in self._actions:
+                self._ignored.setdefault(key, []).append(
+                    {
+                        "tool": tool_name,
+                        "expected_phase": expected,
+                        "actual_phase": actual,
+                        "reason": "phase_mismatch"
+                        if actual != expected
+                        else "already_claimed",
+                    }
+                )
+                return False
+            self._actions[key] = {"tool": tool_name, "expected_phase": expected}
+            return True
+
+    def complete(self, runtime: ToolRuntime, payload: dict[str, Any]) -> None:
+        key = self._key(runtime)
+        with self._lock:
+            self._actions[key] = {**self._actions[key], **payload}
+
+    def drain(self, state: TongAgentState) -> dict[str, Any] | None:
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        key = (
+            str(plan.get("plan_id", "")),
+            str(state.get("active_subquestion_id") or ""),
+            int(state.get("active_phase_turn_index", 0)),
+        )
+        with self._lock:
+            action = self._actions.pop(key, None)
+            ignored = self._ignored.pop(key, [])
+        if action is None and not ignored:
+            return None
+        return {"action": action, "ignored": ignored}
+
+
+class QueryDecision(BaseModel):
+    """The only structured model output accepted in ``NEED_QUERY``."""
+
+    query: str = Field(min_length=3, max_length=180)
+    task_type: Literal[
+        "single_fact_lookup",
+        "list_or_enumeration",
+        "comparison",
+        "date_or_numeric_lookup",
+    ]
+
+
+class ResultSelectionDecision(BaseModel):
+    """The only structured model output accepted in result selection."""
+
+    result_id: str = Field(pattern=r"^R[1-9][0-9]*$")
+    reason: str = Field(min_length=1, max_length=240)
+
+
+class EvidenceDecision(BaseModel):
+    """The only structured model output accepted in evidence registration."""
+
+    claim: str = Field(min_length=16, max_length=600)
+    quote_id: str = Field(pattern=r"^Q[1-9][0-9]*$")
+    stance: Literal["support", "contradict"] = "support"
+
+
+def phase_decision_schema(phase: str) -> type[BaseModel]:
+    """Return the one schema allowed for the code-owned FSM phase."""
+
+    schemas: dict[str, type[BaseModel]] = {
+        "NEED_QUERY": QueryDecision,
+        "NEED_RESULT_SELECTION": ResultSelectionDecision,
+        "NEED_EVIDENCE": EvidenceDecision,
+    }
+    try:
+        return schemas[phase]
+    except KeyError as exc:
+        raise ValueError(f"no model decision schema for phase {phase!r}") from exc
+
+
+def _safe_phase_output_summary(value: Any, *, limit: int = 480) -> str:
+    """Keep malformed model output auditable without replaying large context."""
+
+    if value is None:
+        return "<empty>"
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return " ".join(rendered.split())[:limit]
+
+
+def build_phase_decision_prompt(
+    state: TongAgentState,
+    *,
+    phase: str,
+    repair: bool,
+    validation_error: str | None = None,
+) -> str:
+    """Build the compact initial or repair prompt for one phase decision."""
+
+    schema = phase_decision_schema(phase)
+    context = dict(state.get("phase_decision_context", {}))
+    active_id = str(state.get("active_subquestion_id") or "")
+    if repair:
+        # This deliberately contains no prior chat/tool history and no previous
+        # action result: a repair may only choose the current phase action.
+        return (
+            "Return one valid JSON object and nothing else.\n"
+            f"CURRENT PHASE: {phase}\n"
+            f"ACTIVE SUBQUESTION: {active_id}\n"
+            f"REQUIRED SCHEMA: {json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n"
+            f"PREVIOUS VALIDATION ERROR: {validation_error or 'invalid_model_action'}\n"
+            "COMPACT CONTEXT:\n"
+            f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+        )
+    return (
+        "Choose exactly one legal next research action. Return only JSON matching "
+        "the required schema; do not answer the user question or invoke tools.\n"
+        f"CURRENT PHASE: {phase}\n"
+        f"ACTIVE SUBQUESTION: {active_id}\n"
+        f"REQUIRED SCHEMA: {json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n"
+        "COMPACT CONTEXT:\n"
+        f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def build_model_phase_decider(model: BaseChatModel) -> PhaseDecisionCaller:
+    """Create the production fallback structured decision caller.
+
+    Evaluation injects an accounted version.  The standalone CLI still uses
+    this path and keeps exactly the same schema and repair semantics.
+    """
+
+    def decide(
+        state: TongAgentState,
+        phase: str,
+        repair: bool,
+        validation_error: str | None = None,
+    ) -> dict[str, Any]:
+        schema = phase_decision_schema(phase)
+        prompt = build_phase_decision_prompt(
+            state,
+            phase=phase,
+            repair=repair,
+            validation_error=validation_error,
+        )
+        try:
+            response = model.with_structured_output(schema, include_raw=True).invoke(
+                prompt
+            )
+            parsed = response.get("parsed") if isinstance(response, dict) else response
+            decision = (
+                parsed.model_dump(mode="python")
+                if isinstance(parsed, BaseModel)
+                else schema.model_validate(parsed).model_dump(mode="python")
+            )
+        except Exception as exc:  # Provider and parse errors share repair path.
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": _safe_phase_output_summary(
+                    getattr(exc, "errors", lambda: None)()
+                    if hasattr(exc, "errors")
+                    else str(exc)
+                ),
+            }
+        return {"status": "success", "decision": decision}
+
+    return decide
+
+
+def build_phase_research_tools(
+    *,
+    search_tool: BaseTool,
+    fetch_tool: BaseTool,
+    evidence_record: EvidenceRecord,
+    budget_snapshot: BudgetSnapshot,
+    legacy_fixture_aliases: bool = False,
+) -> list[BaseTool]:
+    """Build phase decisions; only the outer FSM controller mutates state."""
+
+    del legacy_fixture_aliases
+    store = _PhaseActionStore()
+
+    def ignored(tool_name: str) -> str:
+        return json.dumps(
+            {
+                "status": "ignored",
+                "failure_type": "invalid_phase_action",
+                "tool": tool_name,
+            },
+            ensure_ascii=False,
+        )
+
+    @tool("choose_search_query", return_direct=True)
+    def choose_search_query(
+        query: str,
+        task_type: Literal[
+            "single_fact_lookup",
+            "list_or_enumeration",
+            "comparison",
+            "date_or_numeric_lookup",
+        ],
+        runtime: ToolRuntime,
+    ) -> str:
+        """Choose one atomic query; the controller owns the transition."""
+        if not store.claim(
+            runtime, tool_name="choose_search_query", expected="NEED_QUERY"
+        ):
+            return ignored("choose_search_query")
+        normalized = " ".join(query.split())
+        if not normalized or len(normalized.split()) > 14:
+            store.complete(runtime, {"status": "invalid_query", "elapsed_seconds": 0.0})
+            return json.dumps({"status": "invalid_query"})
+        started = time.perf_counter()
+        try:
+            payload = json.loads(
+                search_tool.invoke({"query": normalized, "max_results": 5})
+            )
+        except Exception as exc:
+            payload = {"status": "error", "error": type(exc).__name__, "results": []}
+        candidates = []
+        for index, result in enumerate(
+            payload.get("results", []) if isinstance(payload, dict) else [], start=1
+        ):
+            if not isinstance(result, dict) or not str(result.get("url", "")):
+                continue
+            tier = str(result.get("relevance_tier", "uncertain"))
+            if tier != "irrelevant":
+                candidates.append(
+                    {
+                        "result_id": f"R{index}",
+                        "title": str(result.get("title", "")),
+                        "url": str(result["url"]),
+                        "snippet": str(result.get("snippet", ""))[:500],
+                        "provider": str(result.get("provider", "")),
+                        "rank": int(result.get("final_rank", index) or index),
+                        "relevance": tier,
+                    }
+                )
+        search_id = f"{runtime.state.get('active_subquestion_id')}-search-{runtime.state.get('active_phase_turn_index', 0)}"
+        scope = {
+            "search_id": search_id,
+            "subquestion_id": runtime.state.get("active_subquestion_id"),
+            "candidates": candidates,
+        }
+        store.complete(
+            runtime,
+            {
+                "status": "success" if candidates else "no_candidates",
+                "action": "search",
+                "scope": scope,
+                "task_type": task_type,
+                "elapsed_seconds": time.perf_counter() - started,
+                "search_quality": payload.get("search_quality")
+                if isinstance(payload, dict)
+                else None,
+            },
+        )
+        return json.dumps(
+            {
+                "status": "success" if candidates else "no_candidates",
+                "search_id": search_id,
+                "candidates": [
+                    {key: item[key] for key in item if key != "url"}
+                    for item in candidates
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    @tool("select_search_result", return_direct=True)
+    def select_search_result(result_id: str, reason: str, runtime: ToolRuntime) -> str:
+        """Select one scoped R#; the controller owns the transition."""
+        del reason
+        if not store.claim(
+            runtime, tool_name="select_search_result", expected="NEED_RESULT_SELECTION"
+        ):
+            return ignored("select_search_result")
+        scope = runtime.state.get("active_search_scope", {})
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        candidates = (
+            [item for item in scope.get("candidates", []) if isinstance(item, dict)]
+            if isinstance(scope, dict) and scope.get("subquestion_id") == active_id
+            else []
+        )
+        selected = next(
+            (item for item in candidates if item.get("result_id") == result_id), None
+        )
+        if selected is None:
+            store.complete(
+                runtime,
+                {
+                    "status": "invalid_result_id",
+                    "action": "fetch",
+                    "elapsed_seconds": 0.0,
+                },
+            )
+            return json.dumps({"status": "invalid_result_id"})
+        started = time.perf_counter()
+        attempts: list[dict[str, Any]] = []
+        tried_hosts: set[str] = set()
+        successful: dict[str, Any] | None = None
+        eligible_candidates: list[dict[str, Any]] = []
+        for candidate in [
+            selected,
+            *[item for item in candidates if item is not selected],
+        ]:
+            url = str(candidate["url"])
+            host = re.sub(r"^https?://([^/]+).*$", r"\1", url).casefold()
+            if host in tried_hosts:
+                continue
+            tried_hosts.add(host)
+            eligible_candidates.append(candidate)
+        for candidate in eligible_candidates[:2]:
+            url = str(candidate["url"])
+            try:
+                payload = json.loads(
+                    fetch_tool.invoke({"url": url, "max_chars": 12_000})
+                )
+            except Exception as exc:
+                payload = {"status": "error", "error": type(exc).__name__, "url": url}
+            attempts.append(
+                {
+                    "result_id": candidate["result_id"],
+                    "url": url,
+                    "status": payload.get("status"),
+                }
+            )
+            if (
+                isinstance(payload, dict)
+                and payload.get("status") == "success"
+                and payload.get("source_id")
+            ):
+                successful = {**payload, "result_id": candidate["result_id"]}
+                break
+        elapsed = time.perf_counter() - started
+        if successful is None:
+            fallback_reason = (
+                "no_eligible_fallback_candidate"
+                if len(eligible_candidates) < 2
+                else "eligible_fallback_failed"
+            )
+            store.complete(
+                runtime,
+                {
+                    "status": "fetch_failed",
+                    "action": "fetch",
+                    "attempts": attempts,
+                    "fallback_reason": fallback_reason,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+            return json.dumps(
+                {
+                    "status": "fetch_failed",
+                    "attempts": attempts,
+                    "fallback_reason": fallback_reason,
+                },
+                ensure_ascii=False,
+            )
+        quotes = _compact_quote_candidates(str(successful.get("content", "")))
+        fetch_scope = {
+            "search_id": scope.get("search_id"),
+            "result_id": successful["result_id"],
+            "source_id": successful["source_id"],
+            "quote_candidates": {
+                f"Q{index}": quote for index, quote in enumerate(quotes, start=1)
+            },
+        }
+        store.complete(
+            runtime,
+            {
+                "status": "success",
+                "action": "fetch",
+                "scope": fetch_scope,
+                "attempts": attempts,
+                "elapsed_seconds": elapsed,
+                "acquisition_method": successful.get("acquisition_method"),
+            },
+        )
+        return json.dumps(
+            {
+                "status": "success",
+                "source_id": successful["source_id"],
+                "quote_candidates": list(fetch_scope["quote_candidates"]),
+            },
+            ensure_ascii=False,
+        )
+
+    @tool("propose_evidence", return_direct=True)
+    def propose_evidence(
+        claim: str,
+        quote_id: str,
+        runtime: ToolRuntime,
+        stance: Literal["support", "contradict"] = "support",
+    ) -> str:
+        """Propose one claim and real Q#; the controller owns the transition."""
+        if not store.claim(
+            runtime, tool_name="propose_evidence", expected="NEED_EVIDENCE"
+        ):
+            return ignored("propose_evidence")
+        scope = runtime.state.get("active_fetch_scope", {})
+        quotes = scope.get("quote_candidates", {}) if isinstance(scope, dict) else {}
+        source_id = str(scope.get("source_id", "")) if isinstance(scope, dict) else ""
+        quote = quotes.get(quote_id) if isinstance(quotes, dict) else None
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        requirement_id = f"{active_id}:{source_id}:primary"
+        attempts = dict(runtime.state.get("active_evidence_attempts", {}))
+        count = int(attempts.get(requirement_id, 0))
+        if not source_id or not isinstance(quote, str) or count >= 2:
+            store.complete(
+                runtime,
+                {
+                    "status": "invalid_evidence",
+                    "action": "record_evidence",
+                    "requirement_id": requirement_id,
+                    "elapsed_seconds": 0.0,
+                },
+            )
+            return json.dumps({"status": "invalid_evidence"})
+        started = time.perf_counter()
+        try:
+            result = evidence_record(
+                source_id=source_id,
+                claim=claim,
+                quote=quote,
+                stance="supports" if stance == "support" else "contradicts",
+            )
+        except (EvidenceQuoteMismatch, ValueError) as exc:
+            store.complete(
+                runtime,
+                {
+                    "status": "evidence_rejected",
+                    "action": "record_evidence",
+                    "source_id": source_id,
+                    "requirement_id": requirement_id,
+                    "attempt": count + 1,
+                    "retryable": count == 0,
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "failure_type": type(exc).__name__,
+                },
+            )
+            return json.dumps(
+                {
+                    "status": "evidence_rejected",
+                    "retryable": count == 0,
+                    "quote_candidates": list(quotes),
+                },
+                ensure_ascii=False,
+            )
+        store.complete(
+            runtime,
+            {
+                "status": "success",
+                "action": "record_evidence",
+                "source_id": source_id,
+                "requirement_id": requirement_id,
+                "attempt": count + 1,
+                "claim_id": result.get("claim", {}).get("claim_id"),
+                "elapsed_seconds": time.perf_counter() - started,
+            },
+        )
+        return json.dumps(
+            {
+                "status": "success",
+                "claim_id": result.get("claim", {}).get("claim_id"),
+                "source_id": source_id,
+            },
+            ensure_ascii=False,
+        )
+
+    def apply_structured_decision(
+        state: TongAgentState,
+        phase: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one pre-validated model decision through the normal tools.
+
+        The tool implementations own all network and evidence side effects.  A
+        synthetic ``ToolRuntime`` only supplies their existing read-only state
+        view; phase mutation remains exclusively in ``fsm_controller``.
+        """
+
+        runtime = ToolRuntime(
+            state=state,
+            context=None,
+            config={},
+            stream_writer=lambda _value: None,
+            tool_call_id=(
+                "structured-phase-"
+                f"{state.get('active_subquestion_id') or 'none'}-"
+                f"{state.get('active_phase_turn_index', 0)}"
+            ),
+            store=None,
+        )
+        try:
+            if phase == "NEED_QUERY":
+                item = QueryDecision.model_validate(decision)
+                response = choose_search_query.func(
+                    query=item.query,
+                    task_type=item.task_type,
+                    runtime=runtime,
+                )
+            elif phase == "NEED_RESULT_SELECTION":
+                item = ResultSelectionDecision.model_validate(decision)
+                response = select_search_result.func(
+                    result_id=item.result_id,
+                    reason=item.reason,
+                    runtime=runtime,
+                )
+            elif phase == "NEED_EVIDENCE":
+                item = EvidenceDecision.model_validate(decision)
+                response = propose_evidence.func(
+                    claim=item.claim,
+                    quote_id=item.quote_id,
+                    stance=item.stance,
+                    runtime=runtime,
+                )
+            else:
+                raise ValueError(f"unsupported structured phase: {phase}")
+        except Exception as exc:
+            return {
+                "status": "invalid_model_action",
+                "validation_error": type(exc).__name__,
+                "raw_output_summary": _safe_phase_output_summary(decision),
+            }
+        return {
+            "status": "success",
+            "tool_response": _safe_phase_output_summary(response),
+        }
+
+    phase_tools = [choose_search_query, select_search_result, propose_evidence]
+    for item in phase_tools:
+        item.metadata = {
+            **(item.metadata or {}),
+            "phase_action_drain": store.drain,
+            "phase_action_apply": apply_structured_decision,
+        }
+    return phase_tools
 
 
 class DraftSubquestion(BaseModel):
@@ -55,6 +745,21 @@ class PlanDraft(BaseModel):
     objective: str = Field(min_length=3)
     subquestions: list[DraftSubquestion] = Field(min_length=1)
     completion_criteria: list[str] = Field(default_factory=list)
+
+
+class ActiveResearchContext(BaseModel):
+    """Compact code-owned state injected before one active SQ is researched."""
+
+    plan_id: str
+    active_subquestion: dict[str, Any]
+    subquestion_status: str
+    query_task_type: str
+    remaining_search_budget: int
+    remaining_fetch_budget: int
+    remaining_model_calls: int | None
+    relevant_sources: list[dict[str, Any]] = Field(default_factory=list)
+    canonical_claims: list[dict[str, Any]] = Field(default_factory=list)
+    unresolved_requirements: list[str] = Field(default_factory=list)
 
 
 def create_research_plan(
@@ -137,6 +842,7 @@ def create_research_plan(
                 "evidence_source_ids": [],
                 "claim_ids": [],
                 "conflict_ids": [],
+                "structural_closure_validated": False,
                 "note": "",
             }
         )
@@ -154,6 +860,7 @@ def create_research_plan(
         "objective": " ".join((objective or normalized_topic).split()),
         "planner": planner,
         "status": "pending",
+        "structural_subquestion_coverage": 0.0,
         "coverage": 0.0,
         "completion_criteria": criteria,
         "subquestions": durable,
@@ -232,13 +939,30 @@ User question: {topic}"""
     return plan
 
 
-def calculate_plan_coverage(plan: ResearchPlan) -> float:
-    """Calculate deterministic covered-subquestion coverage."""
+def calculate_structural_subquestion_coverage(plan: ResearchPlan) -> float | None:
+    """Calculate the fraction of structurally covered subquestions.
+
+    This is an internal workflow metric.  It does not measure answer accuracy,
+    semantic facet coverage, citation entailment, or overall completeness.
+    """
+    if int(plan.get("evidence_schema_version", 0)) < EVIDENCE_GRAPH_VERSION:
+        return None
     subquestions = plan.get("subquestions", [])
     if not subquestions:
         return 0.0
-    covered = sum(item["status"] == "covered" for item in subquestions)
+    covered = sum(
+        item["status"] == "covered"
+        and item.get("structural_closure_validated") is True
+        and bool(item.get("claim_ids"))
+        and bool(item.get("evidence_source_ids"))
+        for item in subquestions
+    )
     return round(covered / len(subquestions), 4)
+
+
+def calculate_plan_coverage(plan: ResearchPlan) -> float | None:
+    """Compatibility alias for `calculate_structural_subquestion_coverage`."""
+    return calculate_structural_subquestion_coverage(plan)
 
 
 def refresh_plan_status(plan: ResearchPlan) -> ResearchPlan:
@@ -249,9 +973,20 @@ def refresh_plan_status(plan: ResearchPlan) -> ResearchPlan:
     for item in subquestions:
         item.setdefault("claim_ids", [])
         item.setdefault("conflict_ids", [])
-    updated["coverage"] = calculate_plan_coverage(updated)
+        item.setdefault("structural_closure_validated", False)
+    structural_coverage = calculate_structural_subquestion_coverage(updated)
+    updated["structural_subquestion_coverage"] = structural_coverage
+    # Deprecated compatibility alias retained for Stage 03A-D checkpoints.
+    updated["coverage"] = structural_coverage
     statuses = {item["status"] for item in subquestions}
-    if subquestions and statuses == {"covered"}:
+    schema_current = (
+        int(updated.get("evidence_schema_version", 0)) >= EVIDENCE_GRAPH_VERSION
+    )
+    if (
+        subquestions
+        and statuses == {"covered"}
+        and (not schema_current or structural_coverage == 1.0)
+    ):
         updated["status"] = "completed"
     elif statuses.intersection({"pending", "researching"}):
         attempted = any(item["attempts"] for item in subquestions)
@@ -351,6 +1086,11 @@ def transition_subquestion(
         msg = "Blocked subquestions require an explanatory note"
         raise ValueError(msg)
     target["status"] = status
+    identifiers_changed = bool(evidence or claims or conflicts)
+    if status != "covered":
+        target["structural_closure_validated"] = False
+    elif identifiers_changed:
+        target["structural_closure_validated"] = False
     if increment_attempt:
         target["attempts"] += 1
     if evidence:
@@ -447,6 +1187,7 @@ def invalid_covered_subquestions(
     }
     evidence_units = snapshot.get("evidence_units", [])
     conflicts = snapshot.get("conflicts", [])
+    graph_integrity_errors = validate_evidence_graph(snapshot)
     invalid: dict[str, list[str]] = {}
     for item in plan.get("subquestions", []):
         if item.get("status") != "covered":
@@ -455,6 +1196,17 @@ def invalid_covered_subquestions(
         claim_ids = list(dict.fromkeys(item.get("claim_ids", [])))
         claim_id_set = set(claim_ids)
         reasons: list[str] = []
+        if graph_integrity_errors:
+            reasons.append(
+                "evidence graph integrity validation failed: "
+                + "; ".join(graph_integrity_errors)
+            )
+        scoped_usage = snapshot.get("subquestion_usage", {}).get(subquestion_id, {})
+        scoped_relevant = scoped_usage.get("relevant_searches")
+        if scoped_relevant is None:
+            reasons.append("relevant search metric is unavailable for this subquestion")
+        elif int(scoped_relevant) < 1:
+            reasons.append("missing a relevant search in this subquestion")
         if not claim_ids:
             reasons.append("missing canonical claims")
         valid_claim_ids = {
@@ -498,8 +1250,8 @@ def invalid_covered_subquestions(
             for item in subquestions
             for claim_id in item.get("claim_ids", [])
         }
-        independent_count = len(
-            independent_evidence_source_ids(
+        corroborating_count = len(
+            corroborating_evidence_source_ids(
                 source_ids=plan_source_ids,
                 sources=snapshot.get("successful_sources", []),
                 evidence_units=evidence_units,
@@ -507,23 +1259,44 @@ def invalid_covered_subquestions(
             )
         )
         minimum_sources = int(snapshot.get("min_successful_sources", 0))
-        if independent_count < minimum_sources:
+        if corroborating_count < minimum_sources:
             last_id = str(subquestions[-1].get("id", ""))
             invalid.setdefault(last_id, []).append(
-                f"only {independent_count} of {minimum_sources} required independent sources"
+                f"only {corroborating_count} of {minimum_sources} required "
+                "corroborating source groups"
             )
         required_searches = min(
             int(snapshot.get("max_searches", 0)), max(1, len(subquestions))
         )
-        successful_searches = int(
-            snapshot.get("successful_searches", snapshot.get("search_calls", 0))
-        )
-        if successful_searches < required_searches:
+        raw_relevant_searches = snapshot.get("relevant_searches")
+        if raw_relevant_searches is None:
             last_id = str(subquestions[-1].get("id", ""))
             invalid.setdefault(last_id, []).append(
-                f"only {successful_searches} of {required_searches} required successful searches"
+                "the relevant search metric is unavailable"
+            )
+        elif int(raw_relevant_searches) < required_searches:
+            relevant_searches = int(raw_relevant_searches)
+            last_id = str(subquestions[-1].get("id", ""))
+            invalid.setdefault(last_id, []).append(
+                f"only {relevant_searches} of {required_searches} required relevant searches"
             )
     return invalid
+
+
+def audit_structural_subquestion_closures(
+    plan: ResearchPlan, snapshot: dict[str, Any]
+) -> tuple[ResearchPlan, dict[str, list[str]]]:
+    """Recompute durable closure-validation markers from the canonical ledger."""
+    invalid = invalid_covered_subquestions(plan, snapshot)
+    audited = deepcopy(plan)
+    graph_required = int(audited.get("evidence_schema_version", 0)) >= 1
+    for item in audited.get("subquestions", []):
+        item["structural_closure_validated"] = bool(
+            graph_required
+            and item.get("status") == "covered"
+            and str(item.get("id", "")) not in invalid
+        )
+    return refresh_plan_status(audited), invalid
 
 
 def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
@@ -557,8 +1330,127 @@ def build_source_ledger_tool(budget_snapshot: BudgetSnapshot) -> BaseTool:
     return get_source_ledger
 
 
+def _evidence_retry_identity(
+    subquestion_id: str,
+    source_id: str,
+    requirement_id: str,
+    quote: str,
+) -> tuple[str, str]:
+    """Identify evidence attempts independently of model-mutated claim wording."""
+
+    quote_digest = sha256(normalize_evidence_text(quote).encode()).hexdigest()
+    evidence_key = f"{subquestion_id}:{source_id}:{requirement_id}"
+    return evidence_key, f"{evidence_key}:{quote_digest}:quote_mismatch"
+
+
+def _active_canonical_state(
+    snapshot: dict[str, Any],
+    active_subquestion_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[str]]:
+    """Return supported claims, their evidence, source IDs, and conflict IDs."""
+
+    claims = [
+        dict(item)
+        for item in snapshot.get("claims", [])
+        if item.get("subquestion_id") == active_subquestion_id
+        and item.get("status") in {"supported", "contested"}
+    ]
+    claim_ids = {str(item.get("claim_id", "")) for item in claims}
+    evidence = [
+        dict(item)
+        for item in snapshot.get("evidence_units", [])
+        if str(item.get("claim_id", "")) in claim_ids
+    ]
+    source_ids = list(
+        dict.fromkeys(
+            str(item.get("source_id", "")) for item in evidence if item.get("source_id")
+        )
+    )
+    conflict_ids = [
+        str(item.get("conflict_id", ""))
+        for item in snapshot.get("conflicts", [])
+        if str(item.get("claim_id", "")) in claim_ids
+    ]
+    return claims, evidence, source_ids, conflict_ids
+
+
+def _unresolved_active_requirements(
+    snapshot: dict[str, Any],
+    active_subquestion_id: str,
+) -> list[str]:
+    """Describe the minimum deterministic gates still missing for one SQ."""
+
+    claims, _, source_ids, _ = _active_canonical_state(
+        snapshot,
+        active_subquestion_id,
+    )
+    scoped = snapshot.get("subquestion_usage", {}).get(active_subquestion_id, {})
+    unresolved: list[str] = []
+    if int(scoped.get("relevant_searches") or 0) < 1:
+        unresolved.append("one relevant search")
+    if not source_ids:
+        unresolved.append("one successfully fetched canonical source")
+    if not claims:
+        unresolved.append("one supported canonical claim with exact evidence")
+    return unresolved
+
+
+def _auto_close_after_evidence(
+    *,
+    runtime: ToolRuntime,
+    snapshot: dict[str, Any],
+    events: list[ResearchEvent],
+) -> tuple[ResearchPlan | None, list[ResearchEvent], list[str]]:
+    """Close a locally supported SQ without another model-owned state update."""
+
+    active_id = str(runtime.state.get("active_subquestion_id") or "")
+    plan = cast("ResearchPlan", runtime.state.get("research_plan", {}))
+    if not active_id or not plan:
+        return None, events, ["active subquestion state"]
+    unresolved = _unresolved_active_requirements(snapshot, active_id)
+    if unresolved:
+        return None, events, unresolved
+    claims, _, source_ids, conflict_ids = _active_canonical_state(snapshot, active_id)
+    claim_ids = [str(item.get("claim_id", "")) for item in claims]
+    try:
+        updated = transition_subquestion(
+            plan,
+            active_id,
+            "covered",
+            evidence_source_ids=source_ids,
+            claim_ids=claim_ids,
+            conflict_ids=conflict_ids,
+            note="Minimum canonical evidence was registered; closure was automatic.",
+        )
+        updated, closure_errors = audit_structural_subquestion_closures(
+            updated,
+            snapshot,
+        )
+    except ValueError as exc:
+        return None, events, [str(exc)]
+    if active_id in closure_errors:
+        return None, events, closure_errors[active_id]
+    next_events = append_research_event(
+        events,
+        "subquestion_updated",
+        plan_id=updated["plan_id"],
+        subquestion_id=active_id,
+        details={
+            "status": "covered",
+            "automatic": True,
+            "evidence_source_ids": source_ids,
+            "claim_ids": claim_ids,
+            "conflict_ids": conflict_ids,
+        },
+    )
+    return updated, next_events, []
+
+
 def build_evidence_graph_tools(
-    evidence_record: EvidenceRecord, budget_snapshot: BudgetSnapshot
+    evidence_record: EvidenceRecord,
+    budget_snapshot: BudgetSnapshot,
+    *,
+    auto_update_subquestion: bool = False,
 ) -> list[BaseTool]:
     """Build tools for exact-excerpt registration and graph inspection."""
 
@@ -567,9 +1459,10 @@ def build_evidence_graph_tools(
         source_id: str,
         claim: str,
         quote: str,
+        runtime: ToolRuntime,
         stance: EvidenceStance = "supports",
         claim_id: str = "",
-    ) -> str:
+    ) -> str | Command:
         """Link an exact source excerpt to a code-assigned canonical claim.
 
         The claim must be a self-contained report-ready proposition with a
@@ -577,6 +1470,7 @@ def build_evidence_graph_tools(
         to create it. Pass claim_id only when reusing an existing C# returned by
         a successful earlier call; never invent a C#.
         """
+        events = cast("list[ResearchEvent]", runtime.state.get("research_events", []))
         try:
             result = evidence_record(
                 source_id=source_id,
@@ -585,11 +1479,137 @@ def build_evidence_graph_tools(
                 stance=stance,
                 claim_id=claim_id,
             )
+        except EvidenceQuoteMismatch as exc:
+            active_id = str(runtime.state.get("active_subquestion_id") or "")
+            evidence_key, signature = _evidence_retry_identity(
+                active_id,
+                source_id,
+                "primary",
+                quote,
+            )
+            prior_failures = [
+                item
+                for item in events
+                if item.get("event") == "evidence_registration_failed"
+                and item.get("details", {}).get("evidence_key") == evidence_key
+            ]
+            duplicate = any(
+                item.get("details", {}).get("signature") == signature
+                for item in prior_failures
+            )
+            retryable = not duplicate and not prior_failures
+            status = "duplicate_retry_blocked" if duplicate else "quote_mismatch"
+            payload = {
+                "status": status,
+                "error": str(exc),
+                "retryable": retryable,
+                "candidate_quotes": exc.candidate_quotes,
+                "normalized_similarity": exc.normalized_similarity,
+                "retry_limit": 1,
+            }
+            next_events = append_research_event(
+                events,
+                "evidence_registration_failed",
+                plan_id=str(runtime.state.get("research_plan", {}).get("plan_id", "")),
+                subquestion_id=str(runtime.state.get("active_subquestion_id") or ""),
+                details={
+                    "failure_type": status,
+                    "evidence_key": evidence_key,
+                    "signature": signature,
+                    "retryable": retryable,
+                    "candidate_count": len(exc.candidate_quotes),
+                    "normalized_similarity": exc.normalized_similarity,
+                },
+            )
+            content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            return Command(
+                update={
+                    "research_events": next_events,
+                    "messages": [
+                        ToolMessage(
+                            content=content,
+                            tool_call_id=runtime.tool_call_id,
+                            name="record_evidence",
+                            status="error",
+                        )
+                    ],
+                }
+            )
         except ValueError as exc:
-            result = {"status": "error", "error": str(exc)}
-        else:
-            result = {"status": "success", **result}
-        return json.dumps(result, ensure_ascii=False, indent=2)
+            payload = {"status": "error", "error": str(exc), "retryable": False}
+            next_events = append_research_event(
+                events,
+                "evidence_registration_failed",
+                plan_id=str(runtime.state.get("research_plan", {}).get("plan_id", "")),
+                subquestion_id=str(runtime.state.get("active_subquestion_id") or ""),
+                details={
+                    "failure_type": "validation_error",
+                    "retryable": False,
+                },
+            )
+            return Command(
+                update={
+                    "research_events": next_events,
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            tool_call_id=runtime.tool_call_id,
+                            name="record_evidence",
+                            status="error",
+                        )
+                    ],
+                }
+            )
+
+        snapshot = budget_snapshot()
+        active_id = str(runtime.state.get("active_subquestion_id") or "")
+        registered_events = append_research_event(
+            events,
+            "evidence_registered",
+            plan_id=str(runtime.state.get("research_plan", {}).get("plan_id", "")),
+            subquestion_id=active_id,
+            details={
+                "claim_id": result.get("claim", {}).get("claim_id"),
+                "evidence_id": result.get("evidence", {}).get("evidence_id"),
+                "source_id": source_id,
+            },
+        )
+        updated_plan: ResearchPlan | None = None
+        unresolved = _unresolved_active_requirements(snapshot, active_id)
+        if auto_update_subquestion:
+            updated_plan, registered_events, unresolved = _auto_close_after_evidence(
+                runtime=runtime,
+                snapshot=snapshot,
+                events=registered_events,
+            )
+        payload = {
+            "status": "success",
+            **result,
+            "subquestion_auto_updated": updated_plan is not None,
+            "next_state": "covered" if updated_plan is not None else "researching",
+            "unresolved_requirements": unresolved,
+        }
+        update: dict[str, Any] = {
+            "research_events": registered_events,
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    tool_call_id=runtime.tool_call_id,
+                    name="record_evidence",
+                )
+            ],
+        }
+        if updated_plan is not None:
+            update["research_plan"] = updated_plan
+        return Command(update=update)
 
     @tool("get_evidence_graph")
     def get_evidence_graph() -> str:
@@ -781,6 +1801,35 @@ def build_research_state_tools(
                 },
                 ensure_ascii=False,
             )
+        if graph_required and status == "covered":
+            scoped_usage = snapshot.get("subquestion_usage", {}).get(
+                str(active_subquestion_id), {}
+            )
+            raw_scoped_relevant = scoped_usage.get("relevant_searches")
+            if raw_scoped_relevant is None:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Covered status requires an available per-subquestion "
+                            "relevant-search metric; legacy non-empty searches are "
+                            "not upgraded to relevant"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            if int(raw_scoped_relevant) < 1:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Covered status requires at least one relevant web_search "
+                            "within the active subquestion; non-empty low-relevance "
+                            "searches do not satisfy this gate"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         if graph_required and requested_ids != graph_source_ids:
             return json.dumps(
                 {
@@ -812,23 +1861,23 @@ def build_research_state_tools(
                 for item in other_subquestions
                 for claim_id in item.get("claim_ids", [])
             }.union(active_claim_id_set)
-            independent_source_ids = independent_evidence_source_ids(
+            corroborating_source_ids = corroborating_evidence_source_ids(
                 source_ids=candidate_source_ids,
                 sources=ledger,
                 evidence_units=snapshot.get("evidence_units", []),
                 claim_ids=candidate_claim_ids,
             )
             minimum_sources = int(snapshot.get("min_successful_sources", 0))
-            if len(independent_source_ids) < minimum_sources:
+            if len(corroborating_source_ids) < minimum_sources:
                 return json.dumps(
                     {
                         "status": "error",
                         "error": (
                             "The final covered update requires at least "
-                            f"{minimum_sources} independent canonical sources; "
-                            f"currently {len(independent_source_ids)}. Continue "
+                            f"{minimum_sources} corroborating source groups; "
+                            f"currently {len(corroborating_source_ids)}. Continue "
                             "researching and register a claim from another "
-                            "independent fetched page"
+                            "host with non-duplicate captured content"
                         ),
                     },
                     ensure_ascii=False,
@@ -837,17 +1886,28 @@ def build_research_state_tools(
                 int(snapshot.get("max_searches", 0)),
                 max(1, len(plan.get("subquestions", []))),
             )
-            successful_searches = int(
-                snapshot.get("successful_searches", snapshot.get("search_calls", 0))
-            )
-            if successful_searches < required_searches:
+            raw_relevant_searches = snapshot.get("relevant_searches")
+            if raw_relevant_searches is None:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            "The final covered update requires an available "
+                            "relevant-search metric; legacy non-empty searches are "
+                            "not upgraded to relevant"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            relevant_searches = int(raw_relevant_searches)
+            if relevant_searches < required_searches:
                 return json.dumps(
                     {
                         "status": "error",
                         "error": (
                             "The final covered update requires at least "
-                            f"{required_searches} successful web searches; currently "
-                            f"{successful_searches}. Run a relevant web_search, "
+                            f"{required_searches} relevant web searches; currently "
+                            f"{relevant_searches}. Run a relevant web_search, "
                             "then retry this update"
                         ),
                     },
@@ -864,8 +1924,8 @@ def build_research_state_tools(
                 for item in other_subquestions
                 for claim_id in item.get("claim_ids", [])
             }.union(str(item["claim_id"]) for item in eligible_claims)
-            independent_count = len(
-                independent_evidence_source_ids(
+            corroborating_count = len(
+                corroborating_evidence_source_ids(
                     source_ids=candidate_source_ids,
                     sources=ledger,
                     evidence_units=snapshot.get("evidence_units", []),
@@ -877,9 +1937,7 @@ def build_research_state_tools(
                 int(snapshot.get("max_searches", 0)),
                 max(1, len(plan.get("subquestions", []))),
             )
-            successful_searches = int(
-                snapshot.get("successful_searches", snapshot.get("search_calls", 0))
-            )
+            relevant_searches = int(snapshot.get("relevant_searches") or 0)
             active_limits = snapshot.get("subquestion_limits", {}).get(
                 active_subquestion_id, {}
             )
@@ -898,13 +1956,23 @@ def build_research_state_tools(
                     active_usage.get("search_calls", snapshot.get("search_calls", 0))
                 ),
             )
+            if snapshot.get("strategy") == "adaptive":
+                remaining_fetches += max(0, int(snapshot.get("reserve_fetches", 0)))
+                remaining_searches += max(0, int(snapshot.get("reserve_searches", 0)))
             source_gap_recoverable = (
-                independent_count < minimum_sources and remaining_fetches > 0
+                corroborating_count < minimum_sources and remaining_fetches > 0
             )
             search_gap_recoverable = (
-                successful_searches < required_searches and remaining_searches > 0
+                relevant_searches < required_searches and remaining_searches > 0
             )
-            if source_gap_recoverable or search_gap_recoverable:
+            claim_gap_recoverable = not eligible_claims and (
+                remaining_searches > 0 or remaining_fetches > 0
+            )
+            if (
+                source_gap_recoverable
+                or search_gap_recoverable
+                or claim_gap_recoverable
+            ):
                 return json.dumps(
                     {
                         "status": "error",
@@ -952,6 +2020,14 @@ def build_research_state_tools(
                 conflict_ids=active_conflict_ids,
                 note=note,
             )
+            updated, closure_errors = audit_structural_subquestion_closures(
+                updated, snapshot
+            )
+            if status == "covered" and subquestion_id in closure_errors:
+                msg = "Covered state failed the canonical closure audit: " + "; ".join(
+                    closure_errors[subquestion_id]
+                )
+                raise ValueError(msg)
         except ValueError as exc:
             return json.dumps(
                 {"status": "error", "error": str(exc)}, ensure_ascii=False
@@ -974,6 +2050,9 @@ def build_research_state_tools(
                 "status": "success",
                 "subquestion_id": subquestion_id,
                 "new_status": status,
+                "structural_subquestion_coverage": updated[
+                    "structural_subquestion_coverage"
+                ],
                 "coverage": updated["coverage"],
                 "canonical_claims": active_claims,
                 "canonical_conflicts": active_conflicts,
@@ -998,54 +2077,325 @@ def build_research_state_tools(
     return [get_research_plan, update_subquestion]
 
 
+def _compact_research_history(
+    state: TongAgentState,
+    *,
+    max_chars: int = 480,
+) -> str:
+    """Summarize durable control history without replaying prior SQ messages."""
+
+    events = list(state.get("research_events", []))
+    recent_events = [
+        {
+            "event": item.get("event"),
+            "subquestion_id": item.get("subquestion_id"),
+        }
+        for item in events[-4:]
+    ]
+    decisions = list(state.get("adaptive_control", {}).get("decision_history", []))
+    last_decision = decisions[-1] if decisions else {}
+    summary = json.dumps(
+        {
+            "event_count": len(events),
+            "recent_events": recent_events,
+            "last_control": {
+                "action": last_decision.get("action"),
+                "reason_codes": list(last_decision.get("reason_codes", []))[:4],
+            },
+            "compact_checkpoint_count": len(state.get("compact_checkpoints", [])),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return summary[:max_chars]
+
+
+def build_active_research_context(
+    *,
+    plan: ResearchPlan,
+    active_subquestion_id: str,
+    budget: dict[str, Any],
+    model_budget: dict[str, Any] | None = None,
+) -> ActiveResearchContext:
+    """Derive the only current-SQ state needed by the research model."""
+
+    active = next(
+        item
+        for item in plan.get("subquestions", [])
+        if item.get("id") == active_subquestion_id
+    )
+    limits = budget.get("subquestion_limits", {}).get(active_subquestion_id, {})
+    usage = budget.get("subquestion_usage", {}).get(active_subquestion_id, {})
+    claims, _, source_ids, _ = _active_canonical_state(
+        budget,
+        active_subquestion_id,
+    )
+    source_id_set = set(source_ids)
+    sources = [
+        {
+            "source_id": item.get("source_id"),
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "evidence_quality": item.get("evidence_quality"),
+            "acquisition_method": item.get("acquisition_method"),
+        }
+        for item in budget.get("successful_sources", [])
+        if str(item.get("source_id", "")) in source_id_set
+    ]
+    remaining_model_calls = None
+    if model_budget is not None:
+        raw_remaining = model_budget.get("remaining_model_calls")
+        if isinstance(raw_remaining, int) and not isinstance(raw_remaining, bool):
+            remaining_model_calls = max(0, raw_remaining)
+    return ActiveResearchContext(
+        plan_id=str(plan.get("plan_id", "")),
+        active_subquestion={
+            "id": active.get("id"),
+            "question": active.get("question"),
+            "rationale": active.get("rationale"),
+            "depends_on": list(active.get("depends_on", [])),
+            "attempts": active.get("attempts"),
+        },
+        subquestion_status=str(active.get("status", "")),
+        query_task_type=classify_query_task_type(str(active.get("question", ""))),
+        remaining_search_budget=max(
+            0,
+            int(limits.get("max_searches", 0)) - int(usage.get("search_calls", 0)),
+        ),
+        remaining_fetch_budget=max(
+            0,
+            int(limits.get("max_fetches", 0)) - int(usage.get("fetch_calls", 0)),
+        ),
+        remaining_model_calls=remaining_model_calls,
+        relevant_sources=sources,
+        canonical_claims=[
+            {
+                "claim_id": item.get("claim_id"),
+                "text": item.get("text"),
+                "status": item.get("status"),
+                "source_ids": list(item.get("source_ids", [])),
+            }
+            for item in claims
+        ],
+        unresolved_requirements=_unresolved_active_requirements(
+            budget,
+            active_subquestion_id,
+        ),
+    )
+
+
+def _query_task_guidance(task_type: str) -> str:
+    if task_type == "list_or_enumeration":
+        return (
+            "The first query must target a complete list, table, discography, "
+            "chronology, timeline, or overview. Do not start from one member; "
+            "narrow only after the overview exposes a specific gap."
+        )
+    if task_type == "comparison":
+        return (
+            "Search each compared entity and attribute separately; do not put "
+            "the final comparison or arithmetic into either query."
+        )
+    if task_type == "date_or_numeric_lookup":
+        return (
+            "Use one entity plus the exact date, depth, height, or numeric attribute."
+        )
+    return "Use one entity plus one factual attribute."
+
+
+def build_deterministic_abstain_report(
+    plan: ResearchPlan,
+    budget: dict[str, Any],
+    *,
+    integrity_failure: bool,
+) -> str:
+    """Render a validator-safe abstention without a synthesis model call."""
+
+    claims_by_id = {
+        str(item.get("claim_id", "")): item
+        for item in budget.get("claims", [])
+        if isinstance(item, dict)
+    }
+    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for item in budget.get("evidence_units", []):
+        if isinstance(item, dict) and item.get("stance") in {"supports", "contradicts"}:
+            evidence_by_claim.setdefault(str(item.get("claim_id", "")), []).append(item)
+    sources_by_id = {
+        str(item.get("source_id", "")): item
+        for item in budget.get("successful_sources", [])
+        if isinstance(item, dict)
+    }
+    plan_claim_ids = [
+        str(claim_id)
+        for subquestion in plan.get("subquestions", [])
+        if subquestion.get("status") == "covered"
+        for claim_id in subquestion.get("claim_ids", [])
+    ]
+    findings: list[str] = []
+    cited_source_ids: list[str] = []
+    if not integrity_failure:
+        for claim_id in dict.fromkeys(plan_claim_ids):
+            claim = claims_by_id.get(claim_id)
+            if not claim or claim.get("status") not in {"supported", "contested"}:
+                continue
+            edges = evidence_by_claim.get(claim_id, [])
+            source_ids = [
+                str(item.get("source_id", ""))
+                for item in edges
+                if str(item.get("source_id", "")) in sources_by_id
+            ]
+            if not source_ids:
+                continue
+            if claim.get("status") == "contested":
+                supported = next(
+                    (
+                        str(item.get("source_id", ""))
+                        for item in edges
+                        if item.get("stance") == "supports"
+                    ),
+                    "",
+                )
+                contradicted = next(
+                    (
+                        str(item.get("source_id", ""))
+                        for item in edges
+                        if item.get("stance") == "contradicts"
+                    ),
+                    "",
+                )
+                source_ids = [item for item in (supported, contradicted) if item]
+            source_refs = "".join(f"[{source_id}]" for source_id in source_ids)
+            findings.append(f"- {claim.get('text', '')} [{claim_id}]{source_refs}")
+            cited_source_ids.extend(source_ids)
+    caveats = sorted(
+        allowed_report_caveat_lines(plan, integrity_failure=integrity_failure)
+    )
+    source_lines = [
+        f"- [{source_id}] {sources_by_id[source_id].get('title', '')} — "
+        f"{sources_by_id[source_id].get('url', '')}"
+        for source_id in dict.fromkeys(cited_source_ids)
+        if source_id in sources_by_id
+    ]
+    return "\n".join(
+        [
+            "## Short Answer",
+            "INSUFFICIENT_EVIDENCE",
+            "ABSTAIN",
+            "",
+            "## Key Findings",
+            *findings,
+            "",
+            "## Conflicts and Caveats",
+            *caveats,
+            "",
+            "## Sources",
+            *source_lines,
+            "",
+        ]
+    )
+
+
 def build_research_graph(
     *,
     research_agent: Any,
+    report_agent: Any | None = None,
     planner: Planner,
     budget_snapshot: BudgetSnapshot,
     budget_configure: BudgetConfigure | None = None,
     budget_activate: BudgetActivate | None = None,
+    budget_grant: BudgetGrant | None = None,
+    report_read: ReportRead | None = None,
+    report_clear: ReportClear | None = None,
     checkpointer: Any | None,
     max_subquestions: int,
     max_research_cycles: int,
     interrupt_before: list[str] | None = None,
     require_researcher: bool = False,
+    strategy: ResearchStrategy = "fixed",
+    config_fingerprint: str = "",
+    hard_effort: str = "",
+    pinned_model: str = "",
+    pinned_topology: str = "",
+    max_escalations: int = 0,
+    token_budget_snapshot: TokenBudgetSnapshot | None = None,
+    token_budget_can_start: TokenBudgetCanStart | None = None,
+    model_budget_snapshot: ModelBudgetSnapshot | None = None,
+    phase_action_drain: PhaseActionDrain | None = None,
+    phase_action_apply: PhaseActionApply | None = None,
+    phase_decider: PhaseDecisionCaller | None = None,
+    report_write: Callable[[str], None] | None = None,
 ) -> Any:
     """Compile the outer plan-select-research-evaluate-report workflow.
 
     Args:
         research_agent: Uncheckpointed Deep Agent subgraph or compatible node.
+        report_agent: Optional synthesis-only agent without research-state tools.
         planner: Injectable structured planner.
         budget_snapshot: Callable returning the latest serializable ledger.
         budget_configure: Optional callback that partitions the plan budget.
         budget_activate: Optional callback that selects the active SQ budget.
+        budget_grant: Optional idempotent adaptive reserve-release callback.
+        report_read: Optional callback that snapshots `/report.md` into state.
+        report_clear: Optional callback that removes any pre-synthesis report.
         checkpointer: Checkpointer owned exclusively by the outer graph.
         max_subquestions: Hard plan breadth limit.
         max_research_cycles: Loop limit protecting against stalled model behavior.
         interrupt_before: Optional node interrupts used by recovery tests.
         require_researcher: Force one researcher task call per active SQ.
+        strategy: Fixed baseline or deterministic adaptive control.
+        config_fingerprint: Pinned policy identity used for safe resume.
+        hard_effort: User-selected hard effort ceiling.
+        pinned_model: Model identity that cannot change inside this plan.
+        pinned_topology: Topology identity that cannot change inside this plan.
+        max_escalations: Maximum reserve releases for the whole plan.
+        model_budget_snapshot: Optional evaluation model-call budget telemetry.
+        phase_action_apply: Applies a validated structured phase action through
+            the code-owned search/fetch/evidence tools.
+        phase_decider: Explicit schema-bound phase decision caller. Evaluation
+            injects an accounted implementation.
+        report_write: Atomic report writer used only for deterministic abstain.
 
     Returns:
         Compiled checkpointable research graph.
     """
+    if report_agent is None:
+        msg = "A separate synthesis-only report_agent is required"
+        raise ValueError(msg)
 
     def plan_node(state: TongAgentState) -> dict[str, Any]:
         topic = " ".join(state.get("research_topic", "").split())
         existing = state.get("research_plan")
+        resuming_plan = bool(
+            existing and existing["status"] in {"pending", "in_progress"}
+        )
         events = list(state.get("research_events", []))
         history = list(state.get("research_plan_history", []))
-        if existing and existing["status"] in {"pending", "in_progress"}:
+        if resuming_plan and existing:
             plan = refresh_plan_status(existing)
-            events = append_research_event(
-                events,
-                "plan_resumed",
-                plan_id=plan["plan_id"],
-                details={"coverage": plan["coverage"]},
-            )
         else:
             if existing:
                 history.append(deepcopy(existing))
             plan = refresh_plan_status(planner(topic, max_subquestions))
+        if budget_configure is not None:
+            budget_configure([item["id"] for item in plan["subquestions"]])
+        if budget_activate is not None:
+            budget_activate(None)
+        budget = budget_snapshot()
+        if resuming_plan:
+            plan, closure_errors = audit_structural_subquestion_closures(plan, budget)
+            events = append_research_event(
+                events,
+                "plan_resumed",
+                plan_id=plan["plan_id"],
+                details={
+                    "structural_subquestion_coverage": plan[
+                        "structural_subquestion_coverage"
+                    ],
+                    "coverage": plan["coverage"],
+                    "closure_errors": closure_errors,
+                },
+            )
+        else:
             events = append_research_event(
                 events,
                 "plan_created",
@@ -1055,30 +2405,86 @@ def build_research_graph(
                     "subquestions": len(plan["subquestions"]),
                 },
             )
-        if budget_configure is not None:
-            budget_configure([item["id"] for item in plan["subquestions"]])
-        if budget_activate is not None:
-            budget_activate(None)
-        budget = budget_snapshot()
+        saved_control = state.get("adaptive_control") if resuming_plan else None
+        if saved_control:
+            control = deepcopy(saved_control)
+            saved_fingerprint = str(control.get("config_fingerprint", ""))
+            if (
+                config_fingerprint
+                and saved_fingerprint
+                and saved_fingerprint != config_fingerprint
+            ):
+                msg = "Pending research plan was created with a different policy"
+                raise ValueError(msg)
+        else:
+            control = initialize_control_state(
+                strategy=strategy,
+                config_fingerprint=config_fingerprint,
+                hard_effort=hard_effort,
+                pinned_model=pinned_model,
+                pinned_topology=pinned_topology,
+                max_escalations=max_escalations,
+            )
         return {
             "research_plan": plan,
             "research_plan_history": history,
             "research_events": events,
             "active_subquestion_id": None,
             "active_source_ids_before": [],
+            "active_claim_ids_before": [],
             "active_evidence_ids_before": [],
+            "active_conflict_ids_before": [],
+            "active_tool_attempt_sequence_before": int(
+                budget.get("next_tool_attempt_sequence", 1)
+            ),
             "budget_state": cast("BudgetState", budget),
+            "adaptive_control": cast("AdaptiveControlState", control),
             "workflow_phase": "selecting",
             "research_cycles": 0,
             "max_research_cycles": max_research_cycles,
+            "report_markdown": "",
+            "compact_checkpoints": (
+                list(state.get("compact_checkpoints", [])) if resuming_plan else []
+            ),
+            "active_token_slice_exhausted": None,
+            "active_search_scope": {},
+            "active_fetch_scope": {},
+            "active_evidence_attempts": {},
+            "phase_decision_context": {},
+            "pending_model_action_error": None,
+            "model_action_parse_failures": int(
+                state.get("model_action_parse_failures", 0)
+            )
+            if resuming_plan
+            else 0,
+            "model_action_repairs": int(state.get("model_action_repairs", 0))
+            if resuming_plan
+            else 0,
+            "model_action_repair_successes": int(
+                state.get("model_action_repair_successes", 0)
+            )
+            if resuming_plan
+            else 0,
+            "model_action_events": list(state.get("model_action_events", []))
+            if resuming_plan
+            else [],
+            "report_type": "",
+            "deterministic_report": "",
+            "phase_transition_log": (
+                list(state.get("phase_transition_log", [])) if resuming_plan else []
+            ),
+            "phase_timings": list(state.get("phase_timings", []))
+            if resuming_plan
+            else [],
+            "active_phase_turn_index": int(state.get("active_phase_turn_index", 0)),
+            "last_phase_action": {},
         }
 
     def select_node(state: TongAgentState) -> dict[str, Any]:
         previous_plan = state["research_plan"]
-        audited_plan = deepcopy(previous_plan)
         preselection_budget = budget_snapshot()
-        rejected_covered = invalid_covered_subquestions(
-            audited_plan, preselection_budget
+        audited_plan, rejected_covered = audit_structural_subquestion_closures(
+            previous_plan, preselection_budget
         )
         for subquestion_id, reasons in rejected_covered.items():
             audited_plan = transition_subquestion(
@@ -1088,6 +2494,23 @@ def build_research_graph(
                 note="Covered state rejected: " + "; ".join(reasons),
             )
         plan, active = select_next_subquestion(audited_plan)
+        token_blocked: list[str] = []
+        while (
+            active
+            and token_budget_can_start is not None
+            and not token_budget_can_start(active)
+        ):
+            token_blocked.append(active)
+            plan = transition_subquestion(
+                plan,
+                active,
+                "blocked",
+                note=(
+                    "The required subquestion token partition has insufficient "
+                    "capacity for another compact research turn."
+                ),
+            )
+            plan, active = select_next_subquestion(plan)
         if budget_activate is not None:
             budget_activate(active)
         budget = budget_snapshot()
@@ -1124,24 +2547,56 @@ def build_research_graph(
             plan_id=plan["plan_id"],
             subquestion_id=active or "",
             details={
+                "structural_subquestion_coverage": plan[
+                    "structural_subquestion_coverage"
+                ],
                 "coverage": plan["coverage"],
                 "budget_limits": budget.get("subquestion_limits", {}).get(active, {}),
             },
         )
+        for subquestion_id in token_blocked:
+            events = append_research_event(
+                events,
+                "subquestion_token_partition_exhausted",
+                plan_id=plan["plan_id"],
+                subquestion_id=subquestion_id,
+                details={
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    )
+                },
+            )
         sources = budget.get("successful_sources", [])
         source_ids = [str(item.get("source_id", "")) for item in sources]
         evidence_ids = [
             str(item.get("evidence_id", ""))
             for item in budget.get("evidence_units", [])
         ]
+        claim_ids = [str(item.get("claim_id", "")) for item in budget.get("claims", [])]
+        conflict_ids = [
+            str(item.get("conflict_id", "")) for item in budget.get("conflicts", [])
+        ]
         return {
             "research_plan": plan,
             "research_events": events,
             "active_subquestion_id": active,
             "active_source_ids_before": source_ids,
+            "active_claim_ids_before": claim_ids,
             "active_evidence_ids_before": evidence_ids,
+            "active_conflict_ids_before": conflict_ids,
+            "active_tool_attempt_sequence_before": int(
+                budget.get("next_tool_attempt_sequence", 1)
+            ),
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "researching" if active else "reporting",
+            "active_token_slice_exhausted": None,
+            "active_search_scope": {},
+            "active_fetch_scope": {},
+            "active_evidence_attempts": {},
+            "active_phase_turn_index": 0,
+            "last_phase_action": {},
         }
 
     def route_after_select(state: TongAgentState) -> Route:
@@ -1155,8 +2610,52 @@ def build_research_graph(
             if item["id"] == active_id
         )
         budget = budget_snapshot()
-        limits = budget.get("subquestion_limits", {}).get(active_id, {})
-        usage = budget.get("subquestion_usage", {}).get(active_id, {})
+        active_context = build_active_research_context(
+            plan=state["research_plan"],
+            active_subquestion_id=active_id,
+            budget=budget,
+            model_budget=(
+                model_budget_snapshot() if model_budget_snapshot is not None else None
+            ),
+        )
+        token_partition = (
+            token_budget_snapshot() if token_budget_snapshot is not None else {}
+        )
+        event_summary = _compact_research_history(state)
+        phase = str(state.get("active_research_phase") or "NEED_QUERY")
+        search_scope = (
+            dict(state.get("active_search_scope", {}))
+            if isinstance(state.get("active_search_scope"), dict)
+            else {}
+        )
+        fetch_scope = (
+            dict(state.get("active_fetch_scope", {}))
+            if isinstance(state.get("active_fetch_scope"), dict)
+            else {}
+        )
+        phase_context = {
+            "active_subquestion": active_context.active_subquestion,
+            "query_task_type": active_context.query_task_type,
+            "remaining_search_budget": active_context.remaining_search_budget,
+            "remaining_fetch_budget": active_context.remaining_fetch_budget,
+            "candidates": [
+                {
+                    "result_id": item.get("result_id"),
+                    "title": item.get("title"),
+                    "snippet": item.get("snippet"),
+                    "rank": item.get("rank"),
+                    "relevance": item.get("relevance"),
+                }
+                for item in search_scope.get("candidates", [])
+                if isinstance(item, dict)
+            ][:5],
+            "quote_candidates": {
+                str(key): str(value)[:800]
+                for key, value in dict(fetch_scope.get("quote_candidates", {})).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
+            "unresolved_requirements": active_context.unresolved_requirements,
+        }
         delegation_instruction = (
             "MULTI MODE: your very next tool call MUST be task with "
             "subagent_type='researcher' and its description MUST start exactly "
@@ -1169,19 +2668,300 @@ def build_research_graph(
         )
         content = f"""[RESEARCH STEP]
 Root question: {state["research_plan"]["question"]}
-Active subquestion: {active["id"]} — {active["question"]}
-Rationale: {active["rationale"] or "Required for plan coverage."}
-Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ensure_ascii=False)}
+ACTIVE RESEARCH CONTEXT:
+{active_context.model_dump_json()}
 
-{delegation_instruction}Research only this active subquestion. Read the explicit plan with get_research_plan when useful. After each successful fetch, call record_evidence for every factual proposition you may report, copying an exact 12-800 character excerpt from that fetched page. The claim argument must itself be a self-contained report-ready sentence with subject and predicate, never a label such as "official name" or "contact email"; quote is the separate exact page excerpt that supports it. OMIT claim_id when creating a new claim: the tool assigns C#. Pass claim_id only to add evidence to a C# already returned by a successful record_evidence call; never invent C#. If a tool call fails, read its error, correct the arguments, and retry within budget. Then call get_evidence_graph and pass update_subquestion exactly the [S#] IDs linked to this SQ's canonical [C#] claims. The final covered update also enforces the policy's minimum web-search and independent-source counts; if it reports either minimum is unmet, continue researching and retry instead of blocking. A source alone cannot cover an SQ. Search snippets never receive source IDs or evidence units. If no supported claim can be registered within the reserved budget, mark the SQ blocked. Do not write the final report during this step."""
+Token partition for this SQ: {json.dumps(token_partition.get("buckets", {}).get(f"sq:{active_id}", {}), ensure_ascii=False)}
+RESEARCH EVENT SUMMARY:
+{event_summary}
+
+Query strategy: {_query_task_guidance(active_context.query_task_type)}
+CURRENT CODE-OWNED PHASE: {phase}
+
+{delegation_instruction}Research only this active subquestion through the phase-decision tools. Never call or invent a URL, source ID, or quote. In NEED_QUERY call only choose_search_query with one atomic query. In NEED_RESULT_SELECTION call only select_search_result with one displayed R#; the URL remains code-owned. In NEED_EVIDENCE call only propose_evidence with one displayed Q# and a report-ready claim; the literal quote remains code-owned. Do not issue dependent actions in one response: code rejects them before they consume network budget. If the tool reports SQ_DONE or SQ_BLOCKED, end the turn. Do not write the final report during this step."""
         message_id = (
             f"research-step-{state['research_plan']['plan_id']}-{active['id']}-"
             f"{active['attempts']}"
         )
         return {
-            "messages": [HumanMessage(content=content, id=message_id)],
+            "messages": [
+                HumanMessage(content=content, id=message_id),
+            ],
             "workflow_phase": "researching",
+            "phase_decision_context": phase_context,
+            "pending_model_action_error": None,
         }
+
+    def phase_decision_node(state: TongAgentState) -> dict[str, Any]:
+        """Obtain one schema-bound initial decision without changing FSM state."""
+
+        active_id = str(state.get("active_subquestion_id") or "")
+        phase = str(state.get("active_research_phase") or "")
+        if (
+            not active_id
+            or phase not in {"NEED_QUERY", "NEED_RESULT_SELECTION", "NEED_EVIDENCE"}
+            or phase_decider is None
+            or phase_action_apply is None
+        ):
+            return {}
+        result = phase_decider(state, phase, False, None)
+        if result.get("status") == "success" and isinstance(
+            result.get("decision"), dict
+        ):
+            applied = phase_action_apply(state, phase, dict(result["decision"]))
+            if applied.get("status") == "success":
+                return {"pending_model_action_error": None}
+            result = applied
+        error = str(result.get("validation_error") or "invalid_model_action")
+        summary = _safe_phase_output_summary(result.get("raw_output_summary"))
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "invalid_model_action",
+            plan_id=str(plan.get("plan_id", "")),
+            subquestion_id=active_id,
+            details={
+                "phase": phase,
+                "validation_error": error,
+                "raw_output_summary": summary,
+                "repair_scheduled": True,
+            },
+        )
+        action_events = list(state.get("model_action_events", []))
+        action_events.append(
+            {
+                "phase": phase,
+                "subquestion_id": active_id,
+                "event": "invalid_model_action",
+                "validation_error": error,
+                "raw_output_summary": summary,
+            }
+        )
+        return {
+            "research_events": events,
+            "pending_model_action_error": {
+                "phase": phase,
+                "validation_error": error,
+                "raw_output_summary": summary,
+            },
+            "model_action_parse_failures": int(
+                state.get("model_action_parse_failures", 0)
+            )
+            + 1,
+            "model_action_events": action_events,
+        }
+
+    def fsm_controller_node(state: TongAgentState) -> dict[str, Any]:
+        """The sole writer of `active_research_phase` and scoped FSM state."""
+
+        active_id = str(state.get("active_subquestion_id") or "")
+        plan = cast("ResearchPlan", state.get("research_plan", {}))
+        previous = str(state.get("active_research_phase") or "")
+        phase_owner = str(state.get("phase_subquestion_id") or "")
+        action_bundle = phase_action_drain(state) if phase_action_drain else None
+        updates_prefix: dict[str, Any] = {}
+        if not active_id:
+            # Do not rewrite a terminal blocked state while preparing a report.
+            return {}
+        if phase_owner != active_id or not previous:
+            next_phase = "NEED_QUERY"
+            action: dict[str, Any] = {"action": "initialize", "status": "ready"}
+            ignored: list[dict[str, Any]] = []
+        elif action_bundle is None:
+            if phase_action_drain is None:
+                return {}
+            pending = state.get("pending_model_action_error")
+            if (
+                isinstance(pending, dict)
+                and phase_decider is not None
+                and phase_action_apply is not None
+                and not pending.get("repair_attempted")
+            ):
+                validation_error = str(
+                    pending.get("validation_error") or "invalid_model_action"
+                )
+                repaired = phase_decider(state, previous, True, validation_error)
+                events = append_research_event(
+                    list(state.get("research_events", [])),
+                    "model_action_repair_attempted",
+                    plan_id=str(plan.get("plan_id", "")),
+                    subquestion_id=active_id,
+                    details={"phase": previous, "validation_error": validation_error},
+                )
+                repair_events = list(state.get("model_action_events", []))
+                repair_events.append(
+                    {
+                        "phase": previous,
+                        "subquestion_id": active_id,
+                        "event": "model_action_repair_attempted",
+                        "validation_error": validation_error,
+                    }
+                )
+                updates_prefix.update(
+                    {
+                        "research_events": events,
+                        "model_action_repairs": int(
+                            state.get("model_action_repairs", 0)
+                        )
+                        + 1,
+                        "model_action_events": repair_events,
+                    }
+                )
+                if repaired.get("status") == "success" and isinstance(
+                    repaired.get("decision"), dict
+                ):
+                    applied = phase_action_apply(
+                        state, previous, dict(repaired["decision"])
+                    )
+                    if applied.get("status") == "success":
+                        action_bundle = (
+                            phase_action_drain(state) if phase_action_drain else None
+                        )
+                        if action_bundle is not None:
+                            updates_prefix["model_action_repair_successes"] = (
+                                int(state.get("model_action_repair_successes", 0)) + 1
+                            )
+                            repair_events.append(
+                                {
+                                    "phase": previous,
+                                    "subquestion_id": active_id,
+                                    "event": "model_action_repair_succeeded",
+                                }
+                            )
+                if action_bundle is None:
+                    summary = _safe_phase_output_summary(
+                        repaired.get("raw_output_summary")
+                    )
+                    updates_prefix["pending_model_action_error"] = {
+                        **pending,
+                        "repair_attempted": True,
+                        "repair_validation_error": str(
+                            repaired.get("validation_error") or "invalid_model_action"
+                        ),
+                        "repair_raw_output_summary": summary,
+                    }
+                    repair_events.append(
+                        {
+                            "phase": previous,
+                            "subquestion_id": active_id,
+                            "event": "model_action_repair_failed",
+                            "raw_output_summary": summary,
+                        }
+                    )
+            if action_bundle is None:
+                next_phase = "SQ_BLOCKED"
+                action = {"action": "none", "status": "invalid_model_action"}
+                ignored = []
+            else:
+                action = dict(action_bundle.get("action") or {})
+                ignored = [dict(item) for item in action_bundle.get("ignored", [])]
+                next_phase = ""
+        else:
+            action = dict(action_bundle.get("action") or {})
+            ignored = [dict(item) for item in action_bundle.get("ignored", [])]
+            next_phase = ""
+
+        if not next_phase:
+            status = str(action.get("status", "missing"))
+            name = str(action.get("action", ""))
+            if name == "search":
+                next_phase = (
+                    "NEED_RESULT_SELECTION" if status == "success" else "SQ_BLOCKED"
+                )
+            elif name == "fetch":
+                next_phase = "NEED_EVIDENCE" if status == "success" else "SQ_BLOCKED"
+            elif name == "record_evidence":
+                requirement = str(action.get("requirement_id", ""))
+                attempts = dict(state.get("active_evidence_attempts", {}))
+                attempts[requirement] = max(
+                    int(attempts.get(requirement, 0)), int(action.get("attempt", 0))
+                )
+                action["evidence_attempts"] = attempts
+                if status == "success":
+                    unresolved = _unresolved_active_requirements(
+                        budget_snapshot(), active_id
+                    )
+                    next_phase = "SQ_DONE" if not unresolved else "NEED_QUERY"
+                    action["unresolved_requirements"] = unresolved
+                else:
+                    next_phase = (
+                        "NEED_EVIDENCE" if action.get("retryable") else "SQ_BLOCKED"
+                    )
+            else:
+                next_phase = "SQ_BLOCKED"
+        events = list(state.get("research_events", []))
+        for item in ignored:
+            events = append_research_event(
+                events,
+                "phase_action_ignored",
+                plan_id=str(plan.get("plan_id", "")),
+                subquestion_id=active_id,
+                details=item,
+            )
+        elapsed = float(action.get("elapsed_seconds", 0.0) or 0.0)
+        events = _phase_event(
+            events,
+            plan_id=str(plan.get("plan_id", "")),
+            subquestion_id=active_id,
+            previous=previous or "UNINITIALIZED",
+            current=next_phase,
+            action=str(action.get("action", "controller")),
+            elapsed_seconds=elapsed,
+            details={
+                "status": action.get("status"),
+                "ignored_action_count": len(ignored),
+                "source_id": action.get("source_id"),
+                "requirement_id": action.get("requirement_id"),
+            },
+        )
+        timings = list(state.get("phase_timings", []))
+        timings.append(
+            {
+                "phase": str(action.get("action", "controller")),
+                "subquestion_id": active_id,
+                "elapsed_seconds": round(max(0.0, elapsed), 6),
+            }
+        )
+        updates: dict[str, Any] = {
+            **updates_prefix,
+            "active_research_phase": next_phase,
+            "phase_subquestion_id": active_id,
+            "research_events": events,
+            "phase_timings": timings,
+            "phase_transition_log": [
+                *list(state.get("phase_transition_log", [])),
+                {
+                    "subquestion_id": active_id,
+                    "from": previous or "UNINITIALIZED",
+                    "to": next_phase,
+                    "action": action.get("action", "controller"),
+                },
+            ],
+            "active_phase_turn_index": int(state.get("active_phase_turn_index", 0)) + 1,
+            "last_phase_action": action,
+            "pending_model_action_error": None
+            if next_phase != "SQ_BLOCKED"
+            else updates_prefix.get(
+                "pending_model_action_error", state.get("pending_model_action_error")
+            ),
+        }
+        if str(action.get("action")) == "search" and action.get("scope"):
+            updates["active_search_scope"] = action["scope"]
+        if str(action.get("action")) == "fetch" and action.get("scope"):
+            updates["active_fetch_scope"] = action["scope"]
+        if action.get("evidence_attempts"):
+            updates["active_evidence_attempts"] = action["evidence_attempts"]
+        return updates
+
+    def route_after_fsm_controller(
+        state: TongAgentState,
+    ) -> Literal["research", "evaluate", "report"]:
+        if not state.get("active_subquestion_id"):
+            return "report"
+        phase = str(state.get("active_research_phase") or "")
+        if phase in {"SQ_DONE", "SQ_BLOCKED"}:
+            return "evaluate"
+        return "research"
 
     def evaluate_node(state: TongAgentState) -> dict[str, Any]:
         plan = deepcopy(state["research_plan"])
@@ -1201,12 +2981,132 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
             for item in budget.get("evidence_units", [])
             if str(item.get("evidence_id", "")) not in previous_evidence_ids
         ]
+        previous_claim_ids = set(state.get("active_claim_ids_before", []))
+        new_claim_ids = [
+            str(item.get("claim_id", ""))
+            for item in budget.get("claims", [])
+            if str(item.get("claim_id", "")) not in previous_claim_ids
+        ]
+        previous_conflict_ids = set(state.get("active_conflict_ids_before", []))
+        new_conflict_ids = [
+            str(item.get("conflict_id", ""))
+            for item in budget.get("conflicts", [])
+            if str(item.get("conflict_id", "")) not in previous_conflict_ids
+        ]
+        first_attempt_sequence = int(
+            state.get("active_tool_attempt_sequence_before", 1)
+        )
+        new_tool_attempt_ids = [
+            str(item.get("attempt_id", ""))
+            for item in budget.get("tool_attempts", [])
+            if int(item.get("sequence", 0)) >= first_attempt_sequence
+        ]
+        token_slice_exhausted = state.get("active_token_slice_exhausted")
+        active_phase = str(state.get("active_research_phase") or "NEED_QUERY")
         if active_id:
             active = next(
                 item for item in plan["subquestions"] if item["id"] == active_id
             )
-            if active["status"] == "researching":
-                if active["attempts"] >= active["max_attempts"]:
+            if active["status"] == "researching" and active_phase == "SQ_BLOCKED":
+                plan = transition_subquestion(
+                    plan,
+                    active_id,
+                    "blocked",
+                    note="The code-enforced research phase could not produce canonical evidence.",
+                )
+            elif active["status"] == "researching":
+                active_claims = [
+                    dict(item)
+                    for item in budget.get("claims", [])
+                    if item.get("subquestion_id") == active_id
+                    and item.get("status") in {"supported", "contested"}
+                ]
+                active_claim_ids = {
+                    str(item.get("claim_id", "")) for item in active_claims
+                }
+                active_evidence = [
+                    dict(item)
+                    for item in budget.get("evidence_units", [])
+                    if str(item.get("claim_id", "")) in active_claim_ids
+                ]
+                active_source_ids = list(
+                    dict.fromkeys(
+                        str(item.get("source_id", ""))
+                        for item in active_evidence
+                        if item.get("source_id")
+                    )
+                )
+                active_conflict_ids = [
+                    str(item.get("conflict_id", ""))
+                    for item in budget.get("conflicts", [])
+                    if str(item.get("claim_id", "")) in active_claim_ids
+                ]
+                active_relevant = int(
+                    budget.get("subquestion_usage", {})
+                    .get(active_id, {})
+                    .get("relevant_searches")
+                    or 0
+                )
+                if active_claim_ids and active_source_ids and active_relevant >= 1:
+                    candidate = transition_subquestion(
+                        plan,
+                        active_id,
+                        "covered",
+                        evidence_source_ids=active_source_ids,
+                        claim_ids=sorted(active_claim_ids),
+                        conflict_ids=active_conflict_ids,
+                        note=(
+                            "Minimum canonical evidence was recorded and the "
+                            "outer graph deterministically closed this subquestion."
+                        ),
+                    )
+                    candidate, candidate_errors = audit_structural_subquestion_closures(
+                        candidate,
+                        budget,
+                    )
+                    if active_id not in candidate_errors:
+                        plan = candidate
+                    else:
+                        plan = transition_subquestion(
+                            plan,
+                            active_id,
+                            "pending",
+                            note=(
+                                "Canonical evidence exists but closure still needs: "
+                                + "; ".join(candidate_errors[active_id])
+                            ),
+                        )
+                elif (
+                    token_slice_exhausted
+                    and active_claim_ids
+                    and active_source_ids
+                    and active_relevant >= 1
+                ):
+                    plan = transition_subquestion(
+                        plan,
+                        active_id,
+                        "covered",
+                        evidence_source_ids=active_source_ids,
+                        claim_ids=sorted(active_claim_ids),
+                        conflict_ids=active_conflict_ids,
+                        note=(
+                            "The local token slice ended after the minimum "
+                            "canonical evidence for this subquestion was recorded."
+                        ),
+                    )
+                elif token_slice_exhausted:
+                    plan = transition_subquestion(
+                        plan,
+                        active_id,
+                        "blocked",
+                        note=(
+                            "The local token slice ended before minimum canonical "
+                            "evidence could be recorded."
+                        ),
+                    )
+                elif (
+                    strategy == "fixed" and active["attempts"] >= active["max_attempts"]
+                ):
                     plan = transition_subquestion(
                         plan,
                         active_id,
@@ -1218,42 +3118,144 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                         plan,
                         active_id,
                         "pending",
-                        note="No new successful evidence; retry is allowed.",
+                        note=(
+                            "Adaptive controller will decide whether to retry or "
+                            "release reserve budget."
+                            if strategy == "adaptive"
+                            else "No new successful evidence; retry is allowed."
+                        ),
                     )
-        for subquestion_id, reasons in invalid_covered_subquestions(
-            plan, budget
-        ).items():
-            plan = transition_subquestion(
-                plan,
-                subquestion_id,
-                "blocked",
-                note="Covered state rejected: " + "; ".join(reasons),
-            )
+        plan, rejected_covered = audit_structural_subquestion_closures(plan, budget)
+        for subquestion_id, reasons in rejected_covered.items():
+            if strategy == "adaptive":
+                reopened = deepcopy(plan)
+                target = next(
+                    item
+                    for item in reopened["subquestions"]
+                    if item["id"] == subquestion_id
+                )
+                target["status"] = "pending"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["structural_closure_validated"] = False
+                target["note"] = "Covered state rejected: " + "; ".join(reasons)
+                plan = refresh_plan_status(reopened)
+            else:
+                plan = transition_subquestion(
+                    plan,
+                    subquestion_id,
+                    "blocked",
+                    note="Covered state rejected: " + "; ".join(reasons),
+                )
         plan = refresh_plan_status(plan)
         cycles = int(state.get("research_cycles", 0)) + 1
+        control = deepcopy(
+            state.get("adaptive_control")
+            or initialize_control_state(
+                strategy=strategy,
+                config_fingerprint=config_fingerprint,
+                hard_effort=hard_effort,
+                pinned_model=pinned_model,
+                pinned_topology=pinned_topology,
+                max_escalations=max_escalations,
+            )
+        )
+        assessment = build_control_assessment(
+            plan=plan,
+            budget=budget,
+            control=control,
+            subquestion_id=active_id or "",
+            cycle=cycles,
+            new_source_ids=new_ids,
+            new_claim_ids=new_claim_ids,
+            new_evidence_ids=new_evidence_ids,
+            new_conflict_ids=new_conflict_ids,
+            new_tool_attempt_ids=new_tool_attempt_ids,
+        )
+        control["last_assessment"] = assessment
         events = append_research_event(
             list(state.get("research_events", [])),
             "coverage_evaluated",
             plan_id=plan["plan_id"],
             subquestion_id=active_id or "",
             details={
+                "structural_subquestion_coverage": plan[
+                    "structural_subquestion_coverage"
+                ],
                 "coverage": plan["coverage"],
                 "plan_status": plan["status"],
                 "new_source_ids": new_ids,
+                "new_claim_ids": new_claim_ids,
                 "new_evidence_ids": new_evidence_ids,
+                "new_conflict_ids": new_conflict_ids,
+                "new_tool_attempt_ids": new_tool_attempt_ids,
                 "cycle": cycles,
+            },
+        )
+        if token_slice_exhausted:
+            events = append_research_event(
+                events,
+                "subquestion_token_slice_stopped",
+                plan_id=plan["plan_id"],
+                subquestion_id=active_id or "",
+                details={
+                    "denial": token_slice_exhausted,
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    ),
+                },
+            )
+        compact_checkpoints = list(state.get("compact_checkpoints", []))
+        active_after = next(
+            (item for item in plan["subquestions"] if item.get("id") == active_id),
+            {},
+        )
+        compact_checkpoints.append(
+            {
+                "cycle": cycles,
+                "subquestion_id": active_id,
+                "status": active_after.get("status"),
+                "source_ids": list(active_after.get("evidence_source_ids", [])),
+                "claim_ids": list(active_after.get("claim_ids", [])),
+                "conflict_ids": list(active_after.get("conflict_ids", [])),
+                "new_source_ids": new_ids,
+                "new_claim_ids": new_claim_ids,
+                "new_evidence_ids": new_evidence_ids,
+                "token_partition": (
+                    token_budget_snapshot() if token_budget_snapshot is not None else {}
+                ),
+            }
+        )
+        events = append_research_event(
+            events,
+            "subquestion_compact_checkpoint",
+            plan_id=plan["plan_id"],
+            subquestion_id=active_id or "",
+            details={
+                "cycle": cycles,
+                "status": active_after.get("status"),
+                "source_ids": list(active_after.get("evidence_source_ids", [])),
+                "claim_ids": list(active_after.get("claim_ids", [])),
             },
         )
         return {
             "research_plan": plan,
             "research_events": events,
             "budget_state": cast("BudgetState", budget),
+            "adaptive_control": cast("AdaptiveControlState", control),
             "active_subquestion_id": None,
             "research_cycles": cycles,
             "workflow_phase": "evaluating",
+            "compact_checkpoints": compact_checkpoints,
+            "active_token_slice_exhausted": None,
         }
 
-    def route_after_evaluate(state: TongAgentState) -> Route:
+    def route_after_evaluate(state: TongAgentState) -> str:
+        if strategy == "adaptive":
+            return "control"
         plan = state["research_plan"]
         unfinished = any(
             item["status"] in {"pending", "researching"}
@@ -1264,10 +3266,191 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
         )
         return "research" if unfinished and within_limit else "report"
 
+    def adaptive_control_node(state: TongAgentState) -> dict[str, Any]:
+        plan = deepcopy(state["research_plan"])
+        control = deepcopy(state["adaptive_control"])
+        assessment = deepcopy(control.get("last_assessment", {}))
+        cycle = int(state.get("research_cycles", 0))
+        cycle_limit = int(state.get("max_research_cycles", max_research_cycles))
+        action, reasons = decide_control_action(
+            plan=plan,
+            control=control,
+            assessment=assessment,
+            cycle_limit_reached=cycle >= cycle_limit,
+        )
+        sequence = len(control.get("decision_history", [])) + 1
+        subquestion_id = str(assessment.get("subquestion_id", ""))
+        decision_id = decision_id_for(plan["plan_id"], cycle, sequence, subquestion_id)
+        budget_before_snapshot = budget_snapshot()
+        budget_before = {
+            "search_calls": int(budget_before_snapshot.get("search_calls", 0)),
+            "fetch_calls": int(budget_before_snapshot.get("fetch_calls", 0)),
+            "granted_searches": int(budget_before_snapshot.get("granted_searches", 0)),
+            "granted_fetches": int(budget_before_snapshot.get("granted_fetches", 0)),
+            "reserve_searches": int(budget_before_snapshot.get("reserve_searches", 0)),
+            "reserve_fetches": int(budget_before_snapshot.get("reserve_fetches", 0)),
+        }
+        grant_result: dict[str, Any] = {}
+        if action == "expand_budget":
+            if budget_grant is None or not subquestion_id:
+                action = "stop_subquestion"
+                reasons = [*reasons, "budget_grant_unavailable"]
+            else:
+                search_retry_needed = "search_retry_needed" in reasons
+                fetch_retry_needed = "fetch_retry_needed" in reasons
+                needs_search = (
+                    search_retry_needed
+                    or ("relevant_search_gap" in reasons)
+                    or (
+                        "provider_failure" in reasons
+                        and not search_retry_needed
+                        and not fetch_retry_needed
+                    )
+                )
+                needs_evidence = any(
+                    item in reasons
+                    for item in ("claim_gap", "corroborating_source_gap")
+                )
+                grant_result = budget_grant(
+                    decision_id,
+                    subquestion_id,
+                    search_delta=(
+                        1
+                        if needs_search or (needs_evidence and not fetch_retry_needed)
+                        else 0
+                    ),
+                    fetch_delta=1 if needs_evidence or fetch_retry_needed else 0,
+                )
+                if not grant_result.get("applied") and not grant_result.get(
+                    "idempotent_replay"
+                ):
+                    action = "stop_subquestion"
+                    reasons = [*reasons, "hard_ceiling_reached"]
+                else:
+                    target = next(
+                        item
+                        for item in plan["subquestions"]
+                        if item["id"] == subquestion_id
+                    )
+                    target["max_attempts"] = max(
+                        int(target["max_attempts"]), int(target["attempts"]) + 1
+                    )
+                    plan = refresh_plan_status(plan)
+        if action == "stop_subquestion" and subquestion_id:
+            target = next(
+                (item for item in plan["subquestions"] if item["id"] == subquestion_id),
+                None,
+            )
+            if target is not None and target["status"] in {"pending", "researching"}:
+                plan = transition_subquestion(
+                    plan,
+                    subquestion_id,
+                    "blocked",
+                    note="Adaptive controller stopped research: "
+                    + ", ".join(dict.fromkeys(reasons)),
+                )
+        if action == "fail_closed":
+            plan = deepcopy(plan)
+            for target in plan["subquestions"]:
+                target["status"] = "blocked"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["structural_closure_validated"] = False
+                target["note"] = (
+                    "Evidence integrity validation failed; research stopped."
+                )
+            plan = refresh_plan_status(plan)
+        budget_after_snapshot = budget_snapshot()
+        budget_after = {
+            "search_calls": int(budget_after_snapshot.get("search_calls", 0)),
+            "fetch_calls": int(budget_after_snapshot.get("fetch_calls", 0)),
+            "granted_searches": int(budget_after_snapshot.get("granted_searches", 0)),
+            "granted_fetches": int(budget_after_snapshot.get("granted_fetches", 0)),
+            "reserve_searches": int(budget_after_snapshot.get("reserve_searches", 0)),
+            "reserve_fetches": int(budget_after_snapshot.get("reserve_fetches", 0)),
+        }
+        if action == "expand_budget" and grant_result:
+            original_before = grant_result.get("budget_before")
+            original_after = grant_result.get("budget_after")
+            if isinstance(original_before, dict) and isinstance(original_after, dict):
+                for field_name in (
+                    "granted_searches",
+                    "granted_fetches",
+                    "reserve_searches",
+                    "reserve_fetches",
+                ):
+                    budget_before[field_name] = int(original_before[field_name])
+                    budget_after[field_name] = int(original_after[field_name])
+        control = record_control_decision(
+            control,
+            decision_id=decision_id,
+            action=action,
+            assessment=assessment,
+            reason_codes=list(dict.fromkeys(reasons)),
+            budget_before=budget_before,
+            budget_after=budget_after,
+        )
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "control_assessed",
+            plan_id=plan["plan_id"],
+            subquestion_id=subquestion_id,
+            details={
+                "decision_id": decision_id,
+                "action": action,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "assessment": assessment,
+            },
+        )
+        action_event = {
+            "expand_budget": "budget_expanded",
+            "continue": "adaptive_continued",
+            "stop_subquestion": "adaptive_stopped",
+            "finish_success": "adaptive_stopped",
+            "finish_partial": "adaptive_stopped",
+            "fail_closed": "control_integrity_failed",
+        }[action]
+        events = append_research_event(
+            events,
+            action_event,
+            plan_id=plan["plan_id"],
+            subquestion_id=subquestion_id,
+            details={
+                "decision_id": decision_id,
+                "action": action,
+                "grant": grant_result,
+                "budget_before": budget_before,
+                "budget_after": budget_after,
+            },
+        )
+        return {
+            "research_plan": refresh_plan_status(plan),
+            "research_events": events,
+            "budget_state": cast("BudgetState", budget_after_snapshot),
+            "adaptive_control": cast("AdaptiveControlState", control),
+            "workflow_phase": "evaluating",
+        }
+
+    def route_after_control(state: TongAgentState) -> ControlRoute:
+        control = state["adaptive_control"]
+        history = control.get("decision_history", [])
+        action = history[-1].get("action") if history else "finish_partial"
+        if action in {"finish_success", "finish_partial", "fail_closed"}:
+            return "report"
+        if int(state.get("research_cycles", 0)) >= int(
+            state.get("max_research_cycles", max_research_cycles)
+        ):
+            return "report"
+        return "select"
+
     def prepare_report_node(state: TongAgentState) -> dict[str, Any]:
+        if report_clear is not None:
+            report_clear()
         if budget_activate is not None:
             budget_activate(None)
-        plan = deepcopy(state["research_plan"])
+        budget = budget_snapshot()
+        plan, _ = audit_structural_subquestion_closures(state["research_plan"], budget)
         if int(state.get("research_cycles", 0)) >= int(
             state.get("max_research_cycles", max_research_cycles)
         ):
@@ -1280,28 +3463,177 @@ Reserved budget for this SQ: {json.dumps({"limits": limits, "usage": usage}, ens
                         note="The explicit research cycle limit was reached.",
                     )
         plan = refresh_plan_status(plan)
+        integrity_errors = validate_evidence_graph(budget)
+        control_history = state.get("adaptive_control", {}).get("decision_history", [])
+        integrity_fail_closed = bool(integrity_errors) or bool(
+            control_history and control_history[-1].get("action") == "fail_closed"
+        )
+        if integrity_fail_closed:
+            plan = deepcopy(plan)
+            for target in plan["subquestions"]:
+                target["status"] = "blocked"
+                target["evidence_source_ids"] = []
+                target["claim_ids"] = []
+                target["conflict_ids"] = []
+                target["structural_closure_validated"] = False
+                target["note"] = (
+                    "Evidence integrity validation failed; research stopped."
+                )
+            plan = refresh_plan_status(plan)
+        closure_errors = invalid_covered_subquestions(plan, budget)
+        required_subquestions_covered = bool(plan.get("subquestions")) and all(
+            item.get("status") == "covered" for item in plan.get("subquestions", [])
+        )
+        normal_synthesis_allowed = (
+            not integrity_fail_closed
+            and not closure_errors
+            and required_subquestions_covered
+            and plan.get("status") == "completed"
+            and plan.get("structural_subquestion_coverage") == 1.0
+        )
         events = append_research_event(
             list(state.get("research_events", [])),
             "report_requested",
             plan_id=plan["plan_id"],
-            details={"coverage": plan["coverage"], "status": plan["status"]},
+            details={
+                "structural_subquestion_coverage": plan[
+                    "structural_subquestion_coverage"
+                ],
+                "coverage": plan["coverage"],
+                "status": plan["status"],
+                "integrity_fail_closed": integrity_fail_closed,
+                "integrity_errors": integrity_errors,
+                "normal_synthesis_allowed": normal_synthesis_allowed,
+            },
         )
-        plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
-        budget = budget_snapshot()
-        ledger_json = json.dumps(
-            budget.get("successful_sources", []), ensure_ascii=False, indent=2
+        if not normal_synthesis_allowed:
+            report = build_deterministic_abstain_report(
+                plan,
+                budget,
+                integrity_failure=integrity_fail_closed,
+            )
+            events = append_research_event(
+                events,
+                "deterministic_abstain_requested",
+                plan_id=plan["plan_id"],
+                details={
+                    "required_subquestions_covered": required_subquestions_covered,
+                    "plan_status": plan.get("status"),
+                    "structural_subquestion_coverage": plan.get(
+                        "structural_subquestion_coverage"
+                    ),
+                    "closure_errors": closure_errors,
+                },
+            )
+            return {
+                "research_plan": plan,
+                "research_events": events,
+                "budget_state": cast("BudgetState", budget),
+                "workflow_phase": "reporting",
+                "report_markdown": report,
+                "report_type": "deterministic_abstain",
+                "deterministic_report": report,
+            }
+        report_plan = {
+            "plan_id": plan.get("plan_id"),
+            "question": plan.get("question"),
+            "objective": plan.get("objective"),
+            "status": plan.get("status"),
+            "structural_subquestion_coverage": plan.get(
+                "structural_subquestion_coverage"
+            ),
+            "subquestions": [
+                {
+                    "id": item.get("id"),
+                    "question": item.get("question"),
+                    "status": item.get("status"),
+                    "evidence_source_ids": item.get("evidence_source_ids", []),
+                    "claim_ids": item.get("claim_ids", []),
+                    "conflict_ids": item.get("conflict_ids", []),
+                    "note": item.get("note", ""),
+                }
+                for item in plan.get("subquestions", [])
+            ],
+        }
+        plan_json = json.dumps(report_plan, ensure_ascii=False, separators=(",", ":"))
+        report_sources = (
+            []
+            if integrity_fail_closed
+            else [
+                {
+                    "source_id": item.get("source_id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "evidence_quality": item.get("evidence_quality"),
+                    "quality_reason": item.get("quality_reason", ""),
+                    "acquisition_method": item.get("acquisition_method"),
+                }
+                for item in budget.get("successful_sources", [])
+                if isinstance(item, dict)
+            ]
+        )
+        ledger_json = json.dumps(report_sources, ensure_ascii=False, indent=2)
+        report_graph = (
+            {"claims": [], "evidence_units": [], "conflicts": []}
+            if integrity_fail_closed
+            else {
+                "claims": [
+                    {
+                        "claim_id": item.get("claim_id"),
+                        "subquestion_id": item.get("subquestion_id"),
+                        "text": item.get("text"),
+                        "status": item.get("status"),
+                        "source_ids": item.get("source_ids", []),
+                    }
+                    for item in budget.get("claims", [])
+                    if isinstance(item, dict)
+                ],
+                "evidence_units": [
+                    {
+                        "evidence_id": item.get("evidence_id"),
+                        "claim_id": item.get("claim_id"),
+                        "subquestion_id": item.get("subquestion_id"),
+                        "source_id": item.get("source_id"),
+                        "stance": item.get("stance"),
+                        "quote": item.get("quote"),
+                    }
+                    for item in budget.get("evidence_units", [])
+                    if isinstance(item, dict)
+                ],
+                "conflicts": [
+                    {
+                        "conflict_id": item.get("conflict_id"),
+                        "claim_id": item.get("claim_id"),
+                        "status": item.get("status"),
+                        "source_ids": item.get("source_ids", []),
+                    }
+                    for item in budget.get("conflicts", [])
+                    if isinstance(item, dict)
+                ],
+            }
         )
         evidence_graph_json = json.dumps(
-            {
-                "claims": budget.get("claims", []),
-                "evidence_units": budget.get("evidence_units", []),
-                "conflicts": budget.get("conflicts", []),
-            },
+            report_graph,
             ensure_ascii=False,
             indent=2,
         )
+        allowed_caveats = sorted(
+            allowed_report_caveat_lines(plan, integrity_failure=integrity_fail_closed)
+        )
+        allowed_caveats_json = json.dumps(
+            allowed_caveats,
+            ensure_ascii=False,
+            indent=2,
+        )
+        fail_closed_instruction = (
+            "Evidence integrity validation failed. Do not report or cite any "
+            "canonical fact; leave the factual sections empty and copy only the "
+            "matching allowed caveat under Conflicts and Caveats.\n\n"
+            if integrity_fail_closed
+            else ""
+        )
         content = f"""[FINAL SYNTHESIS]
-You MUST call write_file to create the final `/report.md` for the root question using only the canonical evidence graph below. Use exactly these four H2 section headings in this order with Sources last: `## Short Answer`, `## Key Findings`, `## Conflicts and Caveats`, and `## Sources`; do not add other headings. Every non-empty finding line must contain exactly one canonical `claim.text` copied byte-for-byte from the graph plus its `[C#]` and linked `[S#]`; copy `claim.text`, NOT the evidence quote. The only valid shape is `- <exact claim.text> [C#][S#]`: add no prefix, suffix, emphasis, or local paraphrase. Every canonical claim_id attached to a covered SQ in PLAN MUST appear at least once, even when two claim texts look redundant. Put contested claims only in Conflicts and Caveats and cite both supporting and contradicting sources. A generic process or evidence-quality caveat in that section must contain no `[C#]` or `[S#]`; never attach a supported claim ID to locally written caveat text. Never present contradicted-only claims as facts. Every Sources line MUST have exactly this shape: `- [S#] <exact canonical title> — <canonical URL>`. If there are no reportable claims, leave Short Answer and Key Findings empty and explain the limitation only under Conflicts and Caveats. Search snippets and failed fetches are not evidence. If the plan is partial, write an honest partial report without claiming blocked work was completed.
+{fail_closed_instruction}You MUST call write_file to create the final `/report.md` for the root question using only the canonical evidence graph below. Use exactly these four H2 section headings in this order with Sources last: `## Short Answer`, `## Key Findings`, `## Conflicts and Caveats`, and `## Sources`; do not add other headings. Every non-empty finding line must contain exactly one canonical `claim.text` copied byte-for-byte from the graph plus its `[C#]` and linked `[S#]`; copy `claim.text`, NOT the evidence quote. The only valid shape is `- <exact claim.text> [C#][S#]`: add no prefix, suffix, emphasis, or local paraphrase. Every canonical claim_id attached to a covered SQ in PLAN MUST appear at least once, even when two claim texts look redundant. Put contested claims only in Conflicts and Caveats and cite both supporting and contradicting sources. Citation-free text in Conflicts and Caveats is forbidden unless the complete stripped line is copied byte-for-byte from ALLOWED CAVEAT LINES below; if that list is empty, leave the section empty unless it contains a canonical contested claim. Never attach a supported claim ID to caveat text. Never present contradicted-only claims as facts. Every Sources line MUST have exactly this shape: `- [S#] <exact canonical title> — <canonical URL>`. If there are no reportable claims, leave Short Answer and Key Findings empty and use only an applicable allowed caveat. Search snippets and failed fetches are not evidence. If the plan is partial, use only the exact applicable partial-coverage caveat without claiming blocked work was completed.
 
 PLAN:
 {plan_json}
@@ -1310,7 +3642,10 @@ CANONICAL SOURCE LEDGER:
 {ledger_json}
 
 CANONICAL EVIDENCE GRAPH:
-{evidence_graph_json}"""
+{evidence_graph_json}
+
+ALLOWED CAVEAT LINES:
+{allowed_caveats_json}"""
         return {
             "messages": [
                 HumanMessage(
@@ -1322,16 +3657,52 @@ CANONICAL EVIDENCE GRAPH:
             "research_events": events,
             "budget_state": cast("BudgetState", budget),
             "workflow_phase": "reporting",
+            "report_markdown": "",
+            "report_type": "normal_synthesis",
+            "deterministic_report": "",
         }
 
+    def deterministic_abstain_node(state: TongAgentState) -> dict[str, Any]:
+        """Persist a code-generated report without invoking synthesis/extraction."""
+
+        report = str(state.get("deterministic_report") or "")
+        if not report:
+            raise RuntimeError("deterministic abstain report is missing")
+        if report_write is not None:
+            report_write(report)
+        events = append_research_event(
+            list(state.get("research_events", [])),
+            "deterministic_abstain_report_written",
+            plan_id=str(state.get("research_plan", {}).get("plan_id", "")),
+            details={"report_type": "deterministic_abstain"},
+        )
+        return {
+            "research_events": events,
+            "report_markdown": report,
+            "report_type": "deterministic_abstain",
+        }
+
+    def route_after_prepare_report(state: TongAgentState) -> str:
+        return (
+            "deterministic_abstain"
+            if state.get("report_type") == "deterministic_abstain"
+            else "report_agent"
+        )
+
     def finish_node(state: TongAgentState) -> dict[str, Any]:
-        plan = refresh_plan_status(state["research_plan"])
         budget = budget_snapshot()
+        plan, _ = audit_structural_subquestion_closures(state["research_plan"], budget)
         events = append_research_event(
             list(state.get("research_events", [])),
             "run_finished",
             plan_id=plan["plan_id"],
-            details={"coverage": plan["coverage"], "status": plan["status"]},
+            details={
+                "structural_subquestion_coverage": plan[
+                    "structural_subquestion_coverage"
+                ],
+                "coverage": plan["coverage"],
+                "status": plan["status"],
+            },
         )
         return {
             "research_plan": plan,
@@ -1344,36 +3715,117 @@ CANONICAL EVIDENCE GRAPH:
         state: TongAgentState, config: RunnableConfig
     ) -> dict[str, Any]:
         """Run the uncheckpointed inner graph and atomically expose its ledger."""
-        result = research_agent.invoke(state, config=config)
+        try:
+            result = research_agent.invoke(state, config=config)
+        except Exception as exc:
+            resource = getattr(exc, "resource", None)
+            resource_value = getattr(resource, "value", resource)
+            if str(resource_value) != "subquestion_slice":
+                raise
+            events = append_research_event(
+                list(state.get("research_events", [])),
+                "subquestion_token_slice_exhausted",
+                plan_id=state["research_plan"]["plan_id"],
+                subquestion_id=str(state.get("active_subquestion_id") or ""),
+                details={
+                    "attempted": getattr(exc, "attempted", {}),
+                    "token_partition": (
+                        token_budget_snapshot()
+                        if token_budget_snapshot is not None
+                        else {}
+                    ),
+                },
+            )
+            return {
+                "research_events": events,
+                "budget_state": cast("BudgetState", budget_snapshot()),
+                "report_markdown": "",
+                "active_token_slice_exhausted": getattr(exc, "attempted", {}),
+            }
         return {
             **result,
             "budget_state": cast("BudgetState", budget_snapshot()),
+            "report_markdown": "",
+            "active_token_slice_exhausted": None,
+        }
+
+    def invoke_report_agent(
+        state: TongAgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Run synthesis without exposing untrusted research-turn messages."""
+        report_state = dict(state)
+        report_state["messages"] = [state["messages"][-1]]
+        result = report_agent.invoke(report_state, config=config)
+        report_markdown = report_read() if report_read is not None else ""
+        return {
+            **result,
+            "budget_state": cast("BudgetState", budget_snapshot()),
+            "report_markdown": report_markdown,
         }
 
     builder = StateGraph(TongAgentState)
     builder.add_node("plan", plan_node)
     builder.add_node("select", select_node)
     builder.add_node("prepare_research", prepare_research_node)
+    builder.add_node("phase_decision", phase_decision_node)
     builder.add_node("research_agent", invoke_inner_agent)
     builder.add_node("evaluate", evaluate_node)
+    builder.add_node("adaptive_control", adaptive_control_node)
     builder.add_node("prepare_report", prepare_report_node)
-    builder.add_node("report_agent", invoke_inner_agent)
+    builder.add_node("deterministic_abstain", deterministic_abstain_node)
+    builder.add_node("report_agent", invoke_report_agent)
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "select")
-    builder.add_conditional_edges(
-        "select",
-        route_after_select,
-        {"research": "prepare_research", "report": "prepare_report"},
-    )
-    builder.add_edge("prepare_research", "research_agent")
-    builder.add_edge("research_agent", "evaluate")
+    if phase_action_drain is None:
+        builder.add_conditional_edges(
+            "select",
+            route_after_select,
+            {"research": "prepare_research", "report": "prepare_report"},
+        )
+        builder.add_edge("prepare_research", "research_agent")
+        builder.add_edge("research_agent", "evaluate")
+    else:
+        builder.add_node("fsm_controller", fsm_controller_node)
+        builder.add_edge("select", "fsm_controller")
+        builder.add_conditional_edges(
+            "fsm_controller",
+            route_after_fsm_controller,
+            {
+                "research": "prepare_research",
+                "evaluate": "evaluate",
+                "report": "prepare_report",
+            },
+        )
+        if phase_decider is not None and phase_action_apply is not None:
+            builder.add_edge("prepare_research", "phase_decision")
+            builder.add_edge("phase_decision", "fsm_controller")
+        else:
+            builder.add_edge("prepare_research", "research_agent")
+            builder.add_edge("research_agent", "fsm_controller")
     builder.add_conditional_edges(
         "evaluate",
         route_after_evaluate,
-        {"research": "select", "report": "prepare_report"},
+        {
+            "research": "select",
+            "report": "prepare_report",
+            "control": "adaptive_control",
+        },
     )
-    builder.add_edge("prepare_report", "report_agent")
+    builder.add_conditional_edges(
+        "adaptive_control",
+        route_after_control,
+        {"select": "select", "report": "prepare_report"},
+    )
+    builder.add_conditional_edges(
+        "prepare_report",
+        route_after_prepare_report,
+        {
+            "deterministic_abstain": "deterministic_abstain",
+            "report_agent": "report_agent",
+        },
+    )
+    builder.add_edge("deterministic_abstain", "finish")
     builder.add_edge("report_agent", "finish")
     builder.add_edge("finish", END)
     return builder.compile(
