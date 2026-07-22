@@ -162,6 +162,40 @@ def test_synthesis_recovers_rounded_python_result_after_budget_stop() -> None:
     assert answer == "FINAL_ANSWER: 28"
 
 
+def test_synthesis_uses_completed_years_from_date_difference() -> None:
+    class Call:
+        tool_name = "python"
+        status = ToolCallStatus.SUCCESS
+        result = {
+            "status": "success",
+            "operation": "date_difference",
+            "result": 85.55138,
+            "unit": "years",
+        }
+
+    answer = _answer_from_successful_python(
+        "How many years had passed between admission and the representative's birth?",
+        [Call()],
+    )
+
+    assert answer == "FINAL_ANSWER: 85"
+
+
+def test_synthesis_does_not_use_incompatible_python_intermediate() -> None:
+    class Call:
+        tool_name = "python"
+        status = ToolCallStatus.SUCCESS
+        result = {
+            "status": "success",
+            "operation": "count",
+            "result": 3,
+        }
+
+    answer = _answer_from_successful_python("Which house is described?", [Call()])
+
+    assert answer is None
+
+
 def test_synthesis_strips_location_labels_and_entity_explanation() -> None:
     assert (
         _format_short_answer(

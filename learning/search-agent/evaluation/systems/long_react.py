@@ -519,22 +519,41 @@ def _answer_from_successful_python(
     question: str,
     tool_calls: Sequence[Any],
 ) -> str | None:
-    """Recover an already-computed answer when the next model turn is denied."""
+    """Return the latest deterministic result compatible with the answer contract."""
 
     contract = build_answer_contract(question)
-    if contract.answer_type not in {"number", "count", "duration", "date"}:
+    compatible_operations = {
+        "number": {"arithmetic", "count"},
+        "count": {"arithmetic", "count"},
+        "duration": {"arithmetic", "date_difference"},
+    }
+    allowed = compatible_operations.get(contract.answer_type)
+    if allowed is None:
         return None
     for call in reversed(tool_calls):
         if call.tool_name != "python" or call.status != ToolCallStatus.SUCCESS:
             continue
         payload = call.result if isinstance(call.result, Mapping) else {}
+        if (
+            payload.get("status") != "success"
+            or payload.get("operation") not in allowed
+        ):
+            continue
         value = payload.get("result")
         if isinstance(value, bool) or not isinstance(value, int | float | str):
             continue
-        if isinstance(value, int | float) and re.search(
-            r"\b(?:round|rounded|whole number|nearest)\b", question, re.I
-        ):
-            value = round(float(value))
+        if isinstance(value, int | float):
+            if (
+                payload.get("operation") == "date_difference"
+                and payload.get("unit") == "years"
+            ):
+                # "How many years had passed" asks for completed calendar years,
+                # not the fractional approximation used by the bounded tool.
+                value = int(float(value))
+            elif re.search(
+                r"\b(?:round|rounded|whole number|nearest)\b", question, re.I
+            ):
+                value = round(float(value))
         return _format_short_answer(question, str(value))
     return None
 
@@ -635,6 +654,16 @@ def run_long_react_workflow(
                 draft=contract_hint + (draft or ""),
             )
         final_answer = _format_short_answer(task.question, draft)
+        deterministic_answer = _answer_from_successful_python(
+            task.question,
+            runtime.middleware.tool_calls,
+        )
+        if deterministic_answer is not None:
+            final_answer = deterministic_answer
+            trace.record(
+                "long_react_answer_selected_from_python",
+                final_answer=final_answer,
+            )
     except Exception as exc:
         caught = exc
         if isinstance(exc, BudgetExceeded) and runtime is not None:
