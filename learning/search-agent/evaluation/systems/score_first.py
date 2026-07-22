@@ -142,7 +142,12 @@ def _plan(*, runtime: PreparedRuntime, task: EvalTask) -> tuple[LightweightPlan,
             "Create 1-3 short atomic research subquestions for the question. "
             "Each subquestion must request one fact. Choose the answer type and "
             "a deterministic calculation only when clearly required. Do not "
-            "produce requirements, slots, URLs, evidence schemas, or an answer.\n\n"
+            "produce requirements, slots, URLs, evidence schemas, or an answer. "
+            "Do not add a subquestion that merely combines facts already requested. "
+            "Use the canonical lookup attribute an authoritative page is likely to "
+            "use. Treat dates, people, or events that only identify the target as "
+            "context: do not turn them into a measurement constraint unless the "
+            "question explicitly asks for the value at that event.\n\n"
             f"Question: {task.question}"
         ),
         label="tongagent.score_first.plan",

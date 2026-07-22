@@ -23,6 +23,7 @@ from evaluation.systems.score_first import (
 )
 from evaluation.systems.tongagent import TongAgentRunner
 from evaluation.tracing import TraceCollector
+from retrieval_quality import classify_query_task_type, normalize_atomic_search_query
 
 
 pytestmark = pytest.mark.usefixtures("socket_disabled")
@@ -391,6 +392,15 @@ def test_score_first_source_selection_bounds_fetch_attempts_per_subquestion(
 
     assert len(bundle.sources) == 1
     assert runtime.research_budget.snapshot()["fetch_calls"] == 1
+
+
+def test_score_first_query_rules_treat_which_as_singular_and_use_statehood() -> None:
+    singular = "Which house was used as a royal jail by Francis Talbot?"
+    statehood = "In what year was Pennsylvania admitted to the Union?"
+
+    assert classify_query_task_type(singular) == "single_fact_lookup"
+    assert "list" not in normalize_atomic_search_query(singular)
+    assert normalize_atomic_search_query(statehood) == '"pennsylvania" statehood'
 
 
 def test_score_first_posthoc_audit_never_changes_benchmark_answer(
