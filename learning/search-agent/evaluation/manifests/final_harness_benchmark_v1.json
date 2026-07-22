@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
-  "manifest_type": "final_transparent_harness_benchmark",
+  "manifest_type": "full_candidate_manifest_v1",
+  "candidate_role": "frozen_pool_for_final_harness_benchmark_v2",
   "implementation_commit": "73c05c944436012a9966e95d5c35d9048799984a",
   "selection_frozen_before_answer_materialization": true,
   "historical_task_overlap_count": 0,
