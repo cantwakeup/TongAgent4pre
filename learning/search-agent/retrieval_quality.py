@@ -133,15 +133,10 @@ _ATOMIC_ATTRIBUTE_CANONICAL = {
     "imprisonment": "imprisonment",
     "incarcerated": "imprisonment",
     "jail": "imprisonment",
-    "admission": "statehood",
-    "admitted": "statehood",
     "prison": "imprisonment",
-    "ratified": "statehood",
     "release": "release",
     "released": "release",
-    "statehood": "statehood",
     "tallest": "height",
-    "union": "statehood",
 }
 _ENUMERATION_TERMS = frozenset(
     {
@@ -156,6 +151,7 @@ _ENUMERATION_TERMS = frozenset(
         "overview",
         "table",
         "timeline",
+        "which",
     }
 )
 _COMPARISON_TERMS = frozenset(
@@ -523,9 +519,7 @@ def normalize_atomic_search_query(query: str, *, max_words: int = 12) -> str:
         fallback_terms = [
             term
             for term in dict.fromkeys(_meaningful_terms(without_site))
-            if term not in set(attributes)
-            and term not in _GENERIC_SEARCH_TERMS
-            and term not in _ATOMIC_ATTRIBUTE_CANONICAL
+            if term not in set(attributes) and term not in _GENERIC_SEARCH_TERMS
         ]
         entity = " ".join(fallback_terms[:3])
 
