@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "commit": "5f48b9440f7361dd74933a00506496590bb6e8a7",
+  "experiment_id": "frames-answer-revise-20260722-092749",
+  "runtime_mode": "answer_revise",
+  "selected_result_count": 5,
+  "incomplete_attempt_count": 0,
+  "completion_distribution": {"partial": 1, "timed_out": 4},
+  "failure_distribution": {"deadline_exceeded": 4},
+  "normalized_exact_matches": 0,
+  "artifact_hashes": {
+    "summary.json": "sha256:81dc79acbe69a2ab9265a401172792e8a8568d1396348878e358ff5d1c5b5f7e",
+    "final-summary.json": "sha256:81dc79acbe69a2ab9265a401172792e8a8568d1396348878e358ff5d1c5b5f7e",
+    "answer_revise_launcher_manifest.json": "sha256:51ca53f1ee64ae8880128c869c2914096df6da5bc58e3186fc6614d25a56bac9"
+  }
+}
