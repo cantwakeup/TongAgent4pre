@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "experiment": "constraint-guided-gpt55-attribution-canary-20260722T141647Z",
+  "git_sha": "fb8f2b0a6a15958914ec6f76e0af4e6bc7e0c84a",
+  "model": "gpt-5.5",
+  "temperature": 1.0,
+  "seed": 17,
+  "task_ids": [
+    "frames-test-0069",
+    "frames-test-0612",
+    "frames-test-0615",
+    "frames-test-0637"
+  ],
+  "new_run_count": 12,
+  "incomplete_attempt_count": 0,
+  "systems": [
+    {
+      "system": "long_react_v1",
+      "exact_matches": 1,
+      "answer_count": 3,
+      "budget_exhausted": 0,
+      "tokens": 156772,
+      "search_calls": 6,
+      "fetch_calls": 10,
+      "wall_time_seconds": 383.2196062668809,
+      "conservative_cost_usd": 0.92761
+    },
+    {
+      "system": "simple_react",
+      "exact_matches": 2,
+      "answer_count": 4,
+      "budget_exhausted": 0,
+      "tokens": 105386,
+      "search_calls": 6,
+      "fetch_calls": 10,
+      "wall_time_seconds": 288.2922115190304,
+      "conservative_cost_usd": 0.627455
+    },
+    {
+      "system": "vanilla_deepagents",
+      "exact_matches": 2,
+      "answer_count": 4,
+      "budget_exhausted": 2,
+      "tokens": 229020,
+      "search_calls": 12,
+      "fetch_calls": 15,
+      "wall_time_seconds": 337.41173400898697,
+      "conservative_cost_usd": 1.248175
+    },
+    {
+      "system": "structured_context_frozen_result",
+      "experiment": "constraint-guided-structured-context-gpt55-canary-20260722T134327Z",
+      "git_sha": "aa4969cf93ab3f2ba3011b4caf78419303703a21",
+      "exact_matches": 2,
+      "answer_count": 3,
+      "budget_exhausted": 0,
+      "tokens": 82330,
+      "search_calls": 13,
+      "fetch_calls": 11,
+      "wall_time_seconds": 747.9253332189401,
+      "conservative_cost_usd": 0.56605
+    }
+  ],
+  "exact_match_task_sets": {
+    "long_react_v1": ["frames-test-0615"],
+    "simple_react": ["frames-test-0615", "frames-test-0637"],
+    "vanilla_deepagents": ["frames-test-0615", "frames-test-0637"],
+    "structured_context": ["frames-test-0615", "frames-test-0637"]
+  },
+  "post_run_findings": {
+    "classification": "model_effect_and_no_tongagent_baseline_advantage",
+    "structured_context_incremental_em_over_v1": 1,
+    "structured_context_incremental_em_over_best_baseline": 0,
+    "baseline_and_structured_correctness_complementary": false,
+    "task_0069": "Simple ReAct and Structured Context extracted the correct semantic candidate '7 years', but the frozen conservative whole-string metric retains the gold period and counts the prediction as a non-match.",
+    "task_0612": "All systems failed the gold language relation; baselines selected Selayar while the gold answer is Makassarese, and both Long-ReAct variants abstained.",
+    "task_0615": "All four GPT-5.5 systems answered Summer Magic, so this improvement is primarily attributable to model capacity.",
+    "task_0637": "Structured Context and both baselines answered 143 years; Long-ReAct v1 emitted 143 without the required unit and failed conservative whole-string EM."
+  },
+  "usage_monitor": {
+    "scope": "Structured Context GPT-5.5 canary plus the 12-run attribution canary since the recorded endpoint snapshot",
+    "requests": 84,
+    "input_tokens": 553438,
+    "output_tokens": 20070,
+    "conservative_cost_usd": 3.36929,
+    "remaining_of_30_usd_cap": 26.63071,
+    "limitation": "The endpoint exposes cumulative tokens but no daily or per-model cost breakdown."
+  },
+  "decision": {
+    "strong_positive": false,
+    "medium_positive": false,
+    "tongagent_beats_baseline": false,
+    "primary_effect": "gpt-5.5_model_capacity",
+    "recommended_current_variant": "simple_react_for_pareto_efficiency",
+    "dev12_tongagent_mechanism_expansion_supported": false,
+    "additional_code_changes_allowed": false
+  }
+}
