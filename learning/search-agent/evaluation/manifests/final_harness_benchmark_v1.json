@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "manifest_type": "final_transparent_harness_benchmark",
+  "implementation_commit": "73c05c944436012a9966e95d5c35d9048799984a",
+  "selection_frozen_before_answer_materialization": true,
+  "historical_task_overlap_count": 0,
+  "systems": [
+    "bare_simple_react",
+    "vanilla_deepagents",
+    "tongagent_standard"
+  ],
+  "shared_config": {
+    "runtime_mode": "tongagent_standard",
+    "model": "gpt-5.5",
+    "temperature": 1.0,
+    "seed": 17,
+    "retrieval_backend": "unified",
+    "max_search_calls": 4,
+    "max_fetch_calls": 6,
+    "max_total_tool_calls": 12,
+    "max_model_calls": 16,
+    "max_total_tokens": 100000,
+    "max_output_tokens": 5000,
+    "task_watchdog_sec": 600,
+    "max_results_per_search": 5,
+    "max_page_chars": 12000,
+    "recursion_limit": 125,
+    "task_input_policy": "question_only",
+    "scoring": [
+      "raw_whole_string_em",
+      "standard_normalized_em",
+      "answer_rate"
+    ]
+  },
+  "cost_guard": {
+    "currency": "USD",
+    "hard_cap": 20.0,
+    "conservative_projected_cost": 18.8,
+    "projection_basis": "observed GPT-5.5 attribution runs with a 1.5x margin",
+    "browsecomp_reduction_required": false
+  },
+  "datasets": [
+    {
+      "name": "GAIA",
+      "source": "sayan1101/gaia_filtered_text_only",
+      "official_source_status": "official gaia-benchmark/GAIA required unavailable HF authentication",
+      "config": "default",
+      "split": "validation",
+      "selection_rule": "Level == 1 and empty file_name/file_path, sorted by task_id, first 10",
+      "selection_fields": [
+        "task_id",
+        "Question",
+        "Level",
+        "file_name",
+        "file_path",
+        "source_index"
+      ],
+      "tasks": [
+        {"task_id": "0383a3ee-47a7-41a4-b493-519bdefe0488", "source_index": 86, "question_sha256": "b8a7e2f1783c7326b823acf822dd26a0acc25ad7beda5771a3ffe915432ed144"},
+        {"task_id": "11af4e1a-5f45-467d-9aeb-46f4bb0bf034", "source_index": 91, "question_sha256": "9a4509f4e50824e48642a947ca36657062b8344d14a78d7ba352c2f031ab0a7c"},
+        {"task_id": "23dd907f-1261-4488-b21c-e9185af91d5e", "source_index": 105, "question_sha256": "ded23aa43973e6460b2692529f83688cd74ab36ac83850a29c741d99164f7adb"},
+        {"task_id": "27d5d136-8563-469e-92bf-fd103c28b57c", "source_index": 32, "question_sha256": "8ed8dfc0f5d2866887f525845201fe2b24e84cd30c5b7269c8eafa95e13bfe43"},
+        {"task_id": "2d83110e-a098-4ebb-9987-066c06fa42d0", "source_index": 29, "question_sha256": "319894ef2e18db1c8205a6eaf474398d295548a7736adfdc05f7c8d59d088217"},
+        {"task_id": "305ac316-eef6-4446-960a-92d80d542f82", "source_index": 83, "question_sha256": "0e8256f1fc62ba8a55e958d58c00103269affa45dd93bfb4334abf7641c4ee93"},
+        {"task_id": "3cef3a44-215e-4aed-8e3b-b1e3f08063b7", "source_index": 75, "question_sha256": "8658b9aadc317d6ea122061e3460c9ebf670cdd831dd098e4cecbdadef76d5ee"},
+        {"task_id": "3f57289b-8c60-48be-bd80-01f8099ca449", "source_index": 103, "question_sha256": "c27e9461f713e7377a27e6e9fee3ad5c5b5bcaae917434604465cc13c455bfb1"},
+        {"task_id": "42576abe-0deb-4869-8c63-225c2d75a95a", "source_index": 41, "question_sha256": "ea2efd49003e9571db40287183f334c935a212936bdac4ee79cb13f693bf5f59"},
+        {"task_id": "46719c30-f4c3-4cad-be07-d5cb21eee6bb", "source_index": 16, "question_sha256": "e48d691e88a3fca5abf2fdff76a3ce87bf33872db41e0ab56e60ac51bd61e43c"}
+      ]
+    },
+    {
+      "name": "BrowseComp",
+      "source": "smolagents/browse_comp",
+      "official_decryption": "openai/simple-evals browsecomp_eval.py derive_key/decrypt using row canary",
+      "config": "default",
+      "split": "test",
+      "selection_rule": "decrypt problem only, SHA-256 the question, sort by question_sha256, first 10",
+      "selection_fields": [
+        "problem",
+        "problem_topic",
+        "canary",
+        "source_index"
+      ],
+      "answer_field_used_for_selection": false,
+      "tasks": [
+        {"task_id": "browsecomp-00088739962ef98f", "source_index": 1148, "question_sha256": "00088739962ef98fed02f56481899a0d74958fe7d5892289297a5e7265d69068"},
+        {"task_id": "browsecomp-00792eac015de490", "source_index": 195, "question_sha256": "00792eac015de49008120a119a1a97f42d4482218617254770fb5902ed4caf2a"},
+        {"task_id": "browsecomp-00e082ffa8ac7bd9", "source_index": 969, "question_sha256": "00e082ffa8ac7bd938c68f43b9599ed7d11a267e24aca7474ceac19c73e3eb4a"},
+        {"task_id": "browsecomp-017c1f68f62bbf91", "source_index": 1139, "question_sha256": "017c1f68f62bbf91cd0cec70da1dfd1ee158c63ef3cf9dbe3e3e2684469c8223"},
+        {"task_id": "browsecomp-0182262733a958c4", "source_index": 1225, "question_sha256": "0182262733a958c427ec1e50dadb87a27ea406a6b230be043a7db5f4270c2ef0"},
+        {"task_id": "browsecomp-01e63043eb86a1a5", "source_index": 429, "question_sha256": "01e63043eb86a1a5f0d95f3a922864ab1b2af4c2983e044dcd58bf14764ea5c9"},
+        {"task_id": "browsecomp-0225d819d53d70d7", "source_index": 537, "question_sha256": "0225d819d53d70d77325d3f6e76120c7770f8b7cb9853ea42d12a6c0b4b1d9c7"},
+        {"task_id": "browsecomp-02540fa712871a6a", "source_index": 515, "question_sha256": "02540fa712871a6ad290c40f16d60bae61a8d49a45c9a2f230ea6dde3b3cf05f"},
+        {"task_id": "browsecomp-025775f4ecb5ba0d", "source_index": 560, "question_sha256": "025775f4ecb5ba0dd40c4ea781c583b80e2bb1fa4db4690db31229b9be779a54"},
+        {"task_id": "browsecomp-02871b42634d2d7b", "source_index": 257, "question_sha256": "02871b42634d2d7ba11d9c7ce8383b2e5e25c0e335e27a992c91354122a33eb8"}
+      ]
+    }
+  ],
+  "immutable_after_creation": true
+}
