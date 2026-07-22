@@ -112,7 +112,11 @@ class TongAgentRunner:
         before a controlled live experiment can spend a model or web budget.
         """
 
-        if resolved_config.runtime_mode in {"permissive", "answer_revise"}:
+        if resolved_config.runtime_mode in {
+            "permissive",
+            "answer_revise",
+            "score_first",
+        }:
             # The permissive implementation is intentionally a code-owned
             # workflow rather than a LangGraph/FSM.  Keep the strict builder
             # entirely untouched and preflight the exact permissive runtime
@@ -121,6 +125,15 @@ class TongAgentRunner:
                 from .answer_revise import preflight_answer_revise_workflow
 
                 return preflight_answer_revise_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
+            if resolved_config.runtime_mode == "score_first":
+                from .score_first import preflight_score_first_workflow
+
+                return preflight_score_first_workflow(
                     task,
                     resolved_config,
                     fixture_backend=self._fixture_backend,
@@ -178,7 +191,11 @@ class TongAgentRunner:
     def run(self, task: EvalTask, resolved_config: ResolvedConfig) -> RunResult:
         """Execute one isolated, checkpointed B3 attempt."""
 
-        if resolved_config.runtime_mode in {"permissive", "answer_revise"}:
+        if resolved_config.runtime_mode in {
+            "permissive",
+            "answer_revise",
+            "score_first",
+        }:
             # Do not route permissive research through the strict FSM.  Both
             # modes still receive the same shared runtime, retrieval wrappers,
             # security checks, and hard execution budget.
@@ -186,6 +203,15 @@ class TongAgentRunner:
                 from .answer_revise import run_answer_revise_workflow
 
                 return run_answer_revise_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
+            if resolved_config.runtime_mode == "score_first":
+                from .score_first import run_score_first_workflow
+
+                return run_score_first_workflow(
                     task,
                     resolved_config,
                     fixture_backend=self._fixture_backend,
