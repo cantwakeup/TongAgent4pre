@@ -19,40 +19,45 @@ The stored artifacts contain full queries, ranked search results/snippets, tool-
 | Query/retrieval | 0299, 0612, 0637, 0750 | 4 |
 | Context/operation/selection | 0069, 0132, 0360, 0615 | 4 |
 | Fetch | 0087 | 1 |
-| No failure | 0163, 0452, 0473 | 3 |
+| Format | 0163, 0473 | 2 |
+| No benchmark failure | 0452 | 1 |
 
 Additional recoverability signals:
 
 - Explicit correct candidate appeared in 4/12 traces.
-- All required facts appeared in 6/12 traces.
-- A final operation was possible from saved trace facts in 6/12 traces.
+- The persisted fact chain is auditable in 6/12 traces; 0132 and 0360 are excluded because the required fetched passage is redacted or an operand is missing.
+- The final answer satisfies normalized whole-string EM in only 1/12 traces.
+- Runtime completed without timeout, budget exhaustion, or runner error in 8/12 traces.
+- All required facts appeared in 6/12 traces, and a final operation was possible from saved trace facts in 6/12 traces.
 - `stronger_model_or_retrieval` is recommended for 4/12, below the stop threshold of more than 6.
 - Fetch is the unique primary class for only 1 task, below the two-task fetch-recovery trigger.
 
 ## Per-task audit
 
-| Task | Candidate seen | Required facts | Operation possible | First divergence | Primary class | Main recoverability |
-|---|---:|---:|---:|---:|---|---|
-| 0069 | No | Yes | Yes | 7 | operation | structured context |
-| 0087 | No | Yes | Yes | 2 | fetch | fetch recovery; structured context |
-| 0132 | No | No | No | 6 | operation | structured context; stronger capability |
-| 0163 | Yes | Yes | Yes | — | none | already correct |
-| 0299 | No | No | No | 1 | query | query reformulation |
-| 0360 | Not auditable | Not auditable | No | 4 | context | structured context |
-| 0452 | Yes | Yes | Yes | — | none | already correct |
-| 0473 | Yes | Yes | Yes | — | none | already correct |
-| 0612 | No | No | No | 1 | query | query reformulation |
-| 0615 | Yes | Yes | Yes | 6 | selection | structured context; candidate selection |
-| 0637 | No | No | No | 1 | query | relation-aware query reformulation |
-| 0750 | No | No | No | 5 | query | temporal query reformulation |
+| Task | Runtime failure | Candidate seen | Final EM | Fact chain auditable | First divergence | Primary class |
+|---|---|---:|---:|---:|---:|---|
+| 0069 | token exhaustion | No | No | Yes | 7 | operation |
+| 0087 | token exhaustion | No | No | Yes | 2 | fetch |
+| 0132 | none | No | No | No | 6 | operation |
+| 0163 | none | Yes | No | Yes | — | format |
+| 0299 | token exhaustion | No | No | No | 1 | query |
+| 0360 | none | Not auditable | No | No | 4 | context |
+| 0452 | none | Yes | Yes | Yes | — | none |
+| 0473 | none | Yes | No | Yes | — | format |
+| 0612 | none | No | No | No | 1 | query |
+| 0615 | none | Yes | No | Yes | 6 | selection |
+| 0637 | none | No | No | No | 1 | query |
+| 0750 | token exhaustion | No | No | No | 5 | query |
 
 Key trace-level findings:
 
 - **0069:** SDP/1899 and Parliament/1906 both appear, but the model first computes two dates inside 1906 and exhausts the token budget immediately after finding 1899.
 - **0087:** search snippets contain Straneo, Bonelli, and both nationalities, but every canonical fetch fails; the terminal selection reuses a noisy result for another Lesticus species.
 - **0132:** relevant dates/pages are partially present, but the Python calls are malformed or compute only the first interval. The exact 79 CE date is not retained in an auditable passage.
+- **0163:** the 712 candidate and its operands are auditable and runtime succeeds, but the terminal short answer omits “years”, so whole-string EM is false.
 - **0299:** the first query copies the multi-hop question, then the trace diverges to Omelas/New Dimensions rather than isolating the early world-building stories and their magazine.
 - **0360:** the exact year table is successfully fetched, but the body is redacted in the artifact and the following model turn abstains.
+- **0473:** the candidate 5 and supporting chain are auditable and runtime succeeds, but the short answer does not whole-string match the reference sentence.
 - **0615:** `Summer Magic` is explicitly present after the Parent Trap/Hayley Mills chain, but the final answer emits the intermediate actress.
 - **0637:** both runs misread “preceded” as a historical predecessor and never surface the required 1862 opening operand.
 - **0750:** the trace asks for Alan Menken's lifetime Grammy total rather than the cumulative total at Tom Hanks's first Oscar.
@@ -79,4 +84,6 @@ The canary is fixed from failure class before implementation:
 
 The controls are not chosen from reference-answer difficulty. They are two tasks outside the selected mechanism's class.
 
-No canary has been run. A future four-task run may expand to dev12 only if it gains at least one EM **or** repairs at least two preregistered fact chains, has zero timeout and runner errors, and does not exceed the frozen-v1 token-exhaustion count for these same four tasks. Otherwise the one mechanism must be reverted and dev12 must not run.
+No Structured Context canary has been run yet. The frozen-v1 values on these four tasks are: 4/4 legal results, zero timeout/runner error/token exhaustion, 9 search calls, 9 fetch calls, and 50,583.5 mean tokens.
+
+Expansion requires **all** of the following: at least one new EM on 0069 or 0615, 4/4 legal results, zero timeout and runner error, zero token exhaustion, no more than 9 searches and 9 fetches, and mean tokens no greater than 55,641.85. Repairing two fact chains without an EM gain is diagnostic only and cannot authorize dev12.

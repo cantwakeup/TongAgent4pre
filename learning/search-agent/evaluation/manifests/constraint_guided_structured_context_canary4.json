@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "manifest_type": "constraint_guided_structured_context_canary4",
+  "selection_frozen_in_commit": "fb3986e46054359e59f91bbb3ed61b8374498881",
+  "baseline_experiment": "constraint-guided-dev12-v1-baseline-20260722T091000Z",
+  "dataset": "evaluation/datasets/constraint_guided_structured_context_canary4.jsonl",
+  "selected_tasks": [
+    {
+      "task_id": "frames-test-0069",
+      "role": "mechanism",
+      "failure_class": "operation"
+    },
+    {
+      "task_id": "frames-test-0615",
+      "role": "mechanism",
+      "failure_class": "selection"
+    },
+    {
+      "task_id": "frames-test-0612",
+      "role": "control",
+      "failure_class": "query"
+    },
+    {
+      "task_id": "frames-test-0637",
+      "role": "control",
+      "failure_class": "query"
+    }
+  ],
+  "frozen_v1_canary": {
+    "legal_results": 4,
+    "mechanism_exact_matches": 0,
+    "timeout": 0,
+    "runner_error": 0,
+    "token_exhaustion": 0,
+    "search_calls": 9,
+    "fetch_calls": 9,
+    "mean_tokens": 50583.5
+  },
+  "hard_gate": {
+    "mechanism_task_em_gain_minimum": 1,
+    "legal_results_minimum": 4,
+    "timeout_maximum": 0,
+    "runner_error_maximum": 0,
+    "token_exhaustion_maximum": 0,
+    "search_calls_maximum": 9,
+    "fetch_calls_maximum": 9,
+    "mean_tokens_maximum": 55641.85
+  },
+  "single_mechanism": "structured_context",
+  "forbidden_in_this_iteration": [
+    "query_rewriting",
+    "fetch_recovery",
+    "candidate_selector",
+    "final_verifier",
+    "selective_heavy_mode",
+    "second_trajectory",
+    "new_retrieval_provider",
+    "new_model_call_stage"
+  ],
+  "immutable_after_creation": true
+}

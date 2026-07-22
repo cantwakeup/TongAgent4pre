@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from evaluation.execution import resolve_system_config
 from evaluation.offline import FixtureBackend, FixtureChatModel
@@ -14,6 +14,7 @@ from evaluation.schema import AnswerStatus, CompletionStatus, EvalTask, ToolCall
 from evaluation.systems.long_react import (
     _answer_from_successful_python,
     _format_short_answer,
+    StructuredResearchState,
     build_answer_contract,
     build_python_tool,
     compact_long_react_messages,
@@ -217,6 +218,18 @@ def test_context_manager_keeps_five_recent_tools_and_summarizes_older() -> None:
     messages = [HumanMessage(content="question")]
     for index in range(7):
         messages.append(
+            AIMessage(
+                content=f"old reasoning that must be removed {index}",
+                tool_calls=[
+                    {
+                        "id": f"call-{index}",
+                        "name": "fetch_url",
+                        "args": {"url": f"https://fixture.test/{index}"},
+                    }
+                ],
+            )
+        )
+        messages.append(
             ToolMessage(
                 content=json.dumps(
                     {
@@ -231,16 +244,117 @@ def test_context_manager_keeps_five_recent_tools_and_summarizes_older() -> None:
             )
         )
 
-    compacted, summary, old_count = compact_long_react_messages(messages)
+    state = StructuredResearchState.from_question(
+        "question", build_answer_contract("question")
+    )
+    compacted, summary, old_count = compact_long_react_messages(
+        messages,
+        research_state=state,
+        budget_snapshot={"remaining_total_tokens": 42_000},
+    )
 
     assert old_count == 2
     assert isinstance(compacted[0], SystemMessage)
-    assert summary.startswith("R1 [fetch_url]")
+    assert isinstance(compacted[1], SystemMessage)
+    assert isinstance(compacted[2], HumanMessage)
+    assert compacted[2].content == "question"
+    assert json.loads(summary)["question_target"]["question"] == "question"
+    assert "remaining_total_tokens" in str(compacted[1].content)
     tool_messages = [item for item in compacted if isinstance(item, ToolMessage)]
-    assert json.loads(str(tool_messages[0].content))["status"] == "compacted"
-    assert json.loads(str(tool_messages[1].content))["status"] == "compacted"
-    assert "confirmed fact 2" in str(tool_messages[2].content)
-    assert len(summary) < 6_000
+    assert len(tool_messages) == 5
+    assert "confirmed fact 2" in str(tool_messages[0].content)
+    assert "confirmed fact 0" not in json.dumps(
+        [item.model_dump(mode="json") for item in tool_messages]
+    )
+    assert "confirmed fact 0" in summary
+    assert all(item.content == "" for item in compacted if isinstance(item, AIMessage))
+    assert len(summary) <= 12_000
+
+
+def test_structured_state_tracks_fact_schema_operands_and_candidate_roles() -> None:
+    question = "How many years after Alpha began did Beta end?"
+    messages = [HumanMessage(content=question)]
+    scripted = [
+        (
+            "web_search",
+            {"query": "Alpha began year"},
+            {
+                "status": "success",
+                "query": "Alpha began year",
+                "results": [
+                    {
+                        "title": "Alpha",
+                        "snippet": "Alpha began in 1899.",
+                        "url": "https://fixture.test/alpha",
+                    }
+                ],
+            },
+        ),
+        (
+            "web_search",
+            {"query": "Beta ended year"},
+            {
+                "status": "success",
+                "query": "Beta ended year",
+                "results": [
+                    {
+                        "title": "Beta",
+                        "snippet": "Beta ended in 1906.",
+                        "url": "https://fixture.test/beta",
+                    }
+                ],
+            },
+        ),
+        (
+            "python",
+            {"operation": "arithmetic", "expression": "1906-1899"},
+            {"status": "success", "operation": "arithmetic", "result": 7},
+        ),
+    ]
+    for index, (name, arguments, payload) in enumerate(scripted, start=1):
+        call_id = f"call-{index}"
+        messages.append(
+            AIMessage(
+                content="discard me",
+                tool_calls=[{"id": call_id, "name": name, "args": arguments}],
+            )
+        )
+        messages.append(
+            ToolMessage(
+                content=json.dumps(payload),
+                tool_call_id=call_id,
+                name=name,
+            )
+        )
+
+    state = StructuredResearchState.from_question(
+        question, build_answer_contract(question)
+    )
+    state.observe_messages(messages)
+    snapshot = state.snapshot()
+
+    assert snapshot["question_target"]["answer_type"] == "duration"
+    assert {item["semantic_role"] for item in snapshot["intermediate_entities"]} == {
+        "intermediate",
+        "possible_final",
+    }
+    assert {item["semantic_role"] for item in snapshot["final_candidates"]} == {
+        "possible_final",
+        "final",
+    }
+    assert {item["value"] for item in snapshot["operands"]} >= {"1899", "1906"}
+    assert all(
+        set(item)
+        == {
+            "subject",
+            "relation",
+            "object",
+            "semantic_role",
+            "source_id",
+            "introduced_turn",
+        }
+        for item in snapshot["confirmed_facts"]
+    )
 
 
 def test_long_react_preflight_and_controlled_loop_are_nonblocking(
@@ -270,9 +384,24 @@ def test_long_react_preflight_and_controlled_loop_are_nonblocking(
     native = tmp_path / "native" / "tongagent"
     contract = json.loads((native / "answer_contract.json").read_text())
     context = json.loads((native / "context_manager.json").read_text())
+    structured = json.loads((native / "structured_research_state.json").read_text())
     audit = json.loads((native / "long_react_audit.json").read_text())
     assert contract["answer_contract"]["answer_type"] == "location"
     assert context["keep_last_k_tool_results"] == 5
+    assert structured["question_target"]["question"] == task.question
+    assert structured["confirmed_facts"]
+    assert all(
+        set(item)
+        == {
+            "subject",
+            "relation",
+            "object",
+            "semantic_role",
+            "source_id",
+            "introduced_turn",
+        }
+        for item in structured["confirmed_facts"]
+    )
     assert audit["posthoc_only"] is True
     assert audit["answer_unchanged_by_audit"] is True
     assert len(audit["source_mapping"]) == 1

@@ -17,7 +17,10 @@
   "tasks": [
     {
       "task_id": "frames-test-0069",
+      "runtime_failure": "token_exhaustion",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [],
       "required_facts_seen": true,
       "missing_facts": [],
@@ -32,7 +35,10 @@
     },
     {
       "task_id": "frames-test-0087",
+      "runtime_failure": "token_exhaustion",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [],
       "required_facts_seen": true,
       "missing_facts": [],
@@ -48,7 +54,10 @@
     },
     {
       "task_id": "frames-test-0132",
+      "runtime_failure": "none",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -66,7 +75,10 @@
     },
     {
       "task_id": "frames-test-0163",
+      "runtime_failure": "none",
       "correct_candidate_seen": true,
+      "final_answer_correct": false,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [
         "Python call 5 result 712",
         "final answer"
@@ -75,13 +87,16 @@
       "missing_facts": [],
       "operation_possible_from_trace": true,
       "first_divergence_turn": null,
-      "failure_class": null,
+      "failure_class": "format",
       "recoverable_by": [],
-      "evidence_basis": "Search results supply 1227 and 1939, and the corrected date_difference call deterministically returns 712."
+      "evidence_basis": "Search results supply 1227 and 1939, and the corrected date_difference call deterministically returns 712. Runtime completed normally, but FINAL_ANSWER: 712 omits the reference unit and normalized whole-string EM is false."
     },
     {
       "task_id": "frames-test-0299",
+      "runtime_failure": "token_exhaustion",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -100,7 +115,10 @@
     },
     {
       "task_id": "frames-test-0360",
+      "runtime_failure": "none",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -117,7 +135,10 @@
     },
     {
       "task_id": "frames-test-0452",
+      "runtime_failure": "none",
       "correct_candidate_seen": true,
+      "final_answer_correct": true,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [
         "successful Wisconsin Butter Fire page fetch",
         "final answer"
@@ -132,7 +153,10 @@
     },
     {
       "task_id": "frames-test-0473",
+      "runtime_failure": "none",
       "correct_candidate_seen": true,
+      "final_answer_correct": false,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [
         "search call 4 results 2 through 5",
         "final answer"
@@ -141,13 +165,16 @@
       "missing_facts": [],
       "operation_possible_from_trace": true,
       "first_divergence_turn": null,
-      "failure_class": null,
+      "failure_class": "format",
       "recoverable_by": [],
-      "evidence_basis": "The building-to-St. Philip's/Alamo relation is fetched and the second search returns multiple snippets explicitly stating that the district has five colleges."
+      "evidence_basis": "The building-to-St. Philip's/Alamo relation is fetched and the second search returns multiple snippets explicitly stating that the district has five colleges. Runtime completed normally, but FINAL_ANSWER: 5 does not whole-string match the reference sentence and normalized EM is false."
     },
     {
       "task_id": "frames-test-0612",
+      "runtime_failure": "none",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -165,7 +192,10 @@
     },
     {
       "task_id": "frames-test-0615",
+      "runtime_failure": "none",
       "correct_candidate_seen": true,
+      "final_answer_correct": false,
+      "fact_chain_auditable": true,
       "correct_candidate_locations": [
         "search call 5 result 2"
       ],
@@ -182,7 +212,10 @@
     },
     {
       "task_id": "frames-test-0637",
+      "runtime_failure": "none",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -200,7 +233,10 @@
     },
     {
       "task_id": "frames-test-0750",
+      "runtime_failure": "token_exhaustion",
       "correct_candidate_seen": false,
+      "final_answer_correct": false,
+      "fact_chain_auditable": false,
       "correct_candidate_locations": [],
       "required_facts_seen": false,
       "missing_facts": [
@@ -220,6 +256,9 @@
   "aggregate": {
     "task_count": 12,
     "correct_candidate_seen_count": 4,
+    "final_answer_correct_count": 1,
+    "no_runtime_failure_count": 8,
+    "fact_chain_auditable_count": 6,
     "required_facts_seen_count": 6,
     "operation_possible_from_trace_count": 6,
     "failure_class_counts": {
@@ -229,8 +268,8 @@
       "context": 1,
       "operation": 2,
       "selection": 1,
-      "format": 0,
-      "no_failure": 3
+      "format": 2,
+      "no_failure": 1
     },
     "decision_bucket_counts": {
       "selection_context_or_operation": 4,
@@ -274,13 +313,18 @@
       }
     ],
     "gate": {
-      "em_gain_minimum": 1,
-      "alternative_fact_chain_repairs_minimum": 2,
+      "mechanism_task_em_gain_minimum": 1,
+      "fact_chain_repairs_are_diagnostic_only": true,
+      "legal_result_minimum": 4,
       "timeout_maximum": 0,
       "runner_error_maximum": 0,
       "token_exhaustion_maximum": 0,
       "token_exhaustion_baseline": "frozen v1 on these four fixed tasks",
-      "token_exhaustion_baseline_count": 0
+      "token_exhaustion_baseline_count": 0,
+      "search_call_total_maximum": 9,
+      "fetch_call_total_maximum": 9,
+      "frozen_v1_mean_tokens": 50583.5,
+      "mean_tokens_maximum": 55641.85
     }
   }
 }
