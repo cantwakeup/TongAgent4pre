@@ -52,7 +52,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatResult
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from pydantic import JsonValue
@@ -81,6 +81,9 @@ from ..schema import (
     answer_for_exact_match,
     extract_answer_contract,
     normalized_exact_match,
+    raw_whole_string_exact_match,
+    standard_normalized_exact_match,
+    strict_answer_rate,
 )
 from ..tracing import TraceCollector, sanitize_trace_value
 from ..token_control import (
@@ -94,6 +97,8 @@ from ..token_control import (
 
 SYSTEM_SIMPLE_REACT = "simple_react"
 SYSTEM_VANILLA_DEEPAGENTS = "vanilla_deepagents"
+SYSTEM_BARE_SIMPLE_REACT = "bare_simple_react"
+SYSTEM_TONGAGENT_STANDARD = "tongagent_standard"
 _URL = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 _SOURCE_ID = re.compile(r"(?<![A-Za-z0-9])S[1-9][0-9]*(?![A-Za-z0-9])")
 _HEX_SHA = re.compile(r"^[0-9a-f]{7,64}$")
@@ -172,6 +177,7 @@ class EvaluationMiddleware(AgentMiddleware):
         stage_output_caps: Mapping[ModelStage, int] | None = None,
         enable_context_compaction: bool = False,
         enable_token_partitions: bool = False,
+        max_model_connection_retries: int = 0,
     ) -> None:
         super().__init__()
         self.execution_budget = execution_budget
@@ -186,6 +192,7 @@ class EvaluationMiddleware(AgentMiddleware):
                 for stage, cap in configured_caps.items()
             }
         self._enable_context_compaction = enable_context_compaction
+        self._max_model_connection_retries = max_model_connection_retries
         self._token_controller = (
             StageTokenController(
                 total_token_limit=execution_budget.limits.max_total_tokens,
@@ -646,43 +653,60 @@ class EvaluationMiddleware(AgentMiddleware):
         model_settings["max_tokens"] = cap
         effective_request = effective_request.override(model_settings=model_settings)
         effective_context = _model_context_profile(effective_request)
-        reservation = self._reserve_model_call(
-            label=label,
-            estimated_input_tokens=_estimate_model_request_input_tokens(
-                effective_request
-            ),
-            stage=stage,
-            active_subquestion_id=active_subquestion_id,
-            context_profile=effective_context,
-            original_context_profile=original_context,
-        )
-        started = time.perf_counter()
-        try:
-            response = handler(effective_request)
-        except Exception as exc:
-            settlement = self.execution_budget.cancel_model_call(reservation)
-            self._cancel_partition_reservation(reservation)
-            context = self._reservation_context.pop(reservation.reservation_id, {})
-            duration = max(0.0, time.perf_counter() - started)
-            failure = _failure_from_exception(
-                exc,
-                default_type=FailureType.MODEL_ERROR,
-                stage="model_call",
-            )
-            self._append_failure(failure)
-            self.trace.record(
-                "model_call_failed",
+        retries = 0
+        while True:
+            reservation = self._reserve_model_call(
                 label=label,
-                call_sequence=context.get("call_sequence"),
+                estimated_input_tokens=_estimate_model_request_input_tokens(
+                    effective_request
+                ),
                 stage=stage,
                 active_subquestion_id=active_subquestion_id,
-                duration_seconds=duration,
-                failure=failure,
-                settlement=settlement,
-                budget=self.execution_budget.snapshot(),
-                token_partition=self.token_partition_snapshot(),
+                context_profile=effective_context,
+                original_context_profile=original_context,
             )
-            raise
+            started = time.perf_counter()
+            try:
+                response = handler(effective_request)
+            except Exception as exc:
+                settlement = self.execution_budget.cancel_model_call(reservation)
+                self._cancel_partition_reservation(reservation)
+                context = self._reservation_context.pop(reservation.reservation_id, {})
+                duration = max(0.0, time.perf_counter() - started)
+                failure = _failure_from_exception(
+                    exc,
+                    default_type=FailureType.MODEL_ERROR,
+                    stage="model_call",
+                )
+                self._append_failure(failure)
+                self.trace.record(
+                    "model_call_failed",
+                    label=label,
+                    call_sequence=context.get("call_sequence"),
+                    stage=stage,
+                    active_subquestion_id=active_subquestion_id,
+                    duration_seconds=duration,
+                    failure=failure,
+                    settlement=settlement,
+                    budget=self.execution_budget.snapshot(),
+                    token_partition=self.token_partition_snapshot(),
+                )
+                if (
+                    retries >= self._max_model_connection_retries
+                    or not _is_transient_model_connection_error(exc)
+                ):
+                    raise
+                retries += 1
+                self.trace.record(
+                    "model_connection_retry",
+                    label=label,
+                    retry_number=retries,
+                    max_retries=self._max_model_connection_retries,
+                    exception_type=type(exc).__name__,
+                    budget=self.execution_budget.snapshot(),
+                )
+                continue
+            break
         duration = max(0.0, time.perf_counter() - started)
         reservation_context = dict(
             self._reservation_context.get(reservation.reservation_id, {})
@@ -1402,6 +1426,8 @@ def prepare_runtime(
     search_query_normalizer: Callable[[str], str] | None = None,
     reserve_final_synthesis: bool | None = None,
     allow_retrieval_extension: bool = False,
+    max_model_connection_retries: int = 0,
+    max_retrieval_connection_retries: int = 0,
 ) -> PreparedRuntime:
     """Resolve model and raw providers, then install shared semantic wrappers."""
 
@@ -1432,6 +1458,14 @@ def prepare_runtime(
         raw_tools = _live_raw_tools()
         model = injected_model or _live_model(resolved_config)
 
+    if max_retrieval_connection_retries:
+        raw_tools = _transparent_retry_raw_tools(
+            raw_tools,
+            execution_budget=execution_budget,
+            trace=trace,
+            max_retries=max_retrieval_connection_retries,
+        )
+
     # The strict graph consumes the held final-extractor reservation through
     # ``finalize_answer``.  The permissive workflow owns its finalization in
     # code after a structured draft call, so it must not leave an unused live
@@ -1451,6 +1485,7 @@ def prepare_runtime(
         ),
         enable_context_compaction=enable_tongagent_context_compaction,
         enable_token_partitions=enable_tongagent_token_control,
+        max_model_connection_retries=max_model_connection_retries,
     )
     semantic_tools, research_budget = _semantic_network_tools(
         resolved_config,
@@ -1495,6 +1530,10 @@ def run_graph_system(
     graph_factory: Callable[[PreparedRuntime, Path], Any],
     injected_backend: FixtureBackend | None = None,
     injected_model: BaseChatModel | None = None,
+    finalize_live_answer: bool = True,
+    max_model_connection_retries: int = 0,
+    max_retrieval_connection_retries: int = 0,
+    graph_invoke_config: Mapping[str, Any] | None = None,
 ) -> RunResult:
     """Execute one graph adapter and return a complete canonical result."""
 
@@ -1525,11 +1564,18 @@ def run_graph_system(
             trace=trace,
             injected_backend=injected_backend,
             injected_model=injected_model,
+            reserve_final_synthesis=finalize_live_answer,
+            max_model_connection_retries=max_model_connection_retries,
+            max_retrieval_connection_retries=max_retrieval_connection_retries,
         )
         graph = graph_factory(runtime, artifact_directory)
+        invoke_config = {
+            "recursion_limit": resolved_config.budget.recursion_limit,
+            **dict(graph_invoke_config or {}),
+        }
         native_output = graph.invoke(
             {"messages": [{"role": "user", "content": task.question}]},
-            config={"recursion_limit": resolved_config.budget.recursion_limit},
+            config=invoke_config,
         )
     except Exception as exc:  # Canonical failure conversion happens below.
         caught = exc
@@ -1540,7 +1586,11 @@ def run_graph_system(
         )
 
     final_answer_override: str | None = None
-    if runtime is not None and resolved_config.backend_kind == "live":
+    if (
+        finalize_live_answer
+        and runtime is not None
+        and resolved_config.backend_kind == "live"
+    ):
         draft = extract_final_answer(native_output)
         try:
             final_answer_override = runtime.middleware.finalize_answer(
@@ -1611,10 +1661,9 @@ def build_run_result(
     """Build a truthful result from canonical runtime observations."""
 
     del trace
+    raw_model_answer = extract_final_answer(native_output)
     final_answer = (
-        final_answer_override
-        if final_answer_override is not None
-        else extract_final_answer(native_output)
+        final_answer_override if final_answer_override is not None else raw_model_answer
     )
     tool_calls = runtime.middleware.tool_calls if runtime is not None else []
     token_usage = runtime.middleware.token_usage if runtime is not None else None
@@ -1647,6 +1696,7 @@ def build_run_result(
         started_at=started_at,
         finished_at=finished_at,
         wall_time_seconds=wall_time_seconds,
+        raw_model_answer=raw_model_answer,
         final_answer=final_answer,
         citations=citations,
         tool_calls=tool_calls,
@@ -1675,6 +1725,15 @@ def build_run_result(
             answer_for_exact_match(final_answer),
             task.reference_answer,
         ),
+        raw_whole_string_em=raw_whole_string_exact_match(
+            final_answer,
+            task.reference_answer,
+        ),
+        standard_normalized_em=standard_normalized_exact_match(
+            final_answer,
+            task.reference_answer,
+        ),
+        answer_rate=strict_answer_rate(final_answer),
         judge_score=None,
     )
 
@@ -2920,6 +2979,76 @@ def _safe_message(exc: BaseException) -> str:
     return sanitized if isinstance(sanitized, str) else type(exc).__name__
 
 
+def _is_transient_model_connection_error(exc: BaseException) -> bool:
+    """Recognize connection-layer failures without retrying algorithm errors."""
+
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return type(exc).__name__ in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+    }
+
+
+def _transparent_retry_raw_tools(
+    raw_tools: Sequence[BaseTool],
+    *,
+    execution_budget: ExecutionBudget,
+    trace: TraceCollector,
+    max_retries: int,
+) -> list[BaseTool]:
+    """Retry transient provider results before ledger duplicate suppression."""
+
+    wrapped: list[BaseTool] = []
+    for raw_tool in raw_tools:
+
+        def invoke_raw(
+            _raw_tool: BaseTool = raw_tool,
+            **kwargs: Any,
+        ) -> Any:
+            result = _raw_tool.invoke(kwargs)
+            retries = 0
+            while retries < max_retries and _raw_result_retryable(result):
+                retries += 1
+                execution_budget.require_tool(_raw_tool.name)
+                trace.record(
+                    "retrieval_connection_retry",
+                    tool_name=_raw_tool.name,
+                    retry_number=retries,
+                    max_retries=max_retries,
+                    budget=execution_budget.snapshot(),
+                )
+                result = _raw_tool.invoke(kwargs)
+            return result
+
+        wrapped.append(
+            StructuredTool.from_function(
+                func=invoke_raw,
+                name=raw_tool.name,
+                description=raw_tool.description,
+                args_schema=raw_tool.args_schema,
+                infer_schema=False,
+                metadata=raw_tool.metadata,
+            )
+        )
+    return wrapped
+
+
+def _raw_result_retryable(result: Any) -> bool:
+    if isinstance(result, Mapping):
+        return result.get("retryable") is True
+    if isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(payload, Mapping) and payload.get("retryable") is True
+    return False
+
+
 def _nonnegative_metric(value: Any, *, upper_bound: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
@@ -2990,6 +3119,8 @@ def write_intermediate_artifacts(
         "task_id": task.id,
         "system_id": resolved_config.system_id,
         "output": sanitize_trace_value(native_output),
+        "raw_model_answer": result.raw_model_answer,
+        "final_answer": result.final_answer,
         "exception": (
             None
             if caught is None
@@ -3021,6 +3152,9 @@ def write_intermediate_artifacts(
     if result.final_answer is not None:
         answer = result.final_answer.rstrip() + "\n"
         _atomic_write_text(native_directory / "answer.md", answer)
+    if result.raw_model_answer is not None:
+        raw_answer = result.raw_model_answer.rstrip() + "\n"
+        _atomic_write_text(native_directory / "raw_model_answer.md", raw_answer)
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:

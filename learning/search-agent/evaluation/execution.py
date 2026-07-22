@@ -38,11 +38,20 @@ from .schema import (
     json_ready,
     normalized_exact_match,
     parse_eval_task_jsonl_line,
+    raw_whole_string_exact_match,
+    standard_normalized_exact_match,
+    strict_answer_rate,
 )
 from .tracing import sanitize_trace_value
 
 
-SYSTEM_IDS = ("simple_react", "vanilla_deepagents", "tongagent")
+SYSTEM_IDS = (
+    "simple_react",
+    "vanilla_deepagents",
+    "tongagent",
+    "bare_simple_react",
+    "tongagent_standard",
+)
 DEFAULT_FIXTURE_DIRECTORY = "evaluation/fixtures"
 DEFAULT_FIXTURE_REVISION = "offline-fixtures-v1"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -581,6 +590,14 @@ def persist_terminal_result(
     # Canonical top-level views are refreshed atomically; only result.json is
     # immutable and unique.
     atomic_write_text(attempt / "answer.md", answer, overwrite=True)
+    raw_answer = result.raw_model_answer or ""
+    if raw_answer and not raw_answer.endswith("\n"):
+        raw_answer += "\n"
+    atomic_write_text(
+        attempt / "raw_model_answer.md",
+        raw_answer,
+        overwrite=True,
+    )
     atomic_write_json(
         attempt / "trace.json",
         _canonical_trace_payload(result, native),
@@ -642,6 +659,7 @@ def build_failure_result(
         started_at=started_at,
         finished_at=finished_at,
         wall_time_seconds=max(0.0, monotonic() - started_monotonic),
+        raw_model_answer=final_answer,
         final_answer=final_answer,
         citations=[],
         tool_calls=[],
@@ -665,6 +683,15 @@ def build_failure_result(
             final_answer,
             task.reference_answer,
         ),
+        raw_whole_string_em=raw_whole_string_exact_match(
+            final_answer,
+            task.reference_answer,
+        ),
+        standard_normalized_em=standard_normalized_exact_match(
+            final_answer,
+            task.reference_answer,
+        ),
+        answer_rate=strict_answer_rate(final_answer),
         judge_score=None,
     )
 
@@ -764,6 +791,18 @@ def _canonical_metrics_payload(result: RunResult) -> dict[str, Any]:
         ),
         "workflow_metrics": result.workflow_metrics,
     }
+    if {
+        "raw_whole_string_em",
+        "standard_normalized_em",
+        "answer_rate",
+    }.intersection(result.model_fields_set):
+        payload.update(
+            {
+                "raw_whole_string_em": result.raw_whole_string_em,
+                "standard_normalized_em": result.standard_normalized_em,
+                "answer_rate": result.answer_rate,
+            }
+        )
     if (
         result.external_retrieval_calls is not None
         or result.internal_tool_calls is not None
@@ -841,6 +880,22 @@ def _validate_companion_artifacts(result_path: Path, result: RunResult) -> None:
         expected_answer += "\n"
     if answer_path.read_text(encoding="utf-8") != expected_answer:
         raise EvaluationStateError(f"answer.md/result mismatch in {result_path}")
+    raw_answer_path = attempt / "raw_model_answer.md"
+    if raw_answer_path.exists() or result.system_id in {
+        "bare_simple_react",
+        "tongagent_standard",
+    }:
+        if raw_answer_path.is_symlink() or not raw_answer_path.is_file():
+            raise EvaluationStateError(
+                f"terminal result is missing raw_model_answer.md: {result_path}"
+            )
+        expected_raw = result.raw_model_answer or ""
+        if expected_raw and not expected_raw.endswith("\n"):
+            expected_raw += "\n"
+        if raw_answer_path.read_text(encoding="utf-8") != expected_raw:
+            raise EvaluationStateError(
+                f"raw_model_answer.md/result mismatch in {result_path}"
+            )
 
     expected_payloads = {
         "trace.json": _canonical_trace_payload(result, native),
@@ -859,7 +914,19 @@ def _validate_companion_artifacts(result_path: Path, result: RunResult) -> None:
             raise EvaluationStateError(
                 f"invalid {name} companion for {result_path}: {exc}"
             ) from exc
-        if actual != expected:
+        comparable_expected = dict(expected)
+        if name == "metrics.json":
+            for field_name in (
+                "raw_whole_string_em",
+                "standard_normalized_em",
+                "answer_rate",
+            ):
+                if (
+                    field_name not in actual
+                    and comparable_expected.get(field_name) is None
+                ):
+                    comparable_expected.pop(field_name, None)
+        if actual != comparable_expected:
             raise EvaluationStateError(f"{name}/result mismatch in {result_path}")
 
 
@@ -1187,7 +1254,7 @@ def _default_system_options(
     fixture_directory: str,
 ) -> dict[str, JsonValue]:
     options: dict[str, JsonValue] = {"fixture_dir": fixture_directory}
-    if system_id == "tongagent":
+    if system_id in {"tongagent", "tongagent_standard"}:
         options.update(
             {
                 "effort": "medium",

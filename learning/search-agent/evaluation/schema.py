@@ -286,7 +286,12 @@ class RunResult(StrictModel):
     task_id: NonEmptyString
     system_id: NonEmptyString
     runtime_mode: Literal[
-        "strict", "permissive", "answer_revise", "score_first", "long_react"
+        "strict",
+        "permissive",
+        "answer_revise",
+        "score_first",
+        "long_react",
+        "tongagent_standard",
     ] = "strict"
     git_sha: NonEmptyString
     resolved_config: ResolvedConfig
@@ -295,6 +300,7 @@ class RunResult(StrictModel):
     started_at: datetime
     finished_at: datetime
     wall_time_seconds: NonNegativeFloat
+    raw_model_answer: str | None = None
     final_answer: str | None
     extracted_answer: str | None = None
     answer_status: AnswerStatus = AnswerStatus.EMPTY
@@ -318,6 +324,9 @@ class RunResult(StrictModel):
     artifact_directory: NonEmptyString
     fixture_smoke: bool
     normalized_exact_match: bool | None
+    raw_whole_string_em: bool | None = None
+    standard_normalized_em: bool | None = None
+    answer_rate: bool | None = None
     judge_score: Coverage | None
     judge_result: JudgeResult | None = None
     workflow_metrics: dict[str, JsonValue] | None = None
@@ -330,6 +339,13 @@ class RunResult(StrictModel):
             raise ValueError(msg)
         if self.runtime_mode != self.resolved_config.runtime_mode:
             msg = "runtime_mode must match resolved_config.runtime_mode"
+            raise ValueError(msg)
+        if self.raw_model_answer is None:
+            self.raw_model_answer = self.final_answer
+        if self.system_id in {"bare_simple_react", "tongagent_standard"} and (
+            self.raw_model_answer != self.final_answer
+        ):
+            msg = "transparent ReAct systems cannot rewrite the raw model answer"
             raise ValueError(msg)
         if self.config_fingerprint != self.resolved_config.config_fingerprint:
             msg = "config_fingerprint must match the resolved configuration"
@@ -549,6 +565,54 @@ def normalized_exact_match(
     return normalize_exact_match_text(scoring_prediction) == normalize_exact_match_text(
         reference_answer
     )
+
+
+def raw_whole_string_exact_match(
+    prediction: str | None,
+    reference_answer: str | None,
+) -> bool | None:
+    """Compare the complete strict short-answer value without normalization."""
+
+    if reference_answer is None:
+        return None
+    candidate = answer_for_exact_match(prediction)
+    return candidate == reference_answer if candidate is not None else False
+
+
+def standard_normalize_text(value: str) -> str:
+    """Apply the frozen, gold-independent standard benchmark normalization."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    without_punctuation = "".join(
+        " " if unicodedata.category(character).startswith("P") else character
+        for character in normalized
+    )
+    tokens = without_punctuation.split()
+    without_articles = [token for token in tokens if token not in {"a", "an", "the"}]
+    return " ".join(without_articles)
+
+
+def standard_normalized_exact_match(
+    prediction: str | None,
+    reference_answer: str | None,
+) -> bool | None:
+    """Compare one complete extracted answer using only frozen operations."""
+
+    if reference_answer is None:
+        return None
+    candidate = answer_for_exact_match(prediction)
+    if candidate is None:
+        return False
+    return standard_normalize_text(candidate) == standard_normalize_text(
+        reference_answer
+    )
+
+
+def strict_answer_rate(prediction: str | None) -> bool:
+    """Return whether exactly one non-abstaining ``FINAL_ANSWER`` is present."""
+
+    status, answer = extract_answer_contract(prediction)
+    return status == AnswerStatus.ANSWER and answer is not None
 
 
 def parse_eval_task_jsonl_line(

@@ -64,8 +64,16 @@ _DEFAULT_ANSWER = "Fixture research completed."
 _RESPONSE_KEYS = frozenset({"response", "responses"})
 _SYSTEM_ALIASES = {
     "simple_react": ("simple_react", "b1", "B1"),
+    "bare_simple_react": ("bare_simple_react", "simple_react", "b1", "B1"),
     "vanilla_deepagents": ("vanilla_deepagents", "b2", "B2"),
     "tongagent": ("tongagent", "b3", "B3"),
+    "tongagent_standard": (
+        "tongagent_standard",
+        "bare_simple_react",
+        "simple_react",
+        "b1",
+        "B1",
+    ),
 }
 _T = TypeVar("_T")
 

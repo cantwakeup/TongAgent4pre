@@ -27,6 +27,9 @@ from evaluation import (
     TraceCollector,
     normalized_exact_match,
     parse_eval_task_jsonl_line,
+    raw_whole_string_exact_match,
+    standard_normalized_exact_match,
+    strict_answer_rate,
 )
 
 
@@ -140,6 +143,23 @@ def test_normalized_exact_match_is_unicode_whitespace_whole_string_only() -> Non
     assert normalized_exact_match("The answer is Paris.", "Paris") is False
     assert normalized_exact_match(None, "Paris") is False
     assert normalized_exact_match("anything", None) is None
+
+
+def test_frozen_standard_scoring_is_gold_independent_and_whole_string_only() -> None:
+    prediction = "FINAL_ANSWER: The ＰＡＲＩＳ!"
+    assert raw_whole_string_exact_match(prediction, "Paris") is False
+    assert standard_normalized_exact_match(prediction, "Paris") is True
+    assert strict_answer_rate(prediction) is True
+    assert (
+        standard_normalized_exact_match(
+            "FINAL_ANSWER: The answer is Paris",
+            "Paris",
+        )
+        is False
+    )
+    assert standard_normalized_exact_match("FINAL_ANSWER: Paris", None) is None
+    assert strict_answer_rate("Paris") is False
+    assert strict_answer_rate("FINAL_ANSWER: ABSTAIN") is False
 
 
 def test_config_fingerprints_are_stable_complete_and_fair() -> None:

@@ -1,0 +1,56 @@
+{
+    "schema_version": 1,
+    "manifest_type": "final_transparent_harness_fault_injection",
+    "systems": ["bare_simple_react", "tongagent_standard"],
+    "faults": [
+        "fetch_first_attempt_failure",
+        "temporary_model_connection_failure",
+        "process_interruption_and_resume",
+        "near_budget_exhaustion"
+    ],
+    "cases": [
+        {
+            "task_id": "fault-fetch-alpha",
+            "fault": "fetch_first_attempt_failure",
+            "answer": "Alpha City"
+        },
+        {
+            "task_id": "fault-fetch-beta",
+            "fault": "fetch_first_attempt_failure",
+            "answer": "Beta City"
+        },
+        {
+            "task_id": "fault-model-alpha",
+            "fault": "temporary_model_connection_failure",
+            "answer": "Alpha City"
+        },
+        {
+            "task_id": "fault-model-beta",
+            "fault": "temporary_model_connection_failure",
+            "answer": "Beta City"
+        },
+        {
+            "task_id": "fault-resume-alpha",
+            "fault": "process_interruption_and_resume",
+            "answer": "Alpha City"
+        },
+        {
+            "task_id": "fault-resume-beta",
+            "fault": "process_interruption_and_resume",
+            "answer": "Beta City"
+        },
+        {
+            "task_id": "fault-budget-alpha",
+            "fault": "near_budget_exhaustion",
+            "answer": "Alpha City"
+        },
+        {
+            "task_id": "fault-budget-beta",
+            "fault": "near_budget_exhaustion",
+            "answer": "Beta City"
+        }
+    ],
+    "selection_policy": "two deterministic text-only fixture tasks per fault; no public benchmark answers",
+    "agent_prompt_modified": false,
+    "immutable_after_creation": true
+}

@@ -30,7 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=SYSTEM_IDS,
         default=list(SYSTEM_IDS),
-        help="baseline system ids (default: all three)",
+        help="registered system ids (default: all)",
     )
     run.add_argument("--dataset", type=Path, required=True, help="UTF-8 task JSONL")
     run.add_argument("--limit", type=_nonnegative_int)

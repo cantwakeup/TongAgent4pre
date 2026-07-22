@@ -34,6 +34,8 @@ _RESULT_COLUMNS = (
     "budget_resource",
     "answer_status",
     "extracted_answer",
+    "raw_whole_string_em",
+    "standard_normalized_em",
     "normalized_exact_match",
     "judge_score",
     "wall_time_seconds",
@@ -228,6 +230,8 @@ def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
         ),
         "answer_status": result.answer_status.value,
         "extracted_answer": result.extracted_answer,
+        "raw_whole_string_em": result.raw_whole_string_em,
+        "standard_normalized_em": result.standard_normalized_em,
         "normalized_exact_match": result.normalized_exact_match,
         "judge_score": result.judge_score,
         "wall_time_seconds": result.wall_time_seconds,
@@ -255,7 +259,7 @@ def _result_row(result: RunResult, attempt: str) -> dict[str, Any]:
         "unsupported_answer_rate": workflow.get("balanced_unsupported_answer_rate"),
         "contradicted_answer_rate": workflow.get("balanced_contradicted_answer_rate"),
         "citation_precision": workflow.get("balanced_citation_precision"),
-        "answer_rate": workflow.get("balanced_answer_rate"),
+        "answer_rate": result.answer_rate,
         "total_tokens": (
             result.token_usage.total_tokens if result.token_usage is not None else None
         ),
@@ -279,6 +283,19 @@ def _system_summaries(
             result.normalized_exact_match
             for result in results
             if result.normalized_exact_match is not None
+        ]
+        raw_exact_values = [
+            result.raw_whole_string_em
+            for result in results
+            if result.raw_whole_string_em is not None
+        ]
+        standard_exact_values = [
+            result.standard_normalized_em
+            for result in results
+            if result.standard_normalized_em is not None
+        ]
+        answer_values = [
+            result.answer_rate for result in results if result.answer_rate is not None
         ]
         token_values = [
             result.token_usage.total_tokens
@@ -360,6 +377,23 @@ def _system_summaries(
                 "normalized_exact_match_rate": (
                     sum(value is True for value in exact_values) / len(exact_values)
                     if exact_values
+                    else None
+                ),
+                "raw_whole_string_em_rate": (
+                    sum(value is True for value in raw_exact_values)
+                    / len(raw_exact_values)
+                    if raw_exact_values
+                    else None
+                ),
+                "standard_normalized_em_rate": (
+                    sum(value is True for value in standard_exact_values)
+                    / len(standard_exact_values)
+                    if standard_exact_values
+                    else None
+                ),
+                "answer_rate": (
+                    sum(value is True for value in answer_values) / len(answer_values)
+                    if answer_values
                     else None
                 ),
                 "total_tool_calls": sum(len(result.tool_calls) for result in results),
@@ -474,10 +508,11 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             "",
             "## System comparison",
             "",
-            "| System | Backend | Smoke | Runs | Completed | Not completed | Exact match | "
+            "| System | Backend | Smoke | Runs | Completed | Not completed | Raw EM | "
+            "Standard EM | Answer rate | "
             "Mean tools | External retrieval | Internal tools | "
             "Mean wall time (s) | Failure distribution |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for system in payload["systems"]:
@@ -494,7 +529,7 @@ def _render_markdown(payload: dict[str, Any]) -> str:
         )
         lines.append(
             "| {system} | {backend} | {smoke} | {runs} | {completed} | "
-            "{failed} | {exact} | "
+            "{failed} | {raw_exact} | {standard_exact} | {answer_rate} | "
             "{tools} | {external} | {internal} | {wall} | {failures} |".format(
                 system=system["system_id"],
                 backend=system["backend_kind"],
@@ -502,7 +537,9 @@ def _render_markdown(payload: dict[str, Any]) -> str:
                 runs=system["runs"],
                 completed=completed,
                 failed=failed,
-                exact=_markdown_value(system["normalized_exact_match_rate"]),
+                raw_exact=_markdown_value(system["raw_whole_string_em_rate"]),
+                standard_exact=_markdown_value(system["standard_normalized_em_rate"]),
+                answer_rate=_markdown_value(system["answer_rate"]),
                 tools=_markdown_value(system["mean_tool_calls"]),
                 external=_markdown_value(system["total_external_retrieval_calls"]),
                 internal=_markdown_value(system["total_internal_tool_calls"]),
@@ -516,15 +553,15 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             "## Selected task results",
             "",
             "| System | Task | Attempt | Status | Failure | Budget | Answer status | "
-            "Exact match | Tools | External | Internal | Wall time (s) | Evidence | "
+            "Raw EM | Standard EM | Answer | Tools | External | Internal | Wall time (s) | Evidence | "
             "Structural coverage | Tokens |",
-            "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in payload["results"]:
         lines.append(
             "| {system} | {task} | {attempt} | {status} | {failure} | "
-            "{budget} | {answer_status} | {exact} | {tools} | {external} | "
+            "{budget} | {answer_status} | {raw_exact} | {standard_exact} | {answered} | {tools} | {external} | "
             "{internal} | {wall} | {evidence} | {coverage} | "
             "{tokens} |".format(
                 system=row["system_id"],
@@ -534,7 +571,9 @@ def _render_markdown(payload: dict[str, Any]) -> str:
                 failure=_markdown_value(row["failure_type"]),
                 budget=_markdown_value(row["budget_resource"]),
                 answer_status=row["answer_status"],
-                exact=_markdown_value(row["normalized_exact_match"]),
+                raw_exact=_markdown_value(row["raw_whole_string_em"]),
+                standard_exact=_markdown_value(row["standard_normalized_em"]),
+                answered=_markdown_value(row["answer_rate"]),
                 tools=row["tool_calls"],
                 external=_markdown_value(row["external_retrieval_calls"]),
                 internal=_markdown_value(row["internal_tool_calls"]),

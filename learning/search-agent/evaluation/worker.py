@@ -25,6 +25,9 @@ from .schema import (
     RunResult,
     answer_for_exact_match,
     normalized_exact_match,
+    raw_whole_string_exact_match,
+    standard_normalized_exact_match,
+    strict_answer_rate,
 )
 from .tracing import sanitize_trace_value
 
@@ -156,6 +159,15 @@ def _canonicalize_runner_result(
             answer_for_exact_match(result.final_answer),
             task.reference_answer,
         ),
+        "raw_whole_string_em": raw_whole_string_exact_match(
+            result.final_answer,
+            task.reference_answer,
+        ),
+        "standard_normalized_em": standard_normalized_exact_match(
+            result.final_answer,
+            task.reference_answer,
+        ),
+        "answer_rate": strict_answer_rate(result.final_answer),
     }
     if result.failure_type is not None and result.failure is None:
         updates["failure"] = FailureDetail(

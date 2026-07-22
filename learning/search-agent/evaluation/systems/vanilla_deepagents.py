@@ -25,8 +25,10 @@ _SYSTEM_PROMPT = """Research the user's question with web_search and fetch_url.
 
 Use the native DeepAgents planning, filesystem, and general-purpose delegation
 facilities when useful. Base the final answer on fetched page text and cite
-source IDs with full URLs. If retrieval fails or the shared budget is
-exhausted, report the limitation honestly.
+source IDs while researching. If retrieval fails or the shared budget is
+exhausted, stop honestly. When finished, output exactly one line and nothing
+else: FINAL_ANSWER: <short answer>. Use FINAL_ANSWER: ABSTAIN only when the
+available research cannot support an answer.
 """
 
 
@@ -54,6 +56,7 @@ class VanillaDeepAgentsRunner:
             graph_factory=self._build_graph,
             injected_backend=self._fixture_backend,
             injected_model=self._model,
+            finalize_live_answer=False,
         )
 
     @staticmethod

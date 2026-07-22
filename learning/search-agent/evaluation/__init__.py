@@ -38,6 +38,10 @@ from .schema import (
     normalize_exact_match_text,
     normalized_exact_match,
     parse_eval_task_jsonl_line,
+    raw_whole_string_exact_match,
+    standard_normalize_text,
+    standard_normalized_exact_match,
+    strict_answer_rate,
 )
 from .tracing import TraceCollector, sanitize_trace_value
 
@@ -74,6 +78,10 @@ __all__ = [
     "normalize_exact_match_text",
     "normalized_exact_match",
     "parse_eval_task_jsonl_line",
+    "raw_whole_string_exact_match",
+    "standard_normalize_text",
+    "standard_normalized_exact_match",
+    "strict_answer_rate",
     "register_evaluation_judge",
     "sanitize_trace_value",
 ]
