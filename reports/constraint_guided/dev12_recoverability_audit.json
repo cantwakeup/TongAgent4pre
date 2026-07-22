@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "audit_type": "offline_recoverability_audit",
+  "source_commit_under_test": "ba3db01fcbdd5237659b00655f910c7a78d5a451",
+  "current_code_commit": "c4a2ddeb77aaac537cc8b9dd711eb87112a0fe36",
+  "source_experiments": [
+    "constraint-guided-dev12-v1-baseline-20260722T091000Z",
+    "constraint-guided-dev12-iter1-20260722T102000Z"
+  ],
+  "primary_trace_policy": "Iteration 1 is the primary per-task trace; frozen v1 is used only to check whether a failure pattern was stable across both existing runs.",
+  "reference_answer_policy": "Reference answers were read only after each run to classify errors. They were not used to create runtime rules, queries, or candidates.",
+  "artifact_limitations": [
+    "Persisted model-message and fetched-page bodies are intentionally redacted to hashes and character counts.",
+    "The audit can inspect model tool-call decisions, full search results and snippets, fetch status and source metadata, Python calls, context telemetry, final answers, and references.",
+    "A value that may have existed only inside a redacted fetched body is conservatively marked as not auditable rather than inferred."
+  ],
+  "tasks": [
+    {
+      "task_id": "frames-test-0069",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": 7,
+      "failure_class": "operation",
+      "recoverable_by": [
+        "structured_context",
+        "candidate_selection"
+      ],
+      "evidence_basis": "Search call 1 identifies SDP; search call 3 states Parliament was founded in 1906; search call 9 states SDP was founded in 1899. The trace nevertheless calls date_difference on two dates within 1906 and returns 0 before the late 1899 fact can be used."
+    },
+    {
+      "task_id": "frames-test-0087",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": 2,
+      "failure_class": "fetch",
+      "recoverable_by": [
+        "fetch_recovery",
+        "structured_context",
+        "candidate_selection"
+      ],
+      "evidence_basis": "Search snippets identify Lesticus purpurascens as described by Straneo, Pterostichinae as Bonelli, and both Straneo and Bonelli as Italian. Six canonical fetch attempts fail with TLS errors; the final output selects Mikhail Tschitscherine from a noisy result for the different species Lesticus prasinus."
+    },
+    {
+      "task_id": "frames-test-0132",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "an auditable exact date for the 79 CE eruption",
+        "the correct two-interval calculation and rounding semantics"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 6,
+      "failure_class": "operation",
+      "recoverable_by": [
+        "structured_context",
+        "stronger_model_or_retrieval"
+      ],
+      "evidence_basis": "Search results retain the 62 CE earthquake date and the 2013 release date, and both relevant pages were fetched. The exact fetched bodies are redacted. Three Python attempts use an invalid null output_unit or compute only (79-62)*12; no trace operation computes the requested recurring interval count."
+    },
+    {
+      "task_id": "frames-test-0163",
+      "correct_candidate_seen": true,
+      "correct_candidate_locations": [
+        "Python call 5 result 712",
+        "final answer"
+      ],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": null,
+      "failure_class": null,
+      "recoverable_by": [],
+      "evidence_basis": "Search results supply 1227 and 1939, and the corrected date_difference call deterministically returns 712."
+    },
+    {
+      "task_id": "frames-test-0299",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "the two early stories that developed the world used by the relevant first book",
+        "the magazine that published those stories",
+        "the magazine editor at publication time"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 1,
+      "failure_class": "query",
+      "recoverable_by": [
+        "query_reformulation",
+        "stronger_model_or_retrieval"
+      ],
+      "evidence_basis": "The first two queries copy most of the multi-hop question and do not isolate the book or early stories. The trajectory then diverts to The Ones Who Walk Away from Omelas and New Dimensions 3; Cele Goldsmith never appears."
+    },
+    {
+      "task_id": "frames-test-0360",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "the January 29, 1995 row value from the fetched number-one box-office table, which is not retained in the redacted artifact"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 4,
+      "failure_class": "context",
+      "recoverable_by": [
+        "structured_context",
+        "candidate_selection"
+      ],
+      "evidence_basis": "The game date is found, the exact 1995 number-one-film list is selected, and Iteration 1 successfully fetches 12,000 characters from it. The persisted trace redacts the table body and the next model turn abstains."
+    },
+    {
+      "task_id": "frames-test-0452",
+      "correct_candidate_seen": true,
+      "correct_candidate_locations": [
+        "successful Wisconsin Butter Fire page fetch",
+        "final answer"
+      ],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": null,
+      "failure_class": null,
+      "recoverable_by": [],
+      "evidence_basis": "One targeted search and one successful canonical fetch produce the correct Otis Redding answer in both v1 and Iteration 1."
+    },
+    {
+      "task_id": "frames-test-0473",
+      "correct_candidate_seen": true,
+      "correct_candidate_locations": [
+        "search call 4 results 2 through 5",
+        "final answer"
+      ],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": null,
+      "failure_class": null,
+      "recoverable_by": [],
+      "evidence_basis": "The building-to-St. Philip's/Alamo relation is fetched and the second search returns multiple snippets explicitly stating that the district has five colleges."
+    },
+    {
+      "task_id": "frames-test-0612",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "Makassarese as the predominant regional Austronesian language",
+        "a source joining the regional language fact to Sulawesi Selatan rather than only the Selayar Islands"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 1,
+      "failure_class": "query",
+      "recoverable_by": [
+        "query_reformulation",
+        "stronger_model_or_retrieval"
+      ],
+      "evidence_basis": "The first query narrows to the Selayar Islands and promotes Selayarese, while the second fact about the southern peninsula is found separately. The required predominant regional language is not retained in the Iteration 1 candidates."
+    },
+    {
+      "task_id": "frames-test-0615",
+      "correct_candidate_seen": true,
+      "correct_candidate_locations": [
+        "search call 5 result 2"
+      ],
+      "required_facts_seen": true,
+      "missing_facts": [],
+      "operation_possible_from_trace": true,
+      "first_divergence_turn": 6,
+      "failure_class": "selection",
+      "recoverable_by": [
+        "structured_context",
+        "candidate_selection"
+      ],
+      "evidence_basis": "The Parent Trap source is fetched, Hayley Mills is identified, and the final search explicitly returns Summer Magic as the 1963 film starring her. The terminal answer emits the intermediate actress instead of the final film."
+    },
+    {
+      "task_id": "frames-test-0637",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "the intended adjacent/preceeding station on the line",
+        "that station's 1862 opening year"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 1,
+      "failure_class": "query",
+      "recoverable_by": [
+        "query_reformulation",
+        "stronger_model_or_retrieval"
+      ],
+      "evidence_basis": "Both existing runs interpret preceded as a historical predecessor and select Dún Laoghaire/Kingstown with 1834 or 1837. The 1862 operand needed for the reference-derived 143-year result never appears."
+    },
+    {
+      "task_id": "frames-test-0750",
+      "correct_candidate_seen": false,
+      "correct_candidate_locations": [],
+      "required_facts_seen": false,
+      "missing_facts": [
+        "Alan Menken's cumulative Grammy wins by the date of Tom Hanks's first Oscar rather than his current lifetime total"
+      ],
+      "operation_possible_from_trace": false,
+      "first_divergence_turn": 5,
+      "failure_class": "query",
+      "recoverable_by": [
+        "query_reformulation",
+        "fetch_recovery",
+        "stronger_model_or_retrieval"
+      ],
+      "evidence_basis": "The first-Oscar period is found, but the Alan Menken page fetch fails and the next queries ask for his lifetime Grammy total (11), not a year-by-year count through the Oscar date. The required historical count of 9 never appears."
+    }
+  ],
+  "aggregate": {
+    "task_count": 12,
+    "correct_candidate_seen_count": 4,
+    "required_facts_seen_count": 6,
+    "operation_possible_from_trace_count": 6,
+    "failure_class_counts": {
+      "query": 4,
+      "retrieval": 0,
+      "fetch": 1,
+      "context": 1,
+      "operation": 2,
+      "selection": 1,
+      "format": 0,
+      "no_failure": 3
+    },
+    "decision_bucket_counts": {
+      "selection_context_or_operation": 4,
+      "query_or_retrieval": 4,
+      "fetch_primary": 1,
+      "stronger_model_or_retrieval_recommended": 4
+    }
+  },
+  "iteration_2_decision": {
+    "status": "preregistered_not_implemented",
+    "unique_main_modification": "structured_context",
+    "decision_reason": "Selection/context/operation and query/retrieval are tied at four tasks. The deterministic tie-break is recoverability from already-seen facts: three of the four selection/context/operation failures already contain an executable fact chain, versus zero of four query failures. Structured context is therefore the lower-risk single mechanism.",
+    "explicitly_disabled": [
+      "selective_heavy_mode",
+      "second_trajectory",
+      "fetch_recovery_changes",
+      "relation_aware_query_reformulation",
+      "final_candidate_selector"
+    ]
+  },
+  "canary_preregistration": {
+    "status": "fixed_not_run",
+    "mechanism_tasks": [
+      {
+        "task_id": "frames-test-0069",
+        "selection_basis": "operation failure with all operands already present across the trace"
+      },
+      {
+        "task_id": "frames-test-0615",
+        "selection_basis": "selection failure with both intermediate and final candidates already present"
+      }
+    ],
+    "control_tasks": [
+      {
+        "task_id": "frames-test-0612",
+        "selection_basis": "query failure with a missing regional-language fact"
+      },
+      {
+        "task_id": "frames-test-0637",
+        "selection_basis": "query failure caused by relation interpretation and a missing opening-year operand"
+      }
+    ],
+    "gate": {
+      "em_gain_minimum": 1,
+      "alternative_fact_chain_repairs_minimum": 2,
+      "timeout_maximum": 0,
+      "runner_error_maximum": 0,
+      "token_exhaustion_maximum": 0,
+      "token_exhaustion_baseline": "frozen v1 on these four fixed tasks",
+      "token_exhaustion_baseline_count": 0
+    }
+  }
+}
