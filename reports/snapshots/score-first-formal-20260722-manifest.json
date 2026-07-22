@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "experiment_id": "score-first-formal-holdout-20260722T041353Z",
+  "git_sha": "6ed6ce8ee2012e03200eda8e41fb186826b339f1",
+  "selected_result_count": 15,
+  "incomplete_attempt_count": 0,
+  "fairness_fingerprint": "sha256:a339208589ba26501a480ada8eb47c460ca71c9ed91e0cd87fded81254af65ac",
+  "dataset_sha256": "sha256:b461b502332f6a9a4a041abc35b78cafbdf278bd181afe59911c2cb90c7ae4c8",
+  "config_sha256": "sha256:dc054ef1f18ef7aa26f2b3d19688484da5ef36874b9286d86296d036b305ba18",
+  "summary_sha256": "sha256:a51abf668ead7cf74237f87203e857d8bfb87b8e4ba907485ea24753d666c306",
+  "result_hashes_recorded_in_local_experiment": true,
+  "raw_logs_committed": false
+}
