@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "frozen_v1": {
+    "mechanism_exact_matches": 0,
+    "legal_results": 4,
+    "timeout": 0,
+    "runner_error": 0,
+    "token_exhaustion": 0,
+    "search_calls": 9,
+    "fetch_calls": 9,
+    "mean_tokens": 50583.5
+  },
+  "structured_context_same_model": {
+    "experiment": "constraint-guided-structured-context-canary-20260722T130936Z",
+    "git_sha": "c780fcd726161233a3672b5a7d0a1d6ca7fb6352",
+    "model": "gpt-5.4-nano",
+    "exact_matches": 0,
+    "mechanism_task_em_gain": 0,
+    "legal_results": 4,
+    "timeout": 0,
+    "runner_error": 0,
+    "token_exhaustion": 1,
+    "search_calls": 12,
+    "fetch_calls": 11,
+    "mean_tokens": 27782.5,
+    "passed": false
+  },
+  "gpt55_model_capacity_followup": {
+    "experiment": "constraint-guided-structured-context-gpt55-canary-20260722T134327Z",
+    "git_sha": "aa4969cf93ab3f2ba3011b4caf78419303703a21",
+    "model": "gpt-5.5",
+    "temperature": 1.0,
+    "exact_matches": 2,
+    "mechanism_task_em_gain": 1,
+    "legal_results": 4,
+    "timeout": 0,
+    "runner_error": 0,
+    "token_exhaustion": 0,
+    "search_calls": 13,
+    "fetch_calls": 11,
+    "mean_tokens": 20582.5,
+    "conservative_session_cost_usd": 0.56605,
+    "passed_original_hard_gate": false
+  },
+  "decision": {
+    "structured_context_canary_passed": false,
+    "mechanism_task_em_gain": 0,
+    "dev12_expansion_allowed": false,
+    "model_capacity_is_material": true,
+    "reason": "The same-model mechanism test failed. The stronger-model follow-up improved EM but exceeded the frozen search/fetch ceilings and changed the model variable."
+  }
+}

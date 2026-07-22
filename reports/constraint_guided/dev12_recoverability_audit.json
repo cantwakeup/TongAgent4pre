@@ -279,7 +279,7 @@
     }
   },
   "iteration_2_decision": {
-    "status": "preregistered_not_implemented",
+    "status": "implemented_tested_and_reverted",
     "unique_main_modification": "structured_context",
     "decision_reason": "Selection/context/operation and query/retrieval are tied at four tasks. The deterministic tie-break is recoverability from already-seen facts: three of the four selection/context/operation failures already contain an executable fact chain, versus zero of four query failures. Structured context is therefore the lower-risk single mechanism.",
     "explicitly_disabled": [
@@ -291,7 +291,22 @@
     ]
   },
   "canary_preregistration": {
-    "status": "fixed_not_run",
+    "status": "completed_failed_hard_gate",
+    "experiment": "constraint-guided-structured-context-canary-20260722T130936Z",
+    "git_sha": "c780fcd726161233a3672b5a7d0a1d6ca7fb6352",
+    "result": {
+      "legal_results": 4,
+      "exact_matches": 0,
+      "mechanism_task_em_gain": 0,
+      "timeout": 0,
+      "runner_error": 0,
+      "token_exhaustion": 1,
+      "search_calls": 12,
+      "fetch_calls": 11,
+      "mean_tokens": 27782.5,
+      "structured_context_canary_passed": false,
+      "dev12_expansion_allowed": false
+    },
     "mechanism_tasks": [
       {
         "task_id": "frames-test-0069",
@@ -325,6 +340,24 @@
       "fetch_call_total_maximum": 9,
       "frozen_v1_mean_tokens": 50583.5,
       "mean_tokens_maximum": 55641.85
+    },
+    "model_capacity_followup": {
+      "experiment": "constraint-guided-structured-context-gpt55-canary-20260722T134327Z",
+      "git_sha": "aa4969cf93ab3f2ba3011b4caf78419303703a21",
+      "model": "gpt-5.5",
+      "temperature": 1.0,
+      "exact_matches": 2,
+      "mechanism_task_em_gain": 1,
+      "legal_results": 4,
+      "timeout": 0,
+      "runner_error": 0,
+      "token_exhaustion": 0,
+      "search_calls": 13,
+      "fetch_calls": 11,
+      "mean_tokens": 20582.5,
+      "conservative_session_cost_usd": 0.56605,
+      "hard_gate_passed": false,
+      "interpretation": "Model capacity improves answer selection, but this changed-model diagnostic exceeds the frozen search/fetch ceilings and cannot validate Structured Context or authorize dev12."
     }
   }
 }

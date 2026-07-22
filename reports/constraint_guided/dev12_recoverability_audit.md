@@ -6,7 +6,7 @@ This is a pure offline audit. It made no Agent/runtime changes, called no model 
 
 The primary evidence is the completed `constraint-guided-dev12-iter1-20260722T102000Z` artifact set. The frozen v1 experiment is used only to identify stable failure patterns. Reference answers were opened only after the runs for error classification.
 
-The audit selects **Structured Context as the only proposed Iteration 2 mechanism**, but does not implement or run it in this audit.
+The audit selected **Structured Context as the only proposed Iteration 2 mechanism**. It was subsequently implemented, tested on the frozen canary, and rejected by the preregistered hard gate. The code-only mechanism change was then reverted; the audit and experiment artifacts remain preserved.
 
 ## Artifact boundary
 
@@ -84,6 +84,10 @@ The canary is fixed from failure class before implementation:
 
 The controls are not chosen from reference-answer difficulty. They are two tasks outside the selected mechanism's class.
 
-No Structured Context canary has been run yet. The frozen-v1 values on these four tasks are: 4/4 legal results, zero timeout/runner error/token exhaustion, 9 search calls, 9 fetch calls, and 50,583.5 mean tokens.
+The frozen-v1 values on these four tasks are: 4/4 legal results, zero timeout/runner error/token exhaustion, 9 search calls, 9 fetch calls, and 50,583.5 mean tokens.
 
 Expansion requires **all** of the following: at least one new EM on 0069 or 0615, 4/4 legal results, zero timeout and runner error, zero token exhaustion, no more than 9 searches and 9 fetches, and mean tokens no greater than 55,641.85. Repairing two fact chains without an EM gain is diagnostic only and cannot authorize dev12.
+
+The same-model Structured Context canary `constraint-guided-structured-context-canary-20260722T130936Z` produced 4 result artifacts, 0/4 EM, zero timeout/runner error, one search-budget exhaustion, 12 searches, 11 fetches, and 27,782.5 mean tokens. Neither mechanism task gained EM, so the canary failed and dev12 expansion was prohibited.
+
+A separate model-capacity follow-up used `gpt-5.5` because the original model was `gpt-5.4-nano`. It produced 2/4 EM and repaired mechanism task 0615, with 4/4 legal results and no exhaustion. It nevertheless used 13 searches and 11 fetches, above the frozen 9/9 ceilings. This changed-model diagnostic supports model capacity as an important bottleneck, but it does not retroactively validate Structured Context or authorize dev12.
