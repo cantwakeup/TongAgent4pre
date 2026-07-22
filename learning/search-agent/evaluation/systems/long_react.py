@@ -46,16 +46,6 @@ from .common import (
 
 AnswerType = Literal["entity", "number", "date", "duration", "count", "location"]
 PythonOperation = Literal["arithmetic", "date_difference", "sort", "count"]
-TargetOperation = Literal[
-    "direct",
-    "relation_chain",
-    "difference",
-    "ratio",
-    "enumerate_and_count",
-    "filter_and_count",
-    "compare",
-    "date_calculation",
-]
 _KEEP_LAST_K_TOOL_RESULTS = 5
 _MAX_TURNS = 12
 _SUMMARY_CHARS = 6_000
@@ -86,102 +76,6 @@ class AnswerContract(_StrictModel):
     answer_type: AnswerType
     output_unit: str | None = None
     output_format: Literal["short_answer"] = "short_answer"
-
-
-class TargetSpec(_StrictModel):
-    """Question-only semantic contract for the final, rather than intermediate, value."""
-
-    answer_type: str
-    target_relation: str
-    operation: TargetOperation
-    hard_constraints: list[str]
-    completion_conditions: list[str]
-    expected_unit: str | None = None
-
-
-class CandidateRecord(_StrictModel):
-    value: str
-    candidate_type: str
-    semantic_role: str
-    supporting_source_ids: list[str] = []
-    satisfied_constraints: list[str] = []
-    missing_constraints: list[str] = []
-    contradicted_constraints: list[str] = []
-    status: Literal["intermediate", "possible_final", "verified_final", "rejected"]
-
-
-class CoverageState(_StrictModel):
-    expected_scope: str
-    collected_items: list[dict[str, Any]] = []
-    deduplication_key: str = "item"
-    unresolved_ranges: list[str] = []
-    coverage_complete: bool = False
-
-
-def build_target_spec(question: str) -> TargetSpec:
-    """Derive operation and final-hop conditions without benchmark references."""
-
-    contract = build_answer_contract(question)
-    compact = " ".join(question.split())
-    lowered = compact.casefold()
-    if re.search(r"\bhow many (?:years?|months?|weeks?|days?)\b", lowered):
-        operation: TargetOperation = "date_calculation"
-        relation = "resolve both dates, then calculate the requested elapsed duration"
-        constraints = [
-            "first date operand",
-            "second date operand",
-            "deterministic date calculation",
-        ]
-    elif re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", lowered):
-        operation = "enumerate_and_count"
-        relation = "enumerate the complete requested scope, deduplicate, then count"
-        constraints = [
-            "expected scope",
-            "complete item enumeration",
-            "deterministic count",
-        ]
-    elif re.search(
-        r"\b(?:difference|older|younger|how much more|how much less)\b", lowered
-    ):
-        operation = "difference"
-        relation = (
-            "resolve both numeric operands, then subtract in the question's direction"
-        )
-        constraints = [
-            "first numeric operand",
-            "second numeric operand",
-            "deterministic subtraction",
-        ]
-    elif re.search(r"\b(?:ratio|times as|how many times)\b", lowered):
-        operation = "ratio"
-        relation = "resolve numerator and denominator, then calculate the ratio"
-        constraints = ["numerator", "denominator", "deterministic division"]
-    elif re.search(r"\bcapital of (?:the )?country (?:where|in which)\b", lowered):
-        operation = "relation_chain"
-        relation = "event or entity -> location -> containing country -> capital"
-        constraints = ["event location", "containing country", "country capital"]
-    elif re.search(r"\b(?:who|which|where|what)\b", lowered) and re.search(
-        r"\b(?:who|whose|where|which|that|same|of the)\b", lowered
-    ):
-        operation = "relation_chain"
-        relation = "complete every relation in the question and return only the terminal entity"
-        constraints = ["identify intermediate entity", "complete final relation hop"]
-    else:
-        operation = "direct"
-        relation = "directly identify the requested final value"
-        constraints = ["match requested answer type"]
-    completion = [
-        *constraints,
-        "candidate answers the original question rather than an intermediate lookup",
-    ]
-    return TargetSpec(
-        answer_type=contract.answer_type,
-        target_relation=relation,
-        operation=operation,
-        hard_constraints=constraints,
-        completion_conditions=completion,
-        expected_unit=contract.output_unit,
-    )
 
 
 def build_answer_contract(question: str) -> AnswerContract:
@@ -552,7 +446,7 @@ def build_python_tool() -> BaseTool:
     return python_tool
 
 
-def _system_prompt(contract: AnswerContract, target_spec: TargetSpec) -> str:
+def _system_prompt(contract: AnswerContract) -> str:
     return f"""You are a performance-first long-horizon web research agent.
 
 Solve the user's exact question. Iterate with web_search, fetch_url, and python
@@ -567,13 +461,6 @@ concerns and must never block a best-effort answer. Never invent facts that are
 absent from fetched pages. Stop researching once the answer is clear.
 
 Answer contract: {json.dumps(contract.model_dump(mode="json"), sort_keys=True)}
-Target specification: {json.dumps(target_spec.model_dump(mode="json"), sort_keys=True)}
-Every entity or number found during search is an intermediate candidate by default.
-For relation_chain, finish the last relation hop before answering. For numeric or
-date operations, obtain every operand and use python. For enumerate_and_count,
-do not return a partial count: establish the full expected scope, deduplicate the
-items, and only then use python count. Reject a candidate that still has a hard
-constraint missing, even if it is prominent in a search result.
 Your terminal response must contain exactly: FINAL_ANSWER: <short answer>
 Do not add citations, explanation, or prose to that terminal line.
 """
@@ -700,95 +587,14 @@ def _posthoc_source_mapping(result: RunResult) -> list[dict[str, Any]]:
     return sources
 
 
-def _candidate_ledger_from_result(
-    result: RunResult, target_spec: TargetSpec
-) -> tuple[list[CandidateRecord], CoverageState | None]:
-    """Build an auditable ledger without treating search snippets as evidence."""
-
-    records: list[CandidateRecord] = []
-    seen: set[tuple[str, str]] = set()
-    coverage: CoverageState | None = None
-    if target_spec.operation in {"enumerate_and_count", "filter_and_count"}:
-        coverage = CoverageState(
-            expected_scope=target_spec.target_relation,
-            unresolved_ranges=["complete requested scope has not been demonstrated"],
-        )
-    for call in result.tool_calls:
-        payload = call.result if isinstance(call.result, Mapping) else {}
-        if call.tool_name == "web_search" and call.status == ToolCallStatus.SUCCESS:
-            for item in payload.get("results", [])[:5]:
-                if not isinstance(item, Mapping) or not item.get("title"):
-                    continue
-                value = str(item["title"]).strip()
-                key = (value.casefold(), "search_result")
-                if key in seen:
-                    continue
-                seen.add(key)
-                records.append(
-                    CandidateRecord(
-                        value=value,
-                        candidate_type="entity",
-                        semantic_role="search_result",
-                        missing_constraints=list(target_spec.hard_constraints),
-                        status="intermediate",
-                    )
-                )
-        elif call.tool_name == "fetch_url" and call.status == ToolCallStatus.SUCCESS:
-            value = str(payload.get("title") or "").strip()
-            source_id = str(payload.get("source_id") or "").strip()
-            if value and (value.casefold(), "fetched_page") not in seen:
-                seen.add((value.casefold(), "fetched_page"))
-                records.append(
-                    CandidateRecord(
-                        value=value,
-                        candidate_type="entity",
-                        semantic_role="fetched_page",
-                        supporting_source_ids=[source_id] if source_id else [],
-                        satisfied_constraints=["canonical source acquired"],
-                        missing_constraints=list(target_spec.hard_constraints),
-                        status="intermediate",
-                    )
-                )
-        elif call.tool_name == "python" and call.status == ToolCallStatus.SUCCESS:
-            if payload.get("status") != "success" or payload.get("result") is None:
-                continue
-            operation = str(payload.get("operation") or "")
-            verified = target_spec.operation in {
-                "difference",
-                "ratio",
-                "date_calculation",
-            } and operation in {"arithmetic", "date_difference"}
-            if target_spec.operation in {"enumerate_and_count", "filter_and_count"}:
-                values = call.arguments.get("values") or []
-                if coverage is not None and isinstance(values, list):
-                    coverage = coverage.model_copy(
-                        update={"collected_items": [{"item": item} for item in values]}
-                    )
-            records.append(
-                CandidateRecord(
-                    value=str(payload["result"]),
-                    candidate_type="computed_value",
-                    semantic_role="operation_result",
-                    satisfied_constraints=(
-                        list(target_spec.completion_conditions) if verified else []
-                    ),
-                    missing_constraints=(
-                        [] if verified else list(target_spec.hard_constraints)
-                    ),
-                    status="verified_final" if verified else "possible_final",
-                )
-            )
-    return records, coverage
-
-
 def _build_graph(
-    runtime: PreparedRuntime, contract: AnswerContract, target_spec: TargetSpec
+    runtime: PreparedRuntime, contract: AnswerContract
 ) -> tuple[Any, LongReactContextMiddleware]:
     context = LongReactContextMiddleware(trace=runtime.trace)
     graph = create_agent(
         model=runtime.model,
         tools=[*runtime.tools, build_python_tool()],
-        system_prompt=_system_prompt(contract, target_spec),
+        system_prompt=_system_prompt(contract),
         middleware=[context, runtime.middleware],
         name="evaluation-long-react",
     )
@@ -816,7 +622,6 @@ def run_long_react_workflow(
     native_output: Any = None
     caught: Exception | None = None
     contract = build_answer_contract(task.question)
-    target_spec = build_target_spec(task.question)
     context: LongReactContextMiddleware | None = None
     final_answer = "FINAL_ANSWER: ABSTAIN"
     try:
@@ -832,7 +637,7 @@ def run_long_react_workflow(
             enable_tongagent_evidence_state=True,
             reserve_final_synthesis=resolved_config.backend_kind == "live",
         )
-        graph, context = _build_graph(runtime, contract, target_spec)
+        graph, context = _build_graph(runtime, contract)
         native_output = graph.invoke(
             {"messages": [{"role": "user", "content": task.question}]},
             config={"recursion_limit": resolved_config.budget.recursion_limit},
@@ -842,9 +647,6 @@ def run_long_react_workflow(
             contract_hint = (
                 "Required short-answer type: "
                 f"{contract.answer_type}; unit: {contract.output_unit or 'none'}.\n"
-                "Required target relation and completion conditions: "
-                f"{json.dumps(target_spec.model_dump(mode='json'), sort_keys=True)}.\n"
-                "Do not return an intermediate entity or incomplete count.\n"
             )
             draft = runtime.middleware.finalize_answer(
                 runtime.model,
@@ -902,9 +704,6 @@ def run_long_react_workflow(
     )
     context_snapshot = context.snapshot() if context is not None else {}
     sources = _posthoc_source_mapping(result)
-    candidate_records, coverage_state = _candidate_ledger_from_result(
-        result, target_spec
-    )
     research_snapshot = (
         runtime.research_budget.snapshot() if runtime is not None else {}
     )
@@ -942,25 +741,6 @@ def run_long_react_workflow(
             "schema_version": 1,
             "task_id": task.id,
             "answer_contract": contract.model_dump(mode="json"),
-        },
-    )
-    _atomic_write_json(
-        native / "target_spec.json",
-        {
-            "schema_version": 1,
-            "task_id": task.id,
-            "target_spec": target_spec.model_dump(mode="json"),
-        },
-    )
-    _atomic_write_json(
-        native / "candidate_ledger.json",
-        {
-            "schema_version": 1,
-            "task_id": task.id,
-            "candidates": [item.model_dump(mode="json") for item in candidate_records],
-            "coverage_state": (
-                coverage_state.model_dump(mode="json") if coverage_state else None
-            ),
         },
     )
     _atomic_write_json(
@@ -1008,8 +788,7 @@ def preflight_long_react_workflow(
         enable_tongagent_evidence_state=True,
         reserve_final_synthesis=False,
     )
-    contract = build_answer_contract(task.question)
-    graph, context = _build_graph(runtime, contract, build_target_spec(task.question))
+    graph, context = _build_graph(runtime, build_answer_contract(task.question))
     return {
         "task_id": task.id,
         "runtime_mode": "long_react",
@@ -1022,12 +801,8 @@ def preflight_long_react_workflow(
 
 __all__ = [
     "AnswerContract",
-    "CandidateRecord",
-    "CoverageState",
     "LongReactContextMiddleware",
-    "TargetSpec",
     "build_answer_contract",
-    "build_target_spec",
     "build_python_tool",
     "compact_long_react_messages",
     "preflight_long_react_workflow",

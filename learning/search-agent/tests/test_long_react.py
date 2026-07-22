@@ -16,7 +16,6 @@ from evaluation.systems.long_react import (
     _format_short_answer,
     build_answer_contract,
     build_python_tool,
-    build_target_spec,
     compact_long_react_messages,
 )
 from evaluation.systems.tongagent import TongAgentRunner
@@ -98,36 +97,6 @@ def test_answer_contract_is_derived_only_from_question(
     assert contract.answer_type == answer_type
     assert contract.output_unit == unit
     assert contract.output_format == "short_answer"
-
-
-@pytest.mark.parametrize(
-    ("question", "operation", "last_constraint"),
-    [
-        (
-            "What is the capital of the country where the treaty was signed?",
-            "relation_chain",
-            "country capital",
-        ),
-        (
-            "How many elections had the same nominee from 1924 through 2024?",
-            "enumerate_and_count",
-            "deterministic count",
-        ),
-        (
-            "How many years after 1900 did the station open?",
-            "date_calculation",
-            "deterministic date calculation",
-        ),
-    ],
-)
-def test_target_spec_distinguishes_terminal_relation_and_operation(
-    question: str, operation: str, last_constraint: str
-) -> None:
-    target = build_target_spec(question)
-
-    assert target.operation == operation
-    assert last_constraint in target.hard_constraints
-    assert "intermediate" in target.completion_conditions[-1]
 
 
 @pytest.mark.parametrize(
@@ -302,15 +271,11 @@ def test_long_react_preflight_and_controlled_loop_are_nonblocking(
     contract = json.loads((native / "answer_contract.json").read_text())
     context = json.loads((native / "context_manager.json").read_text())
     audit = json.loads((native / "long_react_audit.json").read_text())
-    target = json.loads((native / "target_spec.json").read_text())
-    ledger = json.loads((native / "candidate_ledger.json").read_text())
     assert contract["answer_contract"]["answer_type"] == "location"
     assert context["keep_last_k_tool_results"] == 5
     assert audit["posthoc_only"] is True
     assert audit["answer_unchanged_by_audit"] is True
     assert len(audit["source_mapping"]) == 1
-    assert target["target_spec"]["operation"] == "relation_chain"
-    assert ledger["candidates"]
 
 
 def test_long_react_fairness_fingerprint_matches_all_three_systems(
