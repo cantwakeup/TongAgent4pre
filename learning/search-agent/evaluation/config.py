@@ -182,9 +182,9 @@ class ResolvedConfig(FrozenStrictModel):
     model: EvaluationModelConfig
     tools: SharedToolConfig
     budget: BudgetLimits
-    runtime_mode: Literal["strict", "permissive", "answer_revise", "score_first"] = (
-        "strict"
-    )
+    runtime_mode: Literal[
+        "strict", "permissive", "answer_revise", "score_first", "long_react"
+    ] = "strict"
     permissive_workflow: PermissiveWorkflowConfig = Field(
         default_factory=PermissiveWorkflowConfig
     )

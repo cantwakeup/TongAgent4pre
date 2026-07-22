@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "manifest_type": "long_react_development",
+  "source_dataset": "google/frames-benchmark",
+  "source_revision": "58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef",
+  "source_sha256": "sha256:4255093c93b595b5b04c7c8dde290b48ec87d72ca0fb0b760d9dd02740d669ff",
+  "task_ids": [
+    "frames-test-0016",
+    "frames-test-0123",
+    "frames-test-0191",
+    "frames-test-0664",
+    "frames-test-0718"
+  ],
+  "maximum_iterations": 3,
+  "allowed_iteration_categories": ["search_strategy", "context", "synthesis"],
+  "success_threshold": {
+    "answer_rate": "3/5",
+    "exact_match": "1/5",
+    "timeouts": 0
+  },
+  "runtime_input_policy": "question_only",
+  "reference_answer_policy": "post_run_scoring_only",
+  "source_urls_policy": "removed_from_runtime_dataset"
+}

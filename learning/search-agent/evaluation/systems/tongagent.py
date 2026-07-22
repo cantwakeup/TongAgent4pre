@@ -116,6 +116,7 @@ class TongAgentRunner:
             "permissive",
             "answer_revise",
             "score_first",
+            "long_react",
         }:
             # The permissive implementation is intentionally a code-owned
             # workflow rather than a LangGraph/FSM.  Keep the strict builder
@@ -134,6 +135,15 @@ class TongAgentRunner:
                 from .score_first import preflight_score_first_workflow
 
                 return preflight_score_first_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
+            if resolved_config.runtime_mode == "long_react":
+                from .long_react import preflight_long_react_workflow
+
+                return preflight_long_react_workflow(
                     task,
                     resolved_config,
                     fixture_backend=self._fixture_backend,
@@ -195,6 +205,7 @@ class TongAgentRunner:
             "permissive",
             "answer_revise",
             "score_first",
+            "long_react",
         }:
             # Do not route permissive research through the strict FSM.  Both
             # modes still receive the same shared runtime, retrieval wrappers,
@@ -212,6 +223,15 @@ class TongAgentRunner:
                 from .score_first import run_score_first_workflow
 
                 return run_score_first_workflow(
+                    task,
+                    resolved_config,
+                    fixture_backend=self._fixture_backend,
+                    model=self._model,
+                )
+            if resolved_config.runtime_mode == "long_react":
+                from .long_react import run_long_react_workflow
+
+                return run_long_react_workflow(
                     task,
                     resolved_config,
                     fixture_backend=self._fixture_backend,

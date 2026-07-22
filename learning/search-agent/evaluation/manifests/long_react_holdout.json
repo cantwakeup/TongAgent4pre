@@ -1,0 +1,66 @@
+{
+  "created_before_long_react_development_runs": true,
+  "excluded_task_ids": [
+    "frames-test-0016",
+    "frames-test-0068",
+    "frames-test-0109",
+    "frames-test-0123",
+    "frames-test-0166",
+    "frames-test-0191",
+    "frames-test-0235",
+    "frames-test-0326",
+    "frames-test-0463",
+    "frames-test-0485",
+    "frames-test-0504",
+    "frames-test-0664",
+    "frames-test-0718",
+    "frames-test-0805",
+    "frames-test-0813"
+  ],
+  "immutable_after_creation": true,
+  "manifest_type": "long_react_formal_holdout",
+  "schema_version": 1,
+  "selected_tasks": [
+    {
+      "question_sha256": "sha256:b690c6cc690a3f64584e57a9df64ef14b3cfc851ddeefbebad40aa5e293c9050",
+      "source_index": 48,
+      "task_id": "frames-test-0048"
+    },
+    {
+      "question_sha256": "sha256:a0c7c1f24e69ef92808e6a6b7c0b05dd2adfd1338d1173592ff559509278f1a5",
+      "source_index": 144,
+      "task_id": "frames-test-0144"
+    },
+    {
+      "question_sha256": "sha256:966a4d5661e11ce9b8e6abfa9388300d60e8c948782cc638280f9769be0f07b3",
+      "source_index": 673,
+      "task_id": "frames-test-0673"
+    },
+    {
+      "question_sha256": "sha256:272099024a3a2ba87944b90b96b5e4d7bec2a11bb1392768af782dbd1df0d95d",
+      "source_index": 681,
+      "task_id": "frames-test-0681"
+    },
+    {
+      "question_sha256": "sha256:a116d58fbdca032513a1bc350113187faae4f62d94b866700a145461116f80bf",
+      "source_index": 391,
+      "task_id": "frames-test-0391"
+    }
+  ],
+  "selection_algorithm": "python-random-v1-shuffle-unseen-source-indices-then-first-5",
+  "selection_inputs_accessed": [
+    "source_index",
+    "question_text_for_sha256_only"
+  ],
+  "selection_inputs_not_accessed": [
+    "Answer",
+    "wikipedia_link_*",
+    "reasoning_types",
+    "wiki_links"
+  ],
+  "selection_seed": 20260724,
+  "source_dataset": "google/frames-benchmark",
+  "source_revision": "58d9fb6330f3ab1316d1eca12e5e8ef23dcc22ef",
+  "source_row_count": 824,
+  "source_sha256": "sha256:4255093c93b595b5b04c7c8dde290b48ec87d72ca0fb0b760d9dd02740d669ff"
+}
