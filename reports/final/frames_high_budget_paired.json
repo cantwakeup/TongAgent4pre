@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "experiment_id": "frames-high-budget-completion-v1",
+  "benchmark_status": "exploratory high-budget benchmark",
+  "scoring_metric": "standard_normalized_em",
+  "pair_counts": {
+    "both_correct": 2,
+    "bare_only": 1,
+    "tongagent_only": 1,
+    "both_wrong": 4
+  },
+  "harness_delta": 0.0,
+  "tasks": [
+    {
+      "task_id": "frames-test-0000",
+      "bare_correct": false,
+      "tongagent_correct": true,
+      "paired_outcome": "tongagent_only",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "completed",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0001",
+      "bare_correct": false,
+      "tongagent_correct": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "budget_exhausted",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0002",
+      "bare_correct": false,
+      "tongagent_correct": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "failed",
+      "finalization_triggered": true,
+      "finalization_reason": "total_tokens",
+      "forced_final_answer_available": false
+    },
+    {
+      "task_id": "frames-test-0003",
+      "bare_correct": true,
+      "tongagent_correct": true,
+      "paired_outcome": "both_correct",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "completed",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0004",
+      "bare_correct": true,
+      "tongagent_correct": true,
+      "paired_outcome": "both_correct",
+      "bare_status": "completed",
+      "tongagent_status": "completed",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0005",
+      "bare_correct": false,
+      "tongagent_correct": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "completed",
+      "tongagent_status": "failed",
+      "tongagent_failure_type": "runner_error",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0006",
+      "bare_correct": false,
+      "tongagent_correct": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "completed",
+      "tongagent_status": "completed",
+      "finalization_triggered": false
+    },
+    {
+      "task_id": "frames-test-0007",
+      "bare_correct": true,
+      "tongagent_correct": false,
+      "paired_outcome": "bare_only",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "budget_exhausted",
+      "finalization_triggered": false
+    }
+  ],
+  "interpretation": "The paired differences are symmetric and the standard-EM delta is zero. This exploratory eight-task result does not establish Harness accuracy superiority."
+}
