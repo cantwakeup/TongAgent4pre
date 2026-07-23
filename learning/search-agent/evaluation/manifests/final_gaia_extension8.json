@@ -4,7 +4,9 @@
   "benchmark_status": "final_gaia_model_harness_scaling_extension",
   "created_at": "2026-07-23T11:18:28Z",
   "selection_frozen_before_answer_materialization": true,
+  "selection_manifest_commit": "58ccccff28ef138fb04da6a6d51d187dc10805ab",
   "dataset_path": "evaluation/datasets/final_gaia_extension8.jsonl",
+  "dataset_sha256": "sha256:d47fc0b9a9866d21a8cb1bf9ca3f5f9309d1a47349a3c8ea4429f495d8ba69dd",
   "source": {
     "dataset": "sayan1101/gaia_filtered_text_only",
     "config": "default",
