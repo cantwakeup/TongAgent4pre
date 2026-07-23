@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "manifest_id": "final_gaia_extension8",
+  "benchmark_status": "final_gaia_model_harness_scaling_extension",
+  "created_at": "2026-07-23T11:18:28Z",
+  "selection_frozen_before_answer_materialization": true,
+  "dataset_path": "evaluation/datasets/final_gaia_extension8.jsonl",
+  "source": {
+    "dataset": "sayan1101/gaia_filtered_text_only",
+    "config": "default",
+    "split": "validation",
+    "revision": "8b387ca6207e63345b380f5741b3c91103d2ac85",
+    "parquet_sha256": "0e7ac3edec5aa4686792e6a4b1b8da9970735487f6059c9a49365be2d60618a9",
+    "source_row_count": 127
+  },
+  "selection_rule": "exclude all historically executed GAIA task IDs, require Level == 1 and empty file_name/file_path, then sort by source_index ascending and take the first 8",
+  "selection_fields": [
+    "task_id",
+    "Question",
+    "Level",
+    "file_name",
+    "file_path",
+    "source_index"
+  ],
+  "prohibited_selection_fields": [
+    "Final answer",
+    "reference_answer",
+    "historical_results",
+    "manual_difficulty_judgment"
+  ],
+  "answer_field_used_for_selection": false,
+  "input_compatibility_policy": "GAIA validation split; Level 1; no file input; non-empty text question; compatible with frozen search/read tools",
+  "historical_exclusion": {
+    "source": "persisted GAIA evaluation task artifacts plus the frozen formal GAIA-8 manifest",
+    "count": 8,
+    "task_ids_sha256": "8264f9586049ec3597432ff55af6514010c992d064478ea5d61c2e0f8f4adad1",
+    "task_ids": [
+      "0383a3ee-47a7-41a4-b493-519bdefe0488",
+      "11af4e1a-5f45-467d-9aeb-46f4bb0bf034",
+      "27d5d136-8563-469e-92bf-fd103c28b57c",
+      "2d83110e-a098-4ebb-9987-066c06fa42d0",
+      "305ac316-eef6-4446-960a-92d80d542f82",
+      "3cef3a44-215e-4aed-8e3b-b1e3f08063b7",
+      "42576abe-0deb-4869-8c63-225c2d75a95a",
+      "46719c30-f4c3-4cad-be07-d5cb21eee6bb"
+    ]
+  },
+  "eligible_unseen_count": 34,
+  "selected_count": 8,
+  "selected_source_indices": [4, 5, 8, 14, 15, 18, 33, 34],
+  "selected_task_ids": [
+    "e1fc63a2-da7a-432f-be78-7c4a95598703",
+    "8e867cd7-cff9-4e6c-867a-ff5ddc2550be",
+    "ec09fa32-d03f-4bf8-84b0-1f16922c3ae4",
+    "5d0080cb-90d7-4712-bc33-848150e917d3",
+    "a1e91b78-d3d8-4675-bb8d-62741b4b68a6",
+    "4b6bb5f7-f634-410e-815d-e673ab7f8632",
+    "dc28cf18-6431-458b-83ef-64b3ce566c10",
+    "b816bfce-3d80-4913-a07d-69b752ce6377"
+  ],
+  "tasks": [
+    {
+      "task_id": "e1fc63a2-da7a-432f-be78-7c4a95598703",
+      "source_index": 4,
+      "question_sha256": "41ebd0abe7650b330bc204d41b77ac6d3e1cc736a35f39946377b3522d67dda7"
+    },
+    {
+      "task_id": "8e867cd7-cff9-4e6c-867a-ff5ddc2550be",
+      "source_index": 5,
+      "question_sha256": "ee845aa6f5d274f54bf44dcd66f3089bf9539b84ef9401919607edb440c4d4a1"
+    },
+    {
+      "task_id": "ec09fa32-d03f-4bf8-84b0-1f16922c3ae4",
+      "source_index": 8,
+      "question_sha256": "97358f209fac7f3a9c569c0ed6304a38bee6ef14c88fa2b1065cde2e9120b214"
+    },
+    {
+      "task_id": "5d0080cb-90d7-4712-bc33-848150e917d3",
+      "source_index": 14,
+      "question_sha256": "1ffd1afe18f32d8103d56654c78bf3f6e169f24c4b89bab993aab3a017022b07"
+    },
+    {
+      "task_id": "a1e91b78-d3d8-4675-bb8d-62741b4b68a6",
+      "source_index": 15,
+      "question_sha256": "4c735ecca4b15c566d57ed83886ff725fe05bf48519a74b111745a2e405d2ac7"
+    },
+    {
+      "task_id": "4b6bb5f7-f634-410e-815d-e673ab7f8632",
+      "source_index": 18,
+      "question_sha256": "34647ca1d6ee2cfd5796564bddd2214310894b75c1e55a6223343b374c90c5ec"
+    },
+    {
+      "task_id": "dc28cf18-6431-458b-83ef-64b3ce566c10",
+      "source_index": 33,
+      "question_sha256": "56a7a534c6735d76df67198405b9a8bd0daa581fc03220ebc5d3a85047aaabe6"
+    },
+    {
+      "task_id": "b816bfce-3d80-4913-a07d-69b752ce6377",
+      "source_index": 34,
+      "question_sha256": "8d07c05f1e00d7d2314c58c3dfb183243c6383122e18479e7b82fba34e387cec"
+    }
+  ],
+  "validation": {
+    "historical_task_leakage": 0,
+    "question_hash_match": "8/8",
+    "source_index_match": "8/8",
+    "reference_answer_read_before_selection": false
+  }
+}
