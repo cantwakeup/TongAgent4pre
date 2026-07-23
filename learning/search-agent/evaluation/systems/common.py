@@ -820,6 +820,7 @@ class EvaluationMiddleware(AgentMiddleware):
             call_id=call_id,
             tool_name=tool_name,
             arguments=arguments,
+            budget=self.execution_budget.snapshot(),
         )
         try:
             response = handler(request)
@@ -1541,7 +1542,11 @@ def run_graph_system(
     artifact_directory.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(UTC)
     started = time.perf_counter()
-    trace = TraceCollector()
+    native_directory = artifact_directory / "native"
+    trace = TraceCollector(
+        persistent_trace_path=native_directory / "trace.jsonl",
+        partial_telemetry_path=native_directory / "partial_telemetry.json",
+    )
     execution_budget = ExecutionBudget(resolved_config.budget)
     run_id = f"{system_id}-{task.id}-{uuid.uuid4().hex}"
     runtime: PreparedRuntime | None = None
@@ -1637,6 +1642,7 @@ def run_graph_system(
         result=result,
         caught=caught,
     )
+    trace.close()
     return result
 
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -485,6 +487,50 @@ def test_trace_redaction_covers_non_openai_tokens_and_camel_case_keys() -> None:
     assert "plain-secret" not in serialized
     assert "hf_abcdefghijklmnopqrstuvwxyz123456" not in serialized
     assert "github_pat_abcdefghijklmnopqrstuvwxyz123456" not in serialized
+
+
+def test_trace_collector_persists_timeout_safe_progress_and_usage_status(
+    tmp_path: Path,
+) -> None:
+    trace_path = tmp_path / "native" / "trace.jsonl"
+    telemetry_path = tmp_path / "native" / "partial_telemetry.json"
+    collector = TraceCollector(
+        persistent_trace_path=trace_path,
+        partial_telemetry_path=telemetry_path,
+        heartbeat_interval_seconds=0.02,
+    )
+    collector.record("model_call_started", budget={"model_calls": 1})
+    collector.record("model_token_usage_unavailable", budget={"model_calls": 1})
+    collector.record(
+        "tool_call_started",
+        tool_name="web_search",
+        budget={
+            "search_calls": 1,
+            "fetch_calls": 0,
+            "external_retrieval_calls": 1,
+            "internal_tool_calls": 0,
+        },
+    )
+    initial = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 0.5
+    heartbeat = initial
+    while time.monotonic() < deadline:
+        heartbeat = json.loads(telemetry_path.read_text(encoding="utf-8"))
+        if heartbeat["heartbeat"] is True:
+            break
+        time.sleep(0.01)
+    collector.close()
+
+    persisted = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    assert trace_path.read_text(encoding="utf-8").count("\n") == 3
+    assert persisted["request_start"] is not None
+    assert persisted["first_model_response"] is not None
+    assert persisted["first_tool_call"] is not None
+    assert persisted["last_progress_timestamp"] is not None
+    assert persisted["started_tool_counts"] == {"web_search": 1}
+    assert persisted["token_usage_status"] == "usage_unavailable"
+    assert persisted["token_usage"] is None
+    assert heartbeat["heartbeat"] is True
 
 
 def test_system_runner_protocol_has_the_required_two_argument_interface() -> None:

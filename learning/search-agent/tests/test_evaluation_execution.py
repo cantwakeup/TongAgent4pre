@@ -59,12 +59,47 @@ def _write_fake_worker(
     directory: Path,
     *,
     sleep: bool = False,
+    partial_telemetry: bool = False,
     exit_code: int | None = None,
     corrupt_result: bool = False,
 ) -> str:
     if sleep:
         module_name = "sleep_worker"
-        body = "import time\ntime.sleep(30)\n"
+        if partial_telemetry:
+            body = """
+import argparse
+import json
+import pathlib
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--job", required=True)
+args = parser.parse_args()
+attempt = pathlib.Path(args.job).parent
+native = attempt / "native"
+native.mkdir(exist_ok=True)
+(native / "partial_telemetry.json").write_text(json.dumps({
+    "schema_version": 1,
+    "request_start": "2026-07-23T00:00:00+00:00",
+    "first_model_response": "2026-07-23T00:00:01+00:00",
+    "first_tool_call": "2026-07-23T00:00:02+00:00",
+    "last_progress_timestamp": "2026-07-23T00:00:03+00:00",
+    "last_event_type": "tool_call_started",
+    "started_tool_counts": {"web_search": 2, "fetch_url": 1},
+    "completed_tool_counts": {"web_search": 1},
+    "budget_snapshot": {
+        "search_calls": 2,
+        "fetch_calls": 1,
+        "external_retrieval_calls": 3,
+        "internal_tool_calls": 0
+    },
+    "token_usage_status": "usage_unavailable",
+    "token_usage": None
+}))
+time.sleep(30)
+"""
+        else:
+            body = "import time\ntime.sleep(30)\n"
     elif exit_code is not None:
         module_name = "crash_worker"
         body = f"raise SystemExit({exit_code})\n"
@@ -494,6 +529,49 @@ def test_subprocess_timeout_writes_structured_terminal_failure(
     assert (attempt / "metrics.json").is_file()
     assert (attempt / "trace.json").is_file()
     assert (attempt / "result.json").is_file()
+
+
+def test_subprocess_timeout_recovers_atomic_partial_telemetry_before_kill(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_dataset(tmp_path / "tasks.jsonl")
+    worker_directory = tmp_path / "worker"
+    worker_directory.mkdir()
+    worker_module = _write_fake_worker(
+        worker_directory,
+        sleep=True,
+        partial_telemetry=True,
+    )
+    report = run_dataset(
+        dataset,
+        systems=["simple_react"],
+        output_directory=tmp_path / "output",
+        experiment_id="timeout-with-telemetry",
+        worker_module=worker_module,
+        worker_cwd=worker_directory,
+        subprocess_timeout_seconds=0.2,
+        git_sha="deadbeef",
+    )
+
+    result = report.outcomes[0].result
+    assert result is not None
+    assert result.completion_status == CompletionStatus.TIMED_OUT
+    assert result.search_calls == 2
+    assert result.fetch_calls == 1
+    assert result.external_retrieval_calls == 3
+    assert result.internal_tool_calls == 0
+    assert result.token_usage is None
+    assert result.failure is not None
+    assert result.failure.details["token_usage_status"] == "usage_unavailable"
+    attempt = report.outcomes[0].attempt_directory
+    watchdog = json.loads(
+        (attempt / "native" / "watchdog_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert watchdog["partial_telemetry_available"] is True
+    assert watchdog["partial_telemetry"]["started_tool_counts"] == {
+        "fetch_url": 1,
+        "web_search": 2,
+    }
 
 
 def test_parent_converts_worker_crash_before_result_to_terminal_failure(

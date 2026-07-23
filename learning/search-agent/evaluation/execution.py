@@ -35,6 +35,7 @@ from .schema import (
     FailureDetail,
     FailureType,
     RunResult,
+    TokenUsage,
     json_ready,
     normalized_exact_match,
     parse_eval_task_jsonl_line,
@@ -630,6 +631,7 @@ def build_failure_result(
     message: str,
     stage: str,
     details: Mapping[str, JsonValue] | None = None,
+    partial_telemetry: Mapping[str, Any] | None = None,
 ) -> RunResult:
     """Construct a canonical terminal result for worker/process failures."""
 
@@ -637,7 +639,20 @@ def build_failure_result(
     safe_message = sanitize_trace_value(message)
     if not isinstance(safe_message, str) or not safe_message:
         safe_message = "evaluation worker failed"
-    safe_details = sanitize_trace_value(dict(details or {}))
+    telemetry = _validated_partial_telemetry(partial_telemetry)
+    detail_values = dict(details or {})
+    if telemetry is not None or completion_status == CompletionStatus.TIMED_OUT:
+        detail_values.update(
+            {
+                "partial_telemetry_available": telemetry is not None,
+                "token_usage_status": (
+                    telemetry.get("token_usage_status")
+                    if telemetry is not None
+                    else "usage_unavailable"
+                ),
+            }
+        )
+    safe_details = sanitize_trace_value(detail_values)
     if not isinstance(safe_details, dict):
         safe_details = {}
     failure = FailureDetail(
@@ -648,6 +663,8 @@ def build_failure_result(
         details=safe_details,
     )
     final_answer = "FINAL_ANSWER: ABSTAIN"
+    counters = _partial_tool_counters(telemetry)
+    token_usage = _partial_token_usage(telemetry)
     return RunResult(
         run_id=run_id,
         task_id=task.id,
@@ -663,15 +680,16 @@ def build_failure_result(
         final_answer=final_answer,
         citations=[],
         tool_calls=[],
-        # The parent cannot observe how far a timed-out or crashed worker ran.
-        # Unknown counters must remain null rather than masquerading as known
-        # zero usage.
-        search_calls=None,
-        fetch_calls=None,
+        external_retrieval_calls=counters.get("external_retrieval_calls"),
+        internal_tool_calls=counters.get("internal_tool_calls"),
+        # A timeout-safe worker snapshot distinguishes observed starts from
+        # genuinely unavailable counters. Unknown values remain null.
+        search_calls=counters.get("search_calls"),
+        fetch_calls=counters.get("fetch_calls"),
         relevant_searches=None,
         evidence_count=None,
         structural_subquestion_coverage=None,
-        token_usage=None,
+        token_usage=token_usage,
         estimated_cost=None,
         completion_status=completion_status,
         failure_type=failure_type,
@@ -694,6 +712,93 @@ def build_failure_result(
         answer_rate=strict_answer_rate(final_answer),
         judge_score=None,
     )
+
+
+def _validated_partial_telemetry(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if value is None or value.get("schema_version") != 1:
+        return None
+    sanitized = sanitize_trace_value(dict(value))
+    return sanitized if isinstance(sanitized, dict) else None
+
+
+def _partial_tool_counters(
+    telemetry: Mapping[str, Any] | None,
+) -> dict[str, int | None]:
+    unknown = {
+        "search_calls": None,
+        "fetch_calls": None,
+        "external_retrieval_calls": None,
+        "internal_tool_calls": None,
+    }
+    if telemetry is None:
+        return unknown
+    budget = telemetry.get("budget_snapshot")
+    if isinstance(budget, Mapping):
+        names = tuple(unknown)
+        values = {name: budget.get(name) for name in names}
+        if all(
+            isinstance(values[name], int)
+            and not isinstance(values[name], bool)
+            and values[name] >= 0
+            for name in names
+        ):
+            return {name: int(values[name]) for name in names}
+    started = telemetry.get("started_tool_counts")
+    if not isinstance(started, Mapping):
+        return unknown
+    search_calls = sum(
+        _nonnegative_int(started.get(name)) for name in ("search", "web_search")
+    )
+    fetch_calls = sum(
+        _nonnegative_int(started.get(name))
+        for name in ("fetch", "fetch_url", "open_page", "open_url")
+    )
+    total_started = sum(_nonnegative_int(item) for item in started.values())
+    return {
+        "search_calls": search_calls,
+        "fetch_calls": fetch_calls,
+        "external_retrieval_calls": search_calls + fetch_calls,
+        "internal_tool_calls": max(0, total_started - search_calls - fetch_calls),
+    }
+
+
+def _partial_token_usage(
+    telemetry: Mapping[str, Any] | None,
+) -> TokenUsage | None:
+    if telemetry is None:
+        return None
+    raw_usage = telemetry.get("token_usage")
+    if not isinstance(raw_usage, Mapping):
+        return None
+    fields = {
+        name: raw_usage.get(name)
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_input_tokens",
+            "reasoning_tokens",
+        )
+    }
+    known = {
+        name: value
+        for name, value in fields.items()
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    }
+    if not known:
+        return None
+    try:
+        return TokenUsage.model_validate(known)
+    except ValueError:
+        return None
+
+
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
 
 
 def validate_persisted_result(
@@ -1088,20 +1193,34 @@ def _run_worker_subprocess(
         stdout_path.open("xb") as stdout_handle,
         stderr_path.open("xb") as stderr_handle,
     ):
+        process = subprocess.Popen(
+            command,
+            cwd=worker_cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=worker_cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                check=False,
-                timeout=effective_timeout,
-            )
-            return_code = completed.returncode
+            return_code = process.wait(timeout=effective_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
+            partial_telemetry = _read_partial_telemetry(attempt_directory)
+            _persist_watchdog_telemetry(
+                attempt_directory,
+                process_id=process.pid,
+                timeout_seconds=effective_timeout,
+                partial_telemetry=partial_telemetry,
+            )
+            # Snapshot all already-flushed worker telemetry before asking the
+            # process to stop. The worker trace sink is atomic, so the parent
+            # never copies a half-written event or counter file.
+            process.terminate()
+            try:
+                return_code = process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait()
 
     result_path = attempt_directory / "result.json"
     if result_path.exists():
@@ -1114,6 +1233,7 @@ def _run_worker_subprocess(
         )
 
     if timed_out:
+        partial_telemetry = _read_partial_telemetry(attempt_directory)
         result = build_failure_result(
             task=task,
             config=config,
@@ -1125,7 +1245,12 @@ def _run_worker_subprocess(
             failure_type=FailureType.DEADLINE_EXCEEDED,
             message=f"worker exceeded subprocess deadline of {effective_timeout:g}s",
             stage="subprocess",
-            details={"timeout_seconds": effective_timeout},
+            details={
+                "timeout_seconds": effective_timeout,
+                "worker_return_code": return_code,
+                "watchdog_telemetry": "native/watchdog_telemetry.json",
+            },
+            partial_telemetry=partial_telemetry,
         )
     else:
         result = build_failure_result(
@@ -1143,6 +1268,41 @@ def _run_worker_subprocess(
         )
     persist_terminal_result(attempt_directory, result)
     return result
+
+
+def _read_partial_telemetry(attempt_directory: Path) -> dict[str, Any] | None:
+    path = attempt_directory / "native" / "partial_telemetry.json"
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    sanitized = sanitize_trace_value(payload)
+    return sanitized if isinstance(sanitized, dict) else None
+
+
+def _persist_watchdog_telemetry(
+    attempt_directory: Path,
+    *,
+    process_id: int,
+    timeout_seconds: float,
+    partial_telemetry: Mapping[str, Any] | None,
+) -> None:
+    atomic_write_json(
+        attempt_directory / "native" / "watchdog_telemetry.json",
+        {
+            "schema_version": 1,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "worker_process_id": process_id,
+            "timeout_seconds": timeout_seconds,
+            "partial_telemetry_available": partial_telemetry is not None,
+            "partial_telemetry": dict(partial_telemetry or {}),
+        },
+        overwrite=True,
+    )
 
 
 def _write_attempt_inputs(
