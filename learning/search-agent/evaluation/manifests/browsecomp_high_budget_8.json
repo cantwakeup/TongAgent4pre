@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "manifest_id": "browsecomp_high_budget_8",
+  "experiment_label": "exploratory BrowseComp high-budget study",
+  "study_type": "exploratory resource-envelope study",
+  "formal_result_replacement": false,
+  "parent_manifest": "evaluation/manifests/final_harness_benchmark_v2.json",
+  "parent_manifest_sha256": "sha256:ec9617dbc2c01d9c5d60b44af2fa00045069fccc3c52d61f83ac712ab9a86162",
+  "parent_dataset": "evaluation/datasets/final_harness_benchmark_v2.jsonl",
+  "parent_dataset_sha256": "sha256:0e5dbf0dcf04b43a9dee035af53bce17be65f1742b0a792d22a50b77786c9d9e",
+  "selection_rule": "reuse the exact eight frozen formal BrowseComp tasks in ascending source-index order",
+  "selection_uses_answers": false,
+  "selected_count": 8,
+  "selected_source_indices": [195, 257, 429, 515, 537, 560, 969, 1139],
+  "selected_task_ids": [
+    "browsecomp-00792eac015de490",
+    "browsecomp-02871b42634d2d7b",
+    "browsecomp-01e63043eb86a1a5",
+    "browsecomp-02540fa712871a6a",
+    "browsecomp-0225d819d53d70d7",
+    "browsecomp-025775f4ecb5ba0d",
+    "browsecomp-00e082ffa8ac7bd9",
+    "browsecomp-017c1f68f62bbf91"
+  ],
+  "question_sha256": {
+    "browsecomp-00792eac015de490": "00792eac015de49008120a119a1a97f42d4482218617254770fb5902ed4caf2a",
+    "browsecomp-02871b42634d2d7b": "02871b42634d2d7ba11d9c7ce8383b2e5e25c0e335e27a992c91354122a33eb8",
+    "browsecomp-01e63043eb86a1a5": "01e63043eb86a1a5f0d95f3a922864ab1b2af4c2983e044dcd58bf14764ea5c9",
+    "browsecomp-02540fa712871a6a": "02540fa712871a6ad290c40f16d60bae61a8d49a45c9a2f230ea6dde3b3cf05f",
+    "browsecomp-0225d819d53d70d7": "0225d819d53d70d77325d3f6e76120c7770f8b7cb9853ea42d12a6c0b4b1d9c7",
+    "browsecomp-025775f4ecb5ba0d": "025775f4ecb5ba0dd40c4ea781c583b80e2bb1fa4db4690db31229b9be779a54",
+    "browsecomp-00e082ffa8ac7bd9": "00e082ffa8ac7bd938c68f43b9599ed7d11a267e24aca7474ceac19c73e3eb4a",
+    "browsecomp-017c1f68f62bbf91": "017c1f68f62bbf91cd0cec70da1dfd1ee158c63ef3cf9dbe3e3e2684469c8223"
+  },
+  "systems": ["bare_simple_react", "tongagent_standard"],
+  "model": "gpt-5.5",
+  "seed": 17,
+  "concurrency": 1,
+  "shared_budget": {
+    "max_total_tokens": 120000,
+    "max_output_tokens": 5000,
+    "watchdog_seconds": 1200,
+    "max_search_calls": 8,
+    "max_fetch_calls": 12,
+    "max_total_tool_calls": 20,
+    "max_model_calls": 20
+  },
+  "cost_guard": {
+    "currency": "USD",
+    "hard_cap": 11.6,
+    "uncached_input_per_million": 5.0,
+    "cached_input_per_million": 0.5,
+    "output_per_million": 30.0,
+    "worst_case_uncached_input_tokens_per_run": 115000,
+    "worst_case_output_tokens_per_run": 5000,
+    "worst_case_cost_per_run": 0.725,
+    "worst_case_total_cost": 11.6
+  },
+  "interpretation_constraint": "token, search, fetch, model-call, and wall-clock limits increase together; results identify only a composite resource-envelope effect"
+}

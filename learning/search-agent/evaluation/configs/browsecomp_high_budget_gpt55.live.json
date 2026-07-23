@@ -1,0 +1,32 @@
+{
+  "backend_kind": "live",
+  "fixture_revision": null,
+  "model": {
+    "provider": "openai",
+    "name": "gpt-5.5",
+    "credential_env": ["OPENAI_API_KEY"],
+    "temperature": 1.0,
+    "max_output_tokens": 5000,
+    "parameters": {
+      "base_url": "https://especially-realm-involvement-skilled.trycloudflare.com/v1"
+    }
+  },
+  "tools": {
+    "search_backend": "tongagent-web-search",
+    "fetch_backend": "tongagent-fetch-url",
+    "parameters": {}
+  },
+  "budget": {
+    "max_search_calls": 8,
+    "max_fetch_calls": 12,
+    "max_total_tool_calls": 20,
+    "max_model_calls": 20,
+    "max_total_tokens": 120000,
+    "wall_time_seconds": 1200.0,
+    "max_results_per_search": 5,
+    "max_page_chars": 12000,
+    "recursion_limit": 125
+  },
+  "runtime_mode": "tongagent_standard",
+  "judge": null
+}
