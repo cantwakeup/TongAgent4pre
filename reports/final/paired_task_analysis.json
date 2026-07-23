@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "study_status": "blocked_at_smoke_gate",
+  "formal_core_started": false,
+  "formal_pair_counts": null,
+  "harness_delta_weak": null,
+  "harness_delta_strong": null,
+  "smoke_pairs": [
+    {
+      "model": "gpt-5.4-nano",
+      "task_id": "frames-test-0000",
+      "bare_standard_em": false,
+      "tongagent_standard_em": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "completed",
+      "tongagent_status": "completed"
+    },
+    {
+      "model": "gpt-5.4-nano",
+      "task_id": "frames-test-0001",
+      "bare_standard_em": false,
+      "tongagent_standard_em": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "budget_exhausted",
+      "tongagent_status": "timed_out"
+    },
+    {
+      "model": "gpt-5.5",
+      "task_id": "frames-test-0000",
+      "bare_standard_em": false,
+      "tongagent_standard_em": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "timed_out",
+      "tongagent_status": "timed_out"
+    },
+    {
+      "model": "gpt-5.5",
+      "task_id": "frames-test-0001",
+      "bare_standard_em": false,
+      "tongagent_standard_em": false,
+      "paired_outcome": "both_wrong",
+      "bare_status": "timed_out",
+      "tongagent_status": "timed_out"
+    }
+  ],
+  "interpretation": "Smoke outcomes validate terminal artifact and scorer paths only. They are not the preregistered formal matrix and are not used to claim a model or Harness accuracy effect."
+}
