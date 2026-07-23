@@ -75,7 +75,17 @@ def _config(
     *,
     system_id: str,
     artifact_name: str,
+    high_budget_finalization: bool = False,
+    high_budget_token_trigger: int = 0,
 ) -> ResolvedConfig:
+    system_options: dict[str, Any] = {"fixture_dir": "evaluation/fixtures"}
+    if high_budget_finalization:
+        system_options["high_budget_finalization"] = {
+            "enabled": True,
+            "token_trigger": high_budget_token_trigger,
+            "wall_time_trigger_seconds": 20.0,
+            "remaining_model_calls_trigger": 1,
+        }
     return ResolvedConfig(
         system_id=system_id,
         dataset_digest="sha256:transparent-harness-fixture",
@@ -103,7 +113,7 @@ def _config(
         ),
         runtime_mode="tongagent_standard",
         seed=17,
-        system_options={"fixture_dir": "evaluation/fixtures"},
+        system_options=system_options,
         artifact_directory=str(tmp_path / artifact_name),
     )
 
@@ -305,3 +315,96 @@ def test_standard_resumes_after_tool_checkpoint_without_refetch(
         (tmp_path / "resume" / "native" / "checkpoint_manifest.json").read_text()
     )
     assert manifest["checkpoint_restored"] is True
+
+
+def test_shared_high_budget_boundary_forces_one_tool_free_answer_for_both_systems(
+    tmp_path: Path,
+) -> None:
+    task = EvalTask(
+        id="transparent-forced-finalization",
+        question="What is the capital of France?",
+        reference_answer="Paris",
+        metadata={"answer": "FINAL_ANSWER: Paris"},
+    )
+    bare_backend = _backend()
+    standard_backend = _backend()
+    bare_model = FixtureChatModel.from_task(task, system_id="bare_simple_react")
+    standard_model = FixtureChatModel.from_task(
+        task,
+        system_id="tongagent_standard",
+    )
+    bare_config = _config(
+        tmp_path,
+        bare_backend,
+        system_id="bare_simple_react",
+        artifact_name="bare-forced",
+        high_budget_finalization=True,
+    )
+    standard_config = _config(
+        tmp_path,
+        standard_backend,
+        system_id="tongagent_standard",
+        artifact_name="standard-forced",
+        high_budget_finalization=True,
+    )
+
+    bare = BareSimpleReactRunner(
+        fixture_backend=bare_backend,
+        model=bare_model,
+    ).run(task, bare_config)
+    standard = TongAgentStandardRunner(
+        fixture_backend=standard_backend,
+        model=standard_model,
+    ).run(task, standard_config)
+
+    assert bare_config.fairness_fingerprint == standard_config.fairness_fingerprint
+    assert bare.final_answer == standard.final_answer == "FINAL_ANSWER: Paris"
+    assert bare.raw_model_answer == bare.final_answer
+    assert standard.raw_model_answer == standard.final_answer
+    assert bare.search_calls == standard.search_calls == 0
+    assert bare.fetch_calls == standard.fetch_calls == 0
+    assert bare_model.call_history[0]["bound_tools"] == []
+    assert standard_model.call_history[0]["bound_tools"] == []
+    for name in ("bare-forced", "standard-forced"):
+        artifact = json.loads(
+            (tmp_path / name / "native" / "finalization.json").read_text()
+        )
+        assert artifact["finalization_triggered"] is True
+        assert artifact["finalization_reason"] == "total_tokens"
+        assert artifact["natural_answer"] is None
+        assert artifact["forced_final_answer"] == "FINAL_ANSWER: Paris"
+        assert artifact["finalization_call_started"] is True
+        assert artifact["finalization_call_finished"] is True
+        assert artifact["blocked_tools_after_finalization"] == []
+        assert not (tmp_path / name / "native" / "natural_answer.md").exists()
+        assert (tmp_path / name / "native" / "forced_final_answer.md").is_file()
+
+
+def test_high_budget_boundary_preserves_a_natural_answer_separately(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    backend = _backend()
+    result = BareSimpleReactRunner(fixture_backend=backend).run(
+        task,
+        _config(
+            tmp_path,
+            backend,
+            system_id="bare_simple_react",
+            artifact_name="bare-natural",
+            high_budget_finalization=True,
+            high_budget_token_trigger=20_000,
+        ),
+    )
+
+    artifact = json.loads(
+        (tmp_path / "bare-natural" / "native" / "finalization.json").read_text()
+    )
+    assert result.final_answer == "FINAL_ANSWER: Paris"
+    assert artifact["finalization_triggered"] is False
+    assert artifact["natural_answer"] == "FINAL_ANSWER: Paris"
+    assert artifact["forced_final_answer"] is None
+    assert (tmp_path / "bare-natural" / "native" / "natural_answer.md").is_file()
+    assert not (
+        tmp_path / "bare-natural" / "native" / "forced_final_answer.md"
+    ).exists()

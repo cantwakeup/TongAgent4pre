@@ -105,6 +105,8 @@ _HEX_SHA = re.compile(r"^[0-9a-f]{7,64}$")
 SemanticStrategy = Literal["fixed", "adaptive"]
 _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE = 4_096
 _FINAL_SYNTHESIS_DRAFT_CHARS = 6_000
+_HIGH_BUDGET_FINALIZATION_CONTEXT_CHARS = 6_000
+_HIGH_BUDGET_FINALIZATION_OUTPUT_CAP = 1_000
 _TONGAGENT_PAGE_CONTEXT_CHARS = 3_500
 _TONGAGENT_SEARCH_SNIPPET_CHARS = 320
 _READ_ONLY_STATE_TOOLS = frozenset(
@@ -158,6 +160,16 @@ class PreparedRuntime:
     fixture_backend: FixtureBackend | None
 
 
+@dataclass(frozen=True)
+class _HighBudgetFinalizationBoundary:
+    """Shared answer-only boundary for the exploratory high-budget study."""
+
+    token_trigger: int
+    wall_time_trigger_seconds: float
+    remaining_model_calls_trigger: int
+    artifact_path: Path
+
+
 class EvaluationMiddleware(AgentMiddleware):
     """Enforce and observe the shared model/tool budget.
 
@@ -178,6 +190,8 @@ class EvaluationMiddleware(AgentMiddleware):
         enable_context_compaction: bool = False,
         enable_token_partitions: bool = False,
         max_model_connection_retries: int = 0,
+        question: str | None = None,
+        high_budget_finalization: _HighBudgetFinalizationBoundary | None = None,
     ) -> None:
         super().__init__()
         self.execution_budget = execution_budget
@@ -193,6 +207,8 @@ class EvaluationMiddleware(AgentMiddleware):
             }
         self._enable_context_compaction = enable_context_compaction
         self._max_model_connection_retries = max_model_connection_retries
+        self._question = question
+        self._high_budget_finalization = high_budget_finalization
         self._token_controller = (
             StageTokenController(
                 total_token_limit=execution_budget.limits.max_total_tokens,
@@ -224,6 +240,14 @@ class EvaluationMiddleware(AgentMiddleware):
         self._model_calls_by_subquestion: dict[str, int] = {}
         self._phase_model_calls: dict[str, int] = {}
         self._avoidable_model_calls = 0
+        self._finalization_triggered = False
+        self._finalization_reason: str | None = None
+        self._finalization_triggered_at: str | None = None
+        self._finalization_call_started = False
+        self._finalization_call_finished = False
+        self._natural_answer: str | None = None
+        self._forced_final_answer: str | None = None
+        self._blocked_tools_after_finalization: list[str] = []
         if reserve_final_synthesis:
             final_cap = self.stage_output_cap("final_extractor")
             token_reservation = final_cap + _FINAL_SYNTHESIS_INPUT_TOKEN_RESERVE
@@ -310,6 +334,94 @@ class EvaluationMiddleware(AgentMiddleware):
                 ),
             }
         return TokenUsage.model_validate(values)
+
+    def record_terminal_answer(self, answer: str | None) -> None:
+        """Persist the natural/forced answer split without rewriting either."""
+
+        if self._high_budget_finalization is None:
+            return
+        with self._lock:
+            if self._finalization_triggered:
+                if self._forced_final_answer is None:
+                    self._forced_final_answer = answer
+            else:
+                self._natural_answer = answer
+            self._persist_finalization_locked()
+
+    def finalization_snapshot(self) -> dict[str, Any] | None:
+        """Return the exploratory boundary state, or null when disabled."""
+
+        boundary = self._high_budget_finalization
+        if boundary is None:
+            return None
+        with self._lock:
+            return {
+                "schema_version": 1,
+                "mode": "shared_high_budget_finalization_boundary",
+                "natural_answer": self._natural_answer,
+                "forced_final_answer": self._forced_final_answer,
+                "finalization_triggered": self._finalization_triggered,
+                "finalization_reason": self._finalization_reason,
+                "finalization_triggered_at": self._finalization_triggered_at,
+                "finalization_call_started": self._finalization_call_started,
+                "finalization_call_finished": self._finalization_call_finished,
+                "blocked_tools_after_finalization": list(
+                    self._blocked_tools_after_finalization
+                ),
+                "boundary": {
+                    "token_trigger": boundary.token_trigger,
+                    "wall_time_trigger_seconds": boundary.wall_time_trigger_seconds,
+                    "remaining_model_calls_trigger": (
+                        boundary.remaining_model_calls_trigger
+                    ),
+                    "forced_output_cap": _HIGH_BUDGET_FINALIZATION_OUTPUT_CAP,
+                    "context_chars": _HIGH_BUDGET_FINALIZATION_CONTEXT_CHARS,
+                },
+            }
+
+    def _maybe_trigger_high_budget_finalization(self) -> str | None:
+        boundary = self._high_budget_finalization
+        if boundary is None:
+            return None
+        with self._lock:
+            if self._finalization_triggered:
+                return self._finalization_reason
+            snapshot = self.execution_budget.snapshot()
+            if snapshot.total_tokens >= boundary.token_trigger:
+                reason = "total_tokens"
+            elif snapshot.elapsed_seconds >= boundary.wall_time_trigger_seconds:
+                reason = "wall_time"
+            elif (
+                snapshot.remaining_model_calls <= boundary.remaining_model_calls_trigger
+            ):
+                reason = "one_model_call_remaining"
+            else:
+                return None
+            self._finalization_triggered = True
+            self._finalization_reason = reason
+            self._finalization_triggered_at = datetime.now(UTC).isoformat()
+            self._persist_finalization_locked()
+        self.trace.record(
+            "high_budget_finalization_triggered",
+            reason=reason,
+            budget=snapshot,
+            boundary={
+                "token_trigger": boundary.token_trigger,
+                "wall_time_trigger_seconds": boundary.wall_time_trigger_seconds,
+                "remaining_model_calls_trigger": (
+                    boundary.remaining_model_calls_trigger
+                ),
+            },
+        )
+        return reason
+
+    def _persist_finalization_locked(self) -> None:
+        boundary = self._high_budget_finalization
+        if boundary is None:
+            return
+        payload = self.finalization_snapshot()
+        assert payload is not None
+        _atomic_write_json(boundary.artifact_path, payload)
 
     def stage_output_cap(self, stage: ModelStage) -> int:
         """Return the auditable cap used for one TongAgent model stage."""
@@ -640,15 +752,45 @@ class EvaluationMiddleware(AgentMiddleware):
         """Reserve, trace, and account one synchronous model call."""
 
         label = _model_label(request)
-        stage = _stage_for_model_request(request)
+        finalization_reason = self._maybe_trigger_high_budget_finalization()
+        forced_finalization = finalization_reason is not None
+        if forced_finalization:
+            with self._lock:
+                if self._finalization_call_finished:
+                    answer = self._forced_final_answer or "FINAL_ANSWER: ABSTAIN"
+                    self.trace.record(
+                        "high_budget_finalization_reused_without_model_call",
+                        reason=finalization_reason,
+                        budget=self.execution_budget.snapshot(),
+                    )
+                    return ModelResponse(result=[AIMessage(content=answer)])
+        stage = (
+            "final_extractor"
+            if forced_finalization
+            else _stage_for_model_request(request)
+        )
         active_subquestion_id = _active_subquestion_id(request)
         original_context = _model_context_profile(request)
-        effective_request = (
-            _compact_tongagent_model_request(request)
-            if self._enable_context_compaction
-            else request
-        )
-        cap = self.stage_output_cap(stage)
+        if forced_finalization:
+            with self._lock:
+                self._finalization_call_started = True
+                self._persist_finalization_locked()
+            effective_request = _high_budget_finalization_request(
+                request,
+                question=self._question,
+                reason=str(finalization_reason),
+            )
+            cap = min(
+                self.stage_output_cap(stage),
+                _HIGH_BUDGET_FINALIZATION_OUTPUT_CAP,
+            )
+        else:
+            effective_request = (
+                _compact_tongagent_model_request(request)
+                if self._enable_context_compaction
+                else request
+            )
+            cap = self.stage_output_cap(stage)
         model_settings = dict(effective_request.model_settings)
         model_settings["max_tokens"] = cap
         effective_request = effective_request.override(model_settings=model_settings)
@@ -664,6 +806,7 @@ class EvaluationMiddleware(AgentMiddleware):
                 active_subquestion_id=active_subquestion_id,
                 context_profile=effective_context,
                 original_context_profile=original_context,
+                stage_output_cap_override=cap,
             )
             started = time.perf_counter()
             try:
@@ -692,7 +835,8 @@ class EvaluationMiddleware(AgentMiddleware):
                     token_partition=self.token_partition_snapshot(),
                 )
                 if (
-                    retries >= self._max_model_connection_retries
+                    forced_finalization
+                    or retries >= self._max_model_connection_retries
                     or not _is_transient_model_connection_error(exc)
                 ):
                     raise
@@ -739,6 +883,18 @@ class EvaluationMiddleware(AgentMiddleware):
             budget=self.execution_budget.snapshot(),
             token_partition=self.token_partition_snapshot(),
         )
+        if forced_finalization:
+            forced_answer = _model_response_text(response)
+            with self._lock:
+                self._forced_final_answer = forced_answer
+                self._finalization_call_finished = True
+                self._persist_finalization_locked()
+            self.trace.record(
+                "high_budget_finalization_finished",
+                reason=finalization_reason,
+                forced_answer=forced_answer,
+                budget=self.execution_budget.snapshot(),
+            )
         return response
 
     def wrap_tool_call(
@@ -752,6 +908,32 @@ class EvaluationMiddleware(AgentMiddleware):
         tool_name = str(raw_call.get("name") or getattr(request.tool, "name", "tool"))
         call_id = str(raw_call.get("id") or f"eval-tool-{uuid.uuid4().hex}")
         arguments = _sanitized_arguments(raw_call.get("args", {}))
+        finalization_reason = self._maybe_trigger_high_budget_finalization()
+        if finalization_reason is not None:
+            with self._lock:
+                self._blocked_tools_after_finalization.append(tool_name)
+                self._persist_finalization_locked()
+            self.trace.record(
+                "tool_call_blocked_by_high_budget_finalization",
+                call_id=call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=finalization_reason,
+                budget=self.execution_budget.snapshot(),
+            )
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "blocked",
+                        "tool": tool_name,
+                        "reason": "high_budget_finalization_boundary",
+                    },
+                    sort_keys=True,
+                ),
+                tool_call_id=call_id,
+                name=tool_name,
+                status="error",
+            )
         started_at = datetime.now(UTC)
         started = time.perf_counter()
         denial: BudgetExceeded | None = None
@@ -938,8 +1120,13 @@ class EvaluationMiddleware(AgentMiddleware):
         active_subquestion_id: str | None,
         context_profile: Mapping[str, Any],
         original_context_profile: Mapping[str, Any] | None = None,
+        stage_output_cap_override: int | None = None,
     ) -> ModelCallReservation:
-        stage_output_cap = self.stage_output_cap(stage)
+        stage_output_cap = (
+            stage_output_cap_override
+            if stage_output_cap_override is not None
+            else self.stage_output_cap(stage)
+        )
         token_reservation = estimated_input_tokens + stage_output_cap
         tools_since_previous_call = self._consume_tools_since_model_call()
         partition: PartitionReservation | None = None
@@ -1474,6 +1661,12 @@ def prepare_runtime(
     # existing callers and, in particular, the strict baseline.
     if reserve_final_synthesis is None:
         reserve_final_synthesis = resolved_config.backend_kind == "live"
+    high_budget_finalization = _resolve_high_budget_finalization(
+        resolved_config,
+        artifact_path=(
+            Path(resolved_config.artifact_directory) / "native" / "finalization.json"
+        ),
+    )
     middleware = EvaluationMiddleware(
         execution_budget,
         trace,
@@ -1487,6 +1680,8 @@ def prepare_runtime(
         enable_context_compaction=enable_tongagent_context_compaction,
         enable_token_partitions=enable_tongagent_token_control,
         max_model_connection_retries=max_model_connection_retries,
+        question=task.question,
+        high_budget_finalization=high_budget_finalization,
     )
     semantic_tools, research_budget = _semantic_network_tools(
         resolved_config,
@@ -1614,6 +1809,13 @@ def run_graph_system(
                 )
             final_answer_override = _attach_final_marker(draft, "ABSTAIN")
 
+    if runtime is not None:
+        runtime.middleware.record_terminal_answer(
+            final_answer_override
+            if final_answer_override is not None
+            else extract_final_answer(native_output)
+        )
+
     finished_at = datetime.now(UTC)
     wall_time_seconds = max(0.0, time.perf_counter() - started)
     result = build_run_result(
@@ -1673,6 +1875,9 @@ def build_run_result(
     )
     tool_calls = runtime.middleware.tool_calls if runtime is not None else []
     token_usage = runtime.middleware.token_usage if runtime is not None else None
+    finalization = (
+        runtime.middleware.finalization_snapshot() if runtime is not None else None
+    )
     research_snapshot = (
         runtime.research_budget.snapshot() if runtime is not None else {}
     )
@@ -1741,6 +1946,11 @@ def build_run_result(
         ),
         answer_rate=strict_answer_rate(final_answer),
         judge_score=None,
+        workflow_metrics=(
+            {"high_budget_finalization": finalization}
+            if finalization is not None
+            else None
+        ),
     )
 
 
@@ -1869,6 +2079,65 @@ def _load_fixture_backend(resolved_config: ResolvedConfig) -> FixtureBackend:
     if not fixture_path.is_absolute():
         fixture_path = Path(__file__).resolve().parents[2] / fixture_path
     return FixtureBackend.from_directory(fixture_path)
+
+
+def _resolve_high_budget_finalization(
+    resolved_config: ResolvedConfig,
+    *,
+    artifact_path: Path,
+) -> _HighBudgetFinalizationBoundary | None:
+    raw = resolved_config.system_options.get("high_budget_finalization")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("system_options.high_budget_finalization must be an object")
+    expected = {
+        "enabled",
+        "token_trigger",
+        "wall_time_trigger_seconds",
+        "remaining_model_calls_trigger",
+    }
+    if set(raw) != expected:
+        raise ValueError(
+            "system_options.high_budget_finalization has unexpected fields"
+        )
+    if raw.get("enabled") is not True:
+        raise ValueError("high-budget finalization must be explicitly enabled")
+    token_trigger = _required_nonnegative_int(
+        raw.get("token_trigger"),
+        name="high_budget_finalization.token_trigger",
+    )
+    remaining_calls = _required_nonnegative_int(
+        raw.get("remaining_model_calls_trigger"),
+        name="high_budget_finalization.remaining_model_calls_trigger",
+    )
+    wall_trigger = raw.get("wall_time_trigger_seconds")
+    if (
+        isinstance(wall_trigger, bool)
+        or not isinstance(wall_trigger, (int, float))
+        or wall_trigger < 0
+    ):
+        raise ValueError(
+            "high_budget_finalization.wall_time_trigger_seconds must be non-negative"
+        )
+    if token_trigger > resolved_config.budget.max_total_tokens:
+        raise ValueError("high-budget token trigger exceeds total token ceiling")
+    if float(wall_trigger) > resolved_config.budget.wall_time_seconds:
+        raise ValueError("high-budget wall trigger exceeds watchdog")
+    if remaining_calls > resolved_config.budget.max_model_calls:
+        raise ValueError("high-budget model-call trigger exceeds call ceiling")
+    return _HighBudgetFinalizationBoundary(
+        token_trigger=token_trigger,
+        wall_time_trigger_seconds=float(wall_trigger),
+        remaining_model_calls_trigger=remaining_calls,
+        artifact_path=artifact_path,
+    )
+
+
+def _required_nonnegative_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
 
 
 def _live_raw_tools() -> list[BaseTool]:
@@ -3065,6 +3334,92 @@ def _message_text(message: BaseMessage) -> str | None:
     return _content_text(message.content)
 
 
+def _model_response_text(response: Any) -> str | None:
+    if isinstance(response, AIMessage):
+        return _message_text(response)
+    messages = getattr(response, "result", None)
+    if isinstance(messages, Sequence) and not isinstance(
+        messages, (str, bytes, bytearray)
+    ):
+        for message in reversed(messages):
+            if isinstance(message, BaseMessage):
+                text = _message_text(message)
+                if text:
+                    return text
+    return None
+
+
+def _high_budget_finalization_request(
+    request: ModelRequest[Any],
+    *,
+    question: str | None,
+    reason: str,
+) -> ModelRequest[Any]:
+    """Build one bounded, tool-free request from the existing trajectory."""
+
+    base_system = (
+        _message_text(request.system_message)
+        if request.system_message is not None
+        else ""
+    )
+    boundary_instruction = (
+        "[SHARED HIGH-BUDGET FINALIZATION BOUNDARY]\n"
+        f"Trigger reason: {reason}. Do not call tools or request more research. "
+        "Using only the original question and the trajectory below, return "
+        "exactly one line: FINAL_ANSWER: <short answer>. If the trajectory "
+        "cannot support an answer, return exactly FINAL_ANSWER: ABSTAIN."
+    )
+    system_content = "\n\n".join(
+        item for item in (base_system, boundary_instruction) if item
+    )
+    trajectory = _bounded_trajectory_text(
+        request.messages,
+        limit=_HIGH_BUDGET_FINALIZATION_CONTEXT_CHARS,
+    )
+    user_content = (
+        f"Original question:\n{question or ''}\n\n"
+        f"Existing trajectory (most recent retained context):\n{trajectory}"
+    )
+    return request.override(
+        system_message=SystemMessage(content=system_content),
+        messages=[HumanMessage(content=user_content)],
+        tools=[],
+        tool_choice=None,
+        response_format=None,
+    )
+
+
+def _bounded_trajectory_text(
+    messages: Sequence[BaseMessage],
+    *,
+    limit: int,
+) -> str:
+    retained: list[str] = []
+    used = 0
+    for message in reversed(messages):
+        text = _message_text(message) or ""
+        if isinstance(message, AIMessage) and message.tool_calls:
+            calls = json.dumps(
+                message.tool_calls,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            text = f"{text}\nTool calls: {calls}".strip()
+        if not text:
+            continue
+        role = type(message).__name__
+        remaining = limit - used
+        if remaining <= 0:
+            break
+        piece = f"[{role}] {text}"[-remaining:]
+        retained.append(piece)
+        used += len(piece) + 1
+    if not retained:
+        return "(no retained trajectory text)"
+    return "\n".join(reversed(retained))
+
+
 def _content_text(content: Any) -> str | None:
     if isinstance(content, str):
         return content.strip() or None
@@ -3155,6 +3510,23 @@ def write_intermediate_artifacts(
     _atomic_write_json(native_directory / "budget.json", budget_payload)
     _atomic_write_json(native_directory / "tool_calls.json", tool_payload)
     _atomic_write_text(native_directory / "trace.jsonl", trace.jsonl())
+    finalization = (
+        runtime.middleware.finalization_snapshot() if runtime is not None else None
+    )
+    if finalization is not None:
+        _atomic_write_json(native_directory / "finalization.json", finalization)
+        natural = finalization.get("natural_answer")
+        forced = finalization.get("forced_final_answer")
+        if isinstance(natural, str):
+            _atomic_write_text(
+                native_directory / "natural_answer.md",
+                natural.rstrip() + "\n",
+            )
+        if isinstance(forced, str):
+            _atomic_write_text(
+                native_directory / "forced_final_answer.md",
+                forced.rstrip() + "\n",
+            )
     if result.final_answer is not None:
         answer = result.final_answer.rstrip() + "\n"
         _atomic_write_text(native_directory / "answer.md", answer)

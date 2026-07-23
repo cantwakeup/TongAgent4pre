@@ -333,7 +333,9 @@ class ResolvedConfig(FrozenStrictModel):
             "fairness_fingerprint",
         }
         if fairness:
-            excluded.update({"system_id", "system_options"})
+            excluded.add("system_id")
+            if "high_budget_finalization" not in self.system_options:
+                excluded.add("system_options")
         if not include_runtime_mode:
             excluded.update(
                 {"runtime_mode", "permissive_workflow", "answer_revise_workflow"}
@@ -341,6 +343,12 @@ class ResolvedConfig(FrozenStrictModel):
         elif not include_answer_revise:
             excluded.add("answer_revise_workflow")
         payload = self.model_dump(mode="json", exclude=excluded)
+        if fairness and "high_budget_finalization" in self.system_options:
+            payload["system_options"] = {
+                "high_budget_finalization": self.system_options[
+                    "high_budget_finalization"
+                ]
+            }
         if include_runtime_mode and not include_fact_gap:
             permissive = dict(payload.get("permissive_workflow", {}))
             for name in (

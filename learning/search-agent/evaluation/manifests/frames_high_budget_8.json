@@ -1,0 +1,98 @@
+{
+  "benchmark_status": "exploratory_high_budget_benchmark",
+  "cost_policy": {
+    "cached_input_per_million": 0.5,
+    "currency": "USD",
+    "known_cost_cap": 6.0,
+    "output_per_million": 30.0,
+    "stop_after_current_attempt": true,
+    "uncached_input_per_million": 5.0
+  },
+  "dataset_sha256": "sha256:1c09ffd61bca42b9020a7d5782c7a1c0bebf94ccd9145746088a0df872510cb6",
+  "experiment_id": "frames-high-budget-completion-v1",
+  "manifest_id": "frames_high_budget_8",
+  "matrix": {
+    "concurrency": 1,
+    "core_jobs": 16,
+    "job_order": "task_id_then_system_manifest_order",
+    "model": "gpt-5.5",
+    "systems": [
+      "bare_simple_react",
+      "tongagent_standard"
+    ],
+    "tasks": 8
+  },
+  "parent_dataset": "evaluation/datasets/final_model_harness_frames12.jsonl",
+  "parent_dataset_sha256": "sha256:b683d23fbbd1ee4237180e6aee610148186a3eb754647a4cef48ba4ec3e0d090",
+  "parent_manifest": "evaluation/manifests/final_model_harness_frames12.json",
+  "parent_manifest_sha256": "sha256:3b27727ac493732b839bf7778f5ed993591636e6936f53480029b5fef17a4630",
+  "question_sha256": {
+    "frames-test-0000": "sha256:34b9e378f634dfe253e208c434c474fffe942e4298dd85fd4ed45da90c7ca73a",
+    "frames-test-0001": "sha256:b8c3cc9230ac20d2859b3dfeefcbf0d0ad74a316d316566231d7a05e5f3fc93d",
+    "frames-test-0002": "sha256:937b0271d5bd4e8cab5ae99ebcf848bbb555bdf1a26cbb48a192875adaa631cd",
+    "frames-test-0003": "sha256:bcfe944bcf977e3ad88a034f67684d233f33a80dfd2d88b47616388cc5e4d667",
+    "frames-test-0004": "sha256:cb9bd5302bd958b67936d36c2d52e103d61abc2bbd4705ed9c67663e8c367085",
+    "frames-test-0005": "sha256:680f732f8df6258f9c9b9072e0a7a77c8e2b83ff0dcb2774dd2db852986425d3",
+    "frames-test-0006": "sha256:755792a25efe845ea5830cf7f61527555248752a8e9d0bca5ae3c72685e705a4",
+    "frames-test-0007": "sha256:f75a1ce6aa12cfd46e49b857f8b4e969c9c1d892ca687da08cd9474ea93fbe1d"
+  },
+  "schema_version": 1,
+  "selected_count": 8,
+  "selected_source_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "selected_task_ids": [
+    "frames-test-0000",
+    "frames-test-0001",
+    "frames-test-0002",
+    "frames-test-0003",
+    "frames-test-0004",
+    "frames-test-0005",
+    "frames-test-0006",
+    "frames-test-0007"
+  ],
+  "selection_inputs": [
+    "task_id",
+    "question",
+    "source_index"
+  ],
+  "selection_prohibited_inputs": [
+    "reference_answer",
+    "gold_articles",
+    "source_urls",
+    "historical_correctness",
+    "manual_difficulty_judgment"
+  ],
+  "selection_rule": "ascending_source_index_first_8",
+  "shared_budget": {
+    "max_fetch_calls": 6,
+    "max_model_calls": 16,
+    "max_output_tokens": 5000,
+    "max_search_calls": 4,
+    "total_token_ceiling": 100000,
+    "watchdog_seconds": 900
+  },
+  "shared_finalization_boundary": {
+    "remaining_model_calls_trigger": 1,
+    "token_trigger": 90000,
+    "wall_time_trigger_seconds": 840
+  },
+  "validation": {
+    "historical_leakage": 0,
+    "historical_leakage_task_ids": [],
+    "prior_scaling_smoke_overlap": 2,
+    "prior_scaling_smoke_task_ids": [
+      "frames-test-0000",
+      "frames-test-0001"
+    ],
+    "question_hash_match": "8/8",
+    "source_index_match": "8/8"
+  }
+}

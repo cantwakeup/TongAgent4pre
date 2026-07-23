@@ -43,6 +43,7 @@ from evaluation.offline import FixtureChatModel
 from evaluation.judging import JudgeUnavailableError, ensure_judge_available
 from evaluation.systems.common import (
     EvaluationMiddleware,
+    _HighBudgetFinalizationBoundary,
     build_evaluation_summarization_middleware,
 )
 from evaluation.tracing import TraceCollector
@@ -595,3 +596,99 @@ def test_fetch_body_is_never_persisted_in_canonical_or_native_trace() -> None:
     assert body_summary["_trace_value"] == "omitted_body_text"
     assert body_summary["chars"] == len(body)
     assert body not in trace.jsonl()
+
+
+def test_high_budget_boundary_blocks_tool_before_budget_or_handler(
+    tmp_path: Path,
+) -> None:
+    budget = ExecutionBudget(_limits())
+    trace = TraceCollector()
+    middleware = EvaluationMiddleware(
+        budget,
+        trace,
+        max_output_tokens=8,
+        question="fixture question",
+        high_budget_finalization=_HighBudgetFinalizationBoundary(
+            token_trigger=0,
+            wall_time_trigger_seconds=9.0,
+            remaining_model_calls_trigger=1,
+            artifact_path=tmp_path / "finalization.json",
+        ),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "web_search",
+            "args": {"query": "must not execute"},
+            "id": "search-blocked",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={},
+        runtime=None,  # type: ignore[arg-type]
+    )
+    handler_called = False
+
+    def handler(_: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("blocked tool handler must not execute")
+
+    response = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(response, ToolMessage)
+    assert response.status == "error"
+    assert handler_called is False
+    assert budget.snapshot().search_calls == 0
+    artifact = json.loads((tmp_path / "finalization.json").read_text())
+    assert artifact["finalization_reason"] == "total_tokens"
+    assert artifact["blocked_tools_after_finalization"] == ["web_search"]
+    assert any(
+        event.event_type == "tool_call_blocked_by_high_budget_finalization"
+        for event in trace.snapshot()
+    )
+
+
+def test_high_budget_boundary_never_executes_a_second_finalization_model_call(
+    tmp_path: Path,
+) -> None:
+    budget = ExecutionBudget(_limits())
+    middleware = EvaluationMiddleware(
+        budget,
+        TraceCollector(),
+        max_output_tokens=8,
+        question="fixture question",
+        high_budget_finalization=_HighBudgetFinalizationBoundary(
+            token_trigger=0,
+            wall_time_trigger_seconds=9.0,
+            remaining_model_calls_trigger=1,
+            artifact_path=tmp_path / "finalization-once.json",
+        ),
+    )
+    request = ModelRequest(
+        model=FakeListChatModel(responses=["unused"]),
+        messages=[HumanMessage(content="fixture question")],
+    )
+    calls = 0
+
+    def handler(_: ModelRequest[object]) -> ModelResponse[object]:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="FINAL_ANSWER: fixture",
+                    usage_metadata={
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                )
+            ]
+        )
+
+    first = middleware.wrap_model_call(request, handler)
+    second = middleware.wrap_model_call(request, handler)
+
+    assert calls == 1
+    assert budget.snapshot().model_calls == 1
+    assert first.result[0].content == second.result[0].content
