@@ -1,0 +1,1508 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "label": "正式实验与受控恢复轨迹",
+    "experiment_id": "final-transparent-harness-v2-formal-20260722T162330Z",
+    "git_sha": "7a94dd2a583fc9770586a5de5fbad1e37a2639c1",
+    "task_id": "0383a3ee-47a7-41a4-b493-519bdefe0488",
+    "replay_task_ids": [
+      "0383a3ee-47a7-41a4-b493-519bdefe0488",
+      "305ac316-eef6-4446-960a-92d80d542f82",
+      "46719c30-f4c3-4cad-be07-d5cb21eee6bb",
+      "fault-resume-alpha"
+    ],
+    "fault_experiment_id": "final-transparent-harness-v2-fault-20260722T175204Z",
+    "contains_reference_answer": false,
+    "network_required": false
+  },
+  "parity": {
+    "model": "GPT-5.5",
+    "seed": 17,
+    "prompt_hash": "73a4e7cc90c0ed0b2f5f743de28f35747647fc33c80e1bb6af706b1e5ada6eef",
+    "fairness_fingerprint": "sha256:516c790a52a97ee393c990af08ec8229658469529e7264dad2fa77feeb487233",
+    "tools": [
+      "web_search",
+      "fetch_url"
+    ],
+    "policy": "Shared transparent ReAct"
+  },
+  "run": {
+    "question": "On the BBC Earth YouTube video of the Top 5 Silliest Animal Moments, what species of bird is featured?",
+    "model_label": "gpt-5.5",
+    "system_id": "tongagent_standard",
+    "completion_status": "completed",
+    "answer_status": "answer",
+    "raw_model_answer": "FINAL_ANSWER: Rockhopper penguin",
+    "final_answer": "FINAL_ANSWER: Rockhopper penguin",
+    "answer_unchanged": true,
+    "raw_em": true,
+    "standard_em": true,
+    "metrics": {
+      "tokens": 13728,
+      "input_tokens": 13549,
+      "output_tokens": 179,
+      "cached_input_tokens": 4736,
+      "model_calls": 3,
+      "search_calls": 1,
+      "fetch_calls": 1,
+      "wall_time_seconds": 45.9
+    },
+    "limits": {
+      "tokens": 60000,
+      "model_calls": 16,
+      "search_calls": 4,
+      "fetch_calls": 6,
+      "wall_time_seconds": 600.0
+    },
+    "checkpoint": {
+      "file": "checkpoint.sqlite",
+      "restored": false,
+      "thread_id": "tongagent-standard-83cb097f4ccd44978f6e6698"
+    }
+  },
+  "timeline": [
+    {
+      "kind": "system",
+      "title": "任务已接收",
+      "module": "evaluation/systems/common.py",
+      "function": "run_graph_system()",
+      "detail": "已创建原子运行目录，轨迹与预算计数同步启动。",
+      "status": "success",
+      "sequence": 1
+    },
+    {
+      "kind": "runtime",
+      "title": "Agent 执行环境准备完成",
+      "module": "evaluation/systems/common.py",
+      "function": "prepare_runtime()",
+      "detail": "模型 gpt-5.5；工具 网页搜索、页面抓取",
+      "status": "success",
+      "sequence": 2
+    },
+    {
+      "kind": "model",
+      "title": "模型调用 1：分析任务并决定下一步",
+      "module": "evaluation/systems/common.py",
+      "function": "EvaluationMiddleware.wrap_model_call()",
+      "detail": "355 Token；耗时 4.3 秒",
+      "status": "success",
+      "sequence": 5,
+      "budget": {
+        "tokens": 355,
+        "model_calls": 1,
+        "search_calls": 0,
+        "fetch_calls": 0,
+        "elapsed_seconds": 5.6
+      }
+    },
+    {
+      "kind": "search",
+      "title": "网页搜索",
+      "module": "search_agent.py → retrieval_backend.py",
+      "function": "limited_web_search() → SearchBroker.search()",
+      "detail": "查询：「BBC Earth YouTube \"Top 5 Silliest Animal Moments\" bird species featured」",
+      "status": "success",
+      "sequence": 7,
+      "duration": 15.981755972024985,
+      "providers": [
+        {
+          "name": "tavily",
+          "status": "not_configured"
+        },
+        {
+          "name": "mediawiki",
+          "status": "empty"
+        },
+        {
+          "name": "duckduckgo_html",
+          "status": "success"
+        },
+        {
+          "name": "bing_rss",
+          "status": "skipped"
+        }
+      ],
+      "result_count": 5
+    },
+    {
+      "kind": "model",
+      "title": "模型调用 2：分析任务并决定下一步",
+      "module": "evaluation/systems/common.py",
+      "function": "EvaluationMiddleware.wrap_model_call()",
+      "detail": "5,279 Token；耗时 6.6 秒",
+      "status": "success",
+      "sequence": 10,
+      "budget": {
+        "tokens": 5634,
+        "model_calls": 2,
+        "search_calls": 1,
+        "fetch_calls": 0,
+        "elapsed_seconds": 28.2
+      }
+    },
+    {
+      "kind": "fetch",
+      "title": "来源网页抓取成功",
+      "module": "search_agent.py → retrieval_backend.py",
+      "function": "limited_fetch_url() → RetrievalSession.fetch()",
+      "detail": "Top 5 Silliest Animal Moments! | BBC Earth",
+      "status": "success",
+      "sequence": 12,
+      "duration": 13.119414882967249,
+      "source_id": "S1",
+      "url": "https://opentools.ai/youtube-summary/top-5-silliest-animal-moments-or-bbc-earth",
+      "content_chars": 10895,
+      "acquisition_method": "direct_http"
+    },
+    {
+      "kind": "model",
+      "title": "模型调用 3：生成最终答案",
+      "module": "evaluation/systems/common.py",
+      "function": "EvaluationMiddleware.wrap_model_call()",
+      "detail": "8,094 Token；耗时 4.4 秒",
+      "status": "success",
+      "sequence": 15,
+      "budget": {
+        "tokens": 13728,
+        "model_calls": 3,
+        "search_calls": 1,
+        "fetch_calls": 1,
+        "elapsed_seconds": 45.8
+      }
+    }
+  ],
+  "sources": [
+    {
+      "call_id": "call_UVe19ZDgwZG6xelpLEf3DGMo",
+      "content_sha256": null,
+      "provider_status": "success",
+      "source_id": "S1",
+      "title": "Top 5 Silliest Animal Moments! | BBC Earth",
+      "url": "https://opentools.ai/youtube-summary/top-5-silliest-animal-moments-or-bbc-earth"
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "trace.jsonl",
+      "description": "模型、工具、预算与故障事件的有序轨迹",
+      "bytes": 33121,
+      "status": "persisted"
+    },
+    {
+      "name": "checkpoint.sqlite",
+      "description": "LangGraph 执行检查点",
+      "bytes": 188416,
+      "status": "persisted"
+    },
+    {
+      "name": "checkpoint_manifest.json",
+      "description": "恢复身份与检查点状态",
+      "bytes": 162,
+      "status": "persisted"
+    },
+    {
+      "name": "budget.json",
+      "description": "Token、工具调用与时限记账",
+      "bytes": 8884,
+      "status": "persisted"
+    },
+    {
+      "name": "source_ledger.json",
+      "description": "Canonical 抓取来源记录",
+      "bytes": 366,
+      "status": "persisted"
+    },
+    {
+      "name": "posthoc_audit.json",
+      "description": "不阻塞答案的后验来源审计",
+      "bytes": 304,
+      "status": "persisted"
+    },
+    {
+      "name": "result.json",
+      "description": "最终结果与冻结评分",
+      "bytes": 29329,
+      "status": "persisted"
+    }
+  ],
+  "replays": [
+    {
+      "id": "0383a3ee-47a7-41a4-b493-519bdefe0488",
+      "label": "顺利完成",
+      "description": "1 次搜索 · 1 次抓取 · 成功回答",
+      "replay_kind": "formal_benchmark",
+      "artifact_directory": "learning/search-agent/output/evaluations/final-transparent-harness-v2-formal-20260722T162330Z/tongagent_standard/0383a3ee-47a7-41a4-b493-519bdefe0488/attempt-0001",
+      "run": {
+        "question": "On the BBC Earth YouTube video of the Top 5 Silliest Animal Moments, what species of bird is featured?",
+        "model_label": "gpt-5.5",
+        "system_id": "tongagent_standard",
+        "completion_status": "completed",
+        "answer_status": "answer",
+        "raw_model_answer": "FINAL_ANSWER: Rockhopper penguin",
+        "final_answer": "FINAL_ANSWER: Rockhopper penguin",
+        "answer_unchanged": true,
+        "raw_em": true,
+        "standard_em": true,
+        "metrics": {
+          "tokens": 13728,
+          "input_tokens": 13549,
+          "output_tokens": 179,
+          "cached_input_tokens": 4736,
+          "model_calls": 3,
+          "search_calls": 1,
+          "fetch_calls": 1,
+          "wall_time_seconds": 45.9
+        },
+        "limits": {
+          "tokens": 60000,
+          "model_calls": 16,
+          "search_calls": 4,
+          "fetch_calls": 6,
+          "wall_time_seconds": 600.0
+        },
+        "checkpoint": {
+          "file": "checkpoint.sqlite",
+          "restored": false,
+          "thread_id": "tongagent-standard-83cb097f4ccd44978f6e6698"
+        }
+      },
+      "timeline": [
+        {
+          "kind": "system",
+          "title": "任务已接收",
+          "module": "evaluation/systems/common.py",
+          "function": "run_graph_system()",
+          "detail": "已创建原子运行目录，轨迹与预算计数同步启动。",
+          "status": "success",
+          "sequence": 1
+        },
+        {
+          "kind": "runtime",
+          "title": "Agent 执行环境准备完成",
+          "module": "evaluation/systems/common.py",
+          "function": "prepare_runtime()",
+          "detail": "模型 gpt-5.5；工具 网页搜索、页面抓取",
+          "status": "success",
+          "sequence": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 1：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "355 Token；耗时 4.3 秒",
+          "status": "success",
+          "sequence": 5,
+          "budget": {
+            "tokens": 355,
+            "model_calls": 1,
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "elapsed_seconds": 5.6
+          }
+        },
+        {
+          "kind": "search",
+          "title": "网页搜索",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "查询：「BBC Earth YouTube \"Top 5 Silliest Animal Moments\" bird species featured」",
+          "status": "success",
+          "sequence": 7,
+          "duration": 15.981755972024985,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "empty"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "success"
+            },
+            {
+              "name": "bing_rss",
+              "status": "skipped"
+            }
+          ],
+          "result_count": 5
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 2：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "5,279 Token；耗时 6.6 秒",
+          "status": "success",
+          "sequence": 10,
+          "budget": {
+            "tokens": 5634,
+            "model_calls": 2,
+            "search_calls": 1,
+            "fetch_calls": 0,
+            "elapsed_seconds": 28.2
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "Top 5 Silliest Animal Moments! | BBC Earth",
+          "status": "success",
+          "sequence": 12,
+          "duration": 13.119414882967249,
+          "source_id": "S1",
+          "url": "https://opentools.ai/youtube-summary/top-5-silliest-animal-moments-or-bbc-earth",
+          "content_chars": 10895,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 3：生成最终答案",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "8,094 Token；耗时 4.4 秒",
+          "status": "success",
+          "sequence": 15,
+          "budget": {
+            "tokens": 13728,
+            "model_calls": 3,
+            "search_calls": 1,
+            "fetch_calls": 1,
+            "elapsed_seconds": 45.8
+          }
+        }
+      ],
+      "sources": [
+        {
+          "call_id": "call_UVe19ZDgwZG6xelpLEf3DGMo",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S1",
+          "title": "Top 5 Silliest Animal Moments! | BBC Earth",
+          "url": "https://opentools.ai/youtube-summary/top-5-silliest-animal-moments-or-bbc-earth"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "trace.jsonl",
+          "description": "模型、工具、预算与故障事件的有序轨迹",
+          "bytes": 33121,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint.sqlite",
+          "description": "LangGraph 执行检查点",
+          "bytes": 188416,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint_manifest.json",
+          "description": "恢复身份与检查点状态",
+          "bytes": 162,
+          "status": "persisted"
+        },
+        {
+          "name": "budget.json",
+          "description": "Token、工具调用与时限记账",
+          "bytes": 8884,
+          "status": "persisted"
+        },
+        {
+          "name": "source_ledger.json",
+          "description": "Canonical 抓取来源记录",
+          "bytes": 366,
+          "status": "persisted"
+        },
+        {
+          "name": "posthoc_audit.json",
+          "description": "不阻塞答案的后验来源审计",
+          "bytes": 304,
+          "status": "persisted"
+        },
+        {
+          "name": "result.json",
+          "description": "最终结果与冻结评分",
+          "bytes": 29329,
+          "status": "persisted"
+        }
+      ]
+    },
+    {
+      "id": "305ac316-eef6-4446-960a-92d80d542f82",
+      "label": "改写查询后完成",
+      "description": "低相关结果 → 调整查询 → 成功回答",
+      "replay_kind": "formal_benchmark",
+      "artifact_directory": "learning/search-agent/output/evaluations/final-transparent-harness-v2-formal-20260722T162330Z/tongagent_standard/305ac316-eef6-4446-960a-92d80d542f82/attempt-0001",
+      "run": {
+        "question": "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? Give only the first name.",
+        "model_label": "gpt-5.5",
+        "system_id": "tongagent_standard",
+        "completion_status": "completed",
+        "answer_status": "answer",
+        "raw_model_answer": "FINAL_ANSWER: Wojciech",
+        "final_answer": "FINAL_ANSWER: Wojciech",
+        "answer_unchanged": true,
+        "raw_em": true,
+        "standard_em": true,
+        "metrics": {
+          "tokens": 54804,
+          "input_tokens": 54031,
+          "output_tokens": 773,
+          "cached_input_tokens": 34176,
+          "model_calls": 5,
+          "search_calls": 3,
+          "fetch_calls": 2,
+          "wall_time_seconds": 99.2
+        },
+        "limits": {
+          "tokens": 60000,
+          "model_calls": 16,
+          "search_calls": 4,
+          "fetch_calls": 6,
+          "wall_time_seconds": 600.0
+        },
+        "checkpoint": {
+          "file": "checkpoint.sqlite",
+          "restored": false,
+          "thread_id": "tongagent-standard-34159df19e4bbae005e97a4d"
+        }
+      },
+      "timeline": [
+        {
+          "kind": "system",
+          "title": "任务已接收",
+          "module": "evaluation/systems/common.py",
+          "function": "run_graph_system()",
+          "detail": "已创建原子运行目录，轨迹与预算计数同步启动。",
+          "status": "success",
+          "sequence": 1
+        },
+        {
+          "kind": "runtime",
+          "title": "Agent 执行环境准备完成",
+          "module": "evaluation/systems/common.py",
+          "function": "prepare_runtime()",
+          "detail": "模型 gpt-5.5；工具 网页搜索、页面抓取",
+          "status": "success",
+          "sequence": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 1：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "422 Token；耗时 5.7 秒",
+          "status": "success",
+          "sequence": 5,
+          "budget": {
+            "tokens": 422,
+            "model_calls": 1,
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "elapsed_seconds": 7.0
+          }
+        },
+        {
+          "kind": "search",
+          "title": "首次搜索结果不够相关",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "原查询：「Polish-language version of Everybody Loves Raymond actor played Ray Magda M.」",
+          "status": "warning",
+          "sequence": 7,
+          "duration": 20.052470362978056,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "success"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "success"
+            },
+            {
+              "name": "bing_rss",
+              "status": "error"
+            }
+          ],
+          "result_count": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 2：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "4,488 Token；耗时 4.7 秒",
+          "status": "success",
+          "sequence": 10,
+          "budget": {
+            "tokens": 4910,
+            "model_calls": 2,
+            "search_calls": 1,
+            "fetch_calls": 0,
+            "elapsed_seconds": 31.9
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "Wszyscy kochają Romana - Wikipedia",
+          "status": "success",
+          "sequence": 14,
+          "duration": 10.503560343000572,
+          "source_id": "S1",
+          "url": "https://en.wikipedia.org/wiki/Wszyscy_kochaj%C4%85_Romana",
+          "content_chars": 3809,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "search",
+          "title": "Agent 改写查询后重新搜索",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "原查询：「Polish-language version of Everybody Loves Raymond actor played Ray Magda M.」 → 新查询：「site:filmpolski.pl Bartłomiej Kasprzykowski \"Magda M.\"」",
+          "status": "recovered",
+          "sequence": 15,
+          "duration": 22.857316602021456,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "empty"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "success"
+            },
+            {
+              "name": "bing_rss",
+              "status": "error"
+            }
+          ],
+          "result_count": 3
+        },
+        {
+          "kind": "search",
+          "title": "首次搜索结果不够相关",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "原查询：「Bartłomiej Kasprzykowski Magda M. role first name」",
+          "status": "warning",
+          "sequence": 16,
+          "duration": 23.06651322398102,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "empty"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "success"
+            },
+            {
+              "name": "bing_rss",
+              "status": "error"
+            }
+          ],
+          "result_count": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 3：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "12,438 Token；耗时 11.4 秒",
+          "status": "success",
+          "sequence": 19,
+          "budget": {
+            "tokens": 17348,
+            "model_calls": 3,
+            "search_calls": 3,
+            "fetch_calls": 1,
+            "elapsed_seconds": 66.3
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "FilmPolski.pl - Bartłomiej Kasprzykowski",
+          "status": "success",
+          "sequence": 21,
+          "duration": 13.45203892904101,
+          "source_id": "S2",
+          "url": "https://www.filmpolski.pl/fp/index.php?osoba=1177273",
+          "content_chars": 12000,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 4：检查来源并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "18,682 Token；耗时 13.3 秒",
+          "status": "success",
+          "sequence": 24,
+          "budget": {
+            "tokens": 36030,
+            "model_calls": 4,
+            "search_calls": 3,
+            "fetch_calls": 2,
+            "elapsed_seconds": 93.1
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "重复抓取被安全阻止",
+          "module": "search_agent.py",
+          "function": "ResearchBudget.fetch_suppression()",
+          "detail": "该链接已成功抓取，安全层阻止重复请求。",
+          "status": "warning",
+          "sequence": 26,
+          "duration": 0.002058007987216115,
+          "source_id": "S2",
+          "url": "https://www.filmpolski.pl/fp/index.php?osoba=1177273",
+          "content_chars": 0,
+          "acquisition_method": null
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 5：生成最终答案",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "18,774 Token；耗时 6.0 秒",
+          "status": "success",
+          "sequence": 29,
+          "budget": {
+            "tokens": 54804,
+            "model_calls": 5,
+            "search_calls": 3,
+            "fetch_calls": 2,
+            "elapsed_seconds": 99.1
+          }
+        }
+      ],
+      "sources": [
+        {
+          "call_id": "call_1vWmlA3wEgsjkeVJVtA5YUPi",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S1",
+          "title": "Wszyscy kochają Romana - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Wszyscy_kochaj%C4%85_Romana"
+        },
+        {
+          "call_id": "call_80doWU6AvA0GO9AKbGCN8xyK",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S2",
+          "title": "FilmPolski.pl - Bartłomiej Kasprzykowski",
+          "url": "https://www.filmpolski.pl/fp/index.php?osoba=1177273"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "trace.jsonl",
+          "description": "模型、工具、预算与故障事件的有序轨迹",
+          "bytes": 64690,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint.sqlite",
+          "description": "LangGraph 执行检查点",
+          "bytes": 520192,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint_manifest.json",
+          "description": "恢复身份与检查点状态",
+          "bytes": 162,
+          "status": "persisted"
+        },
+        {
+          "name": "budget.json",
+          "description": "Token、工具调用与时限记账",
+          "bytes": 15176,
+          "status": "persisted"
+        },
+        {
+          "name": "source_ledger.json",
+          "description": "Canonical 抓取来源记录",
+          "bytes": 619,
+          "status": "persisted"
+        },
+        {
+          "name": "posthoc_audit.json",
+          "description": "不阻塞答案的后验来源审计",
+          "bytes": 284,
+          "status": "persisted"
+        },
+        {
+          "name": "result.json",
+          "description": "最终结果与冻结评分",
+          "bytes": 58991,
+          "status": "persisted"
+        }
+      ]
+    },
+    {
+      "id": "46719c30-f4c3-4cad-be07-d5cb21eee6bb",
+      "label": "预算保护停止",
+      "description": "Token 预算触发 → 安全终止",
+      "replay_kind": "formal_benchmark",
+      "artifact_directory": "learning/search-agent/output/evaluations/final-transparent-harness-v2-formal-20260722T162330Z/tongagent_standard/46719c30-f4c3-4cad-be07-d5cb21eee6bb/attempt-0001",
+      "run": {
+        "question": "Of the authors (First M. Last) that worked on the paper \"Pie Menus or Linear Menus, Which Is Better?\" in 2015, what was the title of the first paper authored by the one that had authored prior papers?",
+        "model_label": "gpt-5.5",
+        "system_id": "tongagent_standard",
+        "completion_status": "budget_exhausted",
+        "answer_status": "empty",
+        "raw_model_answer": null,
+        "final_answer": null,
+        "answer_unchanged": true,
+        "raw_em": false,
+        "standard_em": false,
+        "metrics": {
+          "tokens": 44993,
+          "input_tokens": 43788,
+          "output_tokens": 1205,
+          "cached_input_tokens": 29696,
+          "model_calls": 6,
+          "search_calls": 2,
+          "fetch_calls": 3,
+          "wall_time_seconds": 114.5
+        },
+        "limits": {
+          "tokens": 60000,
+          "model_calls": 16,
+          "search_calls": 4,
+          "fetch_calls": 6,
+          "wall_time_seconds": 600.0
+        },
+        "checkpoint": {
+          "file": "checkpoint.sqlite",
+          "restored": false,
+          "thread_id": "tongagent-standard-502a49ef6c111d0436e98237"
+        }
+      },
+      "timeline": [
+        {
+          "kind": "system",
+          "title": "任务已接收",
+          "module": "evaluation/systems/common.py",
+          "function": "run_graph_system()",
+          "detail": "已创建原子运行目录，轨迹与预算计数同步启动。",
+          "status": "success",
+          "sequence": 1
+        },
+        {
+          "kind": "runtime",
+          "title": "Agent 执行环境准备完成",
+          "module": "evaluation/systems/common.py",
+          "function": "prepare_runtime()",
+          "detail": "模型 gpt-5.5；工具 网页搜索、页面抓取",
+          "status": "success",
+          "sequence": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 1：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "451 Token；耗时 7.3 秒",
+          "status": "success",
+          "sequence": 5,
+          "budget": {
+            "tokens": 451,
+            "model_calls": 1,
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "elapsed_seconds": 8.7
+          }
+        },
+        {
+          "kind": "search",
+          "title": "网页搜索",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "查询：「\"Pie Menus or Linear Menus, Which Is Better?\" 2015 authors」",
+          "status": "success",
+          "sequence": 7,
+          "duration": 16.506322287023067,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "empty"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "success"
+            },
+            {
+              "name": "bing_rss",
+              "status": "skipped"
+            }
+          ],
+          "result_count": 5
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 2：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "4,954 Token；耗时 5.2 秒",
+          "status": "success",
+          "sequence": 10,
+          "budget": {
+            "tokens": 5405,
+            "model_calls": 2,
+            "search_calls": 1,
+            "fetch_calls": 0,
+            "elapsed_seconds": 30.4
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "Pietro Murano - Publications",
+          "status": "success",
+          "sequence": 12,
+          "duration": 8.339107403997332,
+          "source_id": "S1",
+          "url": "https://pietromurano.org/publications.html",
+          "content_chars": 12000,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 3：检查来源并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "8,433 Token；耗时 5.9 秒",
+          "status": "success",
+          "sequence": 15,
+          "budget": {
+            "tokens": 13838,
+            "model_calls": 3,
+            "search_calls": 1,
+            "fetch_calls": 1,
+            "elapsed_seconds": 44.7
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "重复抓取被安全阻止",
+          "module": "search_agent.py",
+          "function": "ResearchBudget.fetch_suppression()",
+          "detail": "该链接已成功抓取，安全层阻止重复请求。",
+          "status": "warning",
+          "sequence": 17,
+          "duration": 0.0023919930099509656,
+          "source_id": "S1",
+          "url": "https://pietromurano.org/publications.html",
+          "content_chars": 0,
+          "acquisition_method": null
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 4：检查来源并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "8,709 Token；耗时 6.3 秒",
+          "status": "success",
+          "sequence": 20,
+          "budget": {
+            "tokens": 22547,
+            "model_calls": 4,
+            "search_calls": 1,
+            "fetch_calls": 1,
+            "elapsed_seconds": 51.0
+          }
+        },
+        {
+          "kind": "search",
+          "title": "首次搜索没有找到结果",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_web_search() → SearchBroker.search()",
+          "detail": "原查询：「site:pietromurano.org/publications.html \"Effectiveness of Mapping Human-Oriented Information\" \"Murano\"」",
+          "status": "warning",
+          "sequence": 22,
+          "duration": 28.024508514034096,
+          "providers": [
+            {
+              "name": "tavily",
+              "status": "not_configured"
+            },
+            {
+              "name": "mediawiki",
+              "status": "empty"
+            },
+            {
+              "name": "duckduckgo_html",
+              "status": "empty"
+            },
+            {
+              "name": "bing_rss",
+              "status": "error"
+            }
+          ],
+          "result_count": 0
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 5：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "9,391 Token；耗时 5.9 秒",
+          "status": "success",
+          "sequence": 25,
+          "budget": {
+            "tokens": 31938,
+            "model_calls": 5,
+            "search_calls": 2,
+            "fetch_calls": 1,
+            "elapsed_seconds": 85.0
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "Pietro Murano - Publications",
+          "status": "success",
+          "sequence": 27,
+          "duration": 12.015578122984152,
+          "source_id": "S1",
+          "url": "https://pietromurano.org/publications.html",
+          "content_chars": 12000,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 6：检查来源并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "13,055 Token；耗时 8.8 秒",
+          "status": "success",
+          "sequence": 30,
+          "budget": {
+            "tokens": 44993,
+            "model_calls": 6,
+            "search_calls": 2,
+            "fetch_calls": 2,
+            "elapsed_seconds": 105.8
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "Pie Menus Or Linear Menus, Which Is Better? 1 Pietro Murano, 2 Iram N - DocsLib",
+          "status": "success",
+          "sequence": 32,
+          "duration": 8.49459451797884,
+          "source_id": "S2",
+          "url": "https://docslib.org/doc/9021566/pie-menus-or-linear-menus-which-is-better-1-pietro-murano-2-iram-n",
+          "content_chars": 12000,
+          "acquisition_method": "direct_http"
+        },
+        {
+          "kind": "budget",
+          "title": "预算保护触发",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware._reserve_model_call()",
+          "detail": "需要预留 18,610 Token，当前仅剩 15,007",
+          "status": "warning",
+          "sequence": 33,
+          "budget": {
+            "tokens": 44993,
+            "model_calls": 6,
+            "search_calls": 2,
+            "fetch_calls": 3,
+            "elapsed_seconds": 114.3
+          }
+        },
+        {
+          "kind": "stop",
+          "title": "任务按预算策略安全停止",
+          "module": "evaluation/systems/common.py",
+          "function": "run_graph_system()",
+          "detail": "未生成无依据答案，已完整保存已有轨迹与运行文件。",
+          "status": "stopped",
+          "sequence": 34
+        }
+      ],
+      "sources": [
+        {
+          "call_id": "call_FajXGlC4JF0OsAbS7JhUHZmX",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S1",
+          "title": "Pietro Murano - Publications",
+          "url": "https://pietromurano.org/publications.html"
+        },
+        {
+          "call_id": "call_dgcTSPUp23b1H7fr3LWkrs6E",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S1",
+          "title": "Pietro Murano - Publications",
+          "url": "https://pietromurano.org/publications.html"
+        },
+        {
+          "call_id": "call_aPbUhmr2gLdBUTzRWlObS4sQ",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S2",
+          "title": "Pie Menus Or Linear Menus, Which Is Better? 1 Pietro Murano, 2 Iram N - DocsLib",
+          "url": "https://docslib.org/doc/9021566/pie-menus-or-linear-menus-which-is-better-1-pietro-murano-2-iram-n"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "trace.jsonl",
+          "description": "模型、工具、预算与故障事件的有序轨迹",
+          "bytes": 57310,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint.sqlite",
+          "description": "LangGraph 执行检查点",
+          "bytes": 565248,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint_manifest.json",
+          "description": "恢复身份与检查点状态",
+          "bytes": 162,
+          "status": "persisted"
+        },
+        {
+          "name": "budget.json",
+          "description": "Token、工具调用与时限记账",
+          "bytes": 15656,
+          "status": "persisted"
+        },
+        {
+          "name": "source_ledger.json",
+          "description": "Canonical 抓取来源记录",
+          "bytes": 940,
+          "status": "persisted"
+        },
+        {
+          "name": "posthoc_audit.json",
+          "description": "不阻塞答案的后验来源审计",
+          "bytes": 244,
+          "status": "persisted"
+        },
+        {
+          "name": "result.json",
+          "description": "最终结果与冻结评分",
+          "bytes": 39615,
+          "status": "persisted"
+        }
+      ]
+    },
+    {
+      "id": "fault-resume-alpha",
+      "label": "中断后恢复",
+      "description": "受控恢复实验 · 中断 → 检查点 → 继续回答",
+      "replay_kind": "controlled_checkpoint_recovery",
+      "artifact_directory": "learning/search-agent/output/evaluations/final-transparent-harness-v2-fault-20260722T175204Z/tongagent_standard/fault-resume-alpha/attempt-0001",
+      "run": {
+        "question": "Which city is stated by the controlled source for fault-resume-alpha?",
+        "model_label": "离线受控模型",
+        "system_id": "tongagent_standard",
+        "completion_status": "completed",
+        "answer_status": "answer",
+        "raw_model_answer": "FINAL_ANSWER: Alpha City",
+        "final_answer": "FINAL_ANSWER: Alpha City",
+        "answer_unchanged": true,
+        "raw_em": true,
+        "standard_em": true,
+        "metrics": {
+          "tokens": 708,
+          "input_tokens": 681,
+          "output_tokens": 27,
+          "cached_input_tokens": 0,
+          "model_calls": 2,
+          "search_calls": 0,
+          "fetch_calls": 1,
+          "wall_time_seconds": 0.8
+        },
+        "limits": {
+          "tokens": 20000,
+          "model_calls": 8,
+          "search_calls": 1,
+          "fetch_calls": 2,
+          "wall_time_seconds": 30.0
+        },
+        "checkpoint": {
+          "file": "checkpoint.sqlite",
+          "restored": true,
+          "thread_id": "tongagent-standard-9ad640013f902944e0caa154"
+        }
+      },
+      "timeline": [
+        {
+          "kind": "system",
+          "title": "任务已接收",
+          "module": "evaluation/systems/common.py",
+          "function": "run_graph_system()",
+          "detail": "已创建原子运行目录，轨迹与预算计数同步启动。",
+          "status": "success",
+          "sequence": 1
+        },
+        {
+          "kind": "runtime",
+          "title": "Agent 执行环境准备完成",
+          "module": "evaluation/systems/common.py",
+          "function": "prepare_runtime()",
+          "detail": "模型 离线受控模型；工具 网页搜索、页面抓取",
+          "status": "success",
+          "sequence": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 1：分析任务并决定下一步",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "149 Token；耗时 0.0 秒",
+          "status": "success",
+          "sequence": 5,
+          "budget": {
+            "tokens": 149,
+            "model_calls": 1,
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "elapsed_seconds": 0.2
+          }
+        },
+        {
+          "kind": "fetch",
+          "title": "来源网页抓取成功",
+          "module": "search_agent.py → retrieval_backend.py",
+          "function": "limited_fetch_url() → RetrievalSession.fetch()",
+          "detail": "受控实验来源页（fault-resume-alpha）",
+          "status": "success",
+          "sequence": 7,
+          "duration": 0.0026215650141239166,
+          "source_id": "S1",
+          "url": "https://fixture.test/fault-resume-alpha",
+          "content_chars": 930,
+          "acquisition_method": null
+        },
+        {
+          "kind": "interrupt",
+          "title": "受控实验模拟进程中断",
+          "module": "evaluation/fault_injection.py",
+          "function": "_run_case()",
+          "detail": "页面抓取完成后终止第一次执行；检查点数据库和已抓取来源保留在原运行目录。",
+          "status": "warning",
+          "sequence": 1
+        },
+        {
+          "kind": "recovery",
+          "title": "从检查点恢复执行",
+          "module": "evaluation/systems/transparent_react.py",
+          "function": "_CheckpointedGraph.invoke()",
+          "detail": "检测到检查点文件 checkpoint.sqlite，恢复同一任务状态；已成功抓取的来源不会再次请求。",
+          "status": "recovered",
+          "sequence": 1
+        },
+        {
+          "kind": "runtime",
+          "title": "恢复后的执行环境已就绪",
+          "module": "evaluation/systems/common.py",
+          "function": "prepare_runtime()",
+          "detail": "模型 离线受控模型；工具 网页搜索、页面抓取",
+          "status": "success",
+          "sequence": 2
+        },
+        {
+          "kind": "model",
+          "title": "模型调用 2：生成最终答案",
+          "module": "evaluation/systems/common.py",
+          "function": "EvaluationMiddleware.wrap_model_call()",
+          "detail": "559 Token；耗时 0.0 秒",
+          "status": "success",
+          "sequence": 5,
+          "budget": {
+            "tokens": 559,
+            "model_calls": 1,
+            "search_calls": 0,
+            "fetch_calls": 0,
+            "elapsed_seconds": 0.0
+          }
+        }
+      ],
+      "sources": [
+        {
+          "call_id": "fixture-315ae8ef75-s001-c0001",
+          "content_sha256": null,
+          "provider_status": "success",
+          "source_id": "S1",
+          "title": "Controlled source for fault-resume-alpha",
+          "url": "https://fixture.test/fault-resume-alpha"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "trace.jsonl",
+          "description": "模型、工具、预算与故障事件的有序轨迹",
+          "bytes": 14120,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint.sqlite",
+          "description": "LangGraph 执行检查点",
+          "bytes": 32768,
+          "status": "persisted"
+        },
+        {
+          "name": "checkpoint_manifest.json",
+          "description": "恢复身份与检查点状态",
+          "bytes": 161,
+          "status": "persisted"
+        },
+        {
+          "name": "budget.json",
+          "description": "Token、工具调用与时限记账",
+          "bytes": 2349,
+          "status": "persisted"
+        },
+        {
+          "name": "source_ledger.json",
+          "description": "Canonical 抓取来源记录",
+          "bytes": 324,
+          "status": "persisted"
+        },
+        {
+          "name": "posthoc_audit.json",
+          "description": "不阻塞答案的后验来源审计",
+          "bytes": 288,
+          "status": "persisted"
+        },
+        {
+          "name": "result.json",
+          "description": "最终结果与冻结评分",
+          "bytes": 5389,
+          "status": "persisted"
+        }
+      ]
+    }
+  ],
+  "benchmark": {
+    "label": "冻结的 48 次正式运行",
+    "systems": [
+      {
+        "system_id": "bare_simple_react",
+        "label": "Bare Simple ReAct",
+        "runs": 16,
+        "answer_rate": 0.4375,
+        "raw_em": 0.25,
+        "standard_em": 0.375,
+        "runner_errors": 1,
+        "budget_exhausted": 8,
+        "mean_wall": 139.6
+      },
+      {
+        "system_id": "tongagent_standard",
+        "label": "TongAgent Standard",
+        "runs": 16,
+        "answer_rate": 0.4375,
+        "raw_em": 0.1875,
+        "standard_em": 0.3125,
+        "runner_errors": 0,
+        "budget_exhausted": 9,
+        "mean_wall": 96.9
+      },
+      {
+        "system_id": "vanilla_deepagents",
+        "label": "Vanilla DeepAgents",
+        "runs": 16,
+        "answer_rate": 0.375,
+        "raw_em": 0.125,
+        "standard_em": 0.3125,
+        "runner_errors": 0,
+        "budget_exhausted": 10,
+        "mean_wall": 84.6
+      }
+    ],
+    "claims": {
+      "accuracy_superiority": false,
+      "performance_non_inferiority": false,
+      "operational_reliability_superiority": true
+    }
+  },
+  "fault_lab": {
+    "label": "受控离线故障注入",
+    "api_cost_usd": 0,
+    "systems": {
+      "bare_simple_react": {
+        "recovery_success_rate": 0.5,
+        "runs": 8,
+        "trace_completeness_rate": 0.75,
+        "valid_terminal_rate": 0.75
+      },
+      "tongagent_standard": {
+        "recovery_success_rate": 1.0,
+        "runs": 8,
+        "trace_completeness_rate": 1.0,
+        "valid_terminal_rate": 1.0
+      }
+    },
+    "scenarios": [
+      {
+        "id": "fetch_first_attempt_failure",
+        "label": "首次抓取失败",
+        "systems": {
+          "bare_simple_react": {
+            "recovery_success": false,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": true,
+            "total_tokens": 1074,
+            "wall_time_seconds": 0.05
+          },
+          "tongagent_standard": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 1,
+            "trace_complete": true,
+            "total_tokens": 1373,
+            "wall_time_seconds": 0.75
+          }
+        }
+      },
+      {
+        "id": "temporary_model_connection_failure",
+        "label": "模型连接暂时中断",
+        "systems": {
+          "bare_simple_react": {
+            "recovery_success": false,
+            "valid_terminal": false,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": false,
+            "total_tokens": null,
+            "wall_time_seconds": 0.03
+          },
+          "tongagent_standard": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": true,
+            "total_tokens": 134,
+            "wall_time_seconds": 0.49
+          }
+        }
+      },
+      {
+        "id": "process_interruption_and_resume",
+        "label": "进程中断与恢复",
+        "systems": {
+          "bare_simple_react": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 1,
+            "trace_complete": true,
+            "total_tokens": 698,
+            "wall_time_seconds": 0.04
+          },
+          "tongagent_standard": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": true,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": true,
+            "total_tokens": 698,
+            "wall_time_seconds": 0.8
+          }
+        }
+      },
+      {
+        "id": "near_budget_exhaustion",
+        "label": "接近预算上限",
+        "systems": {
+          "bare_simple_react": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": true,
+            "total_tokens": 1377,
+            "wall_time_seconds": 0.05
+          },
+          "tongagent_standard": {
+            "recovery_success": true,
+            "valid_terminal": true,
+            "checkpoint_restored": false,
+            "duplicate_fetch_calls": 0,
+            "trace_complete": true,
+            "total_tokens": 1377,
+            "wall_time_seconds": 0.8
+          }
+        }
+      }
+    ]
+  },
+  "architecture": [
+    {
+      "index": "01",
+      "name": "共享 ReAct 策略",
+      "detail": "提示词、模型参数、工具和原始答案保持一致。"
+    },
+    {
+      "index": "02",
+      "name": "统一检索后端",
+      "detail": "Provider 切换、Canonical URL、缓存和 Host 冷却。"
+    },
+    {
+      "index": "03",
+      "name": "执行预算控制",
+      "detail": "统一管理 Token、模型调用、工具调用和业务时限。"
+    },
+    {
+      "index": "04",
+      "name": "透明执行框架",
+      "detail": "检查点、失败重试、原子 Artifact 与持久化轨迹。"
+    },
+    {
+      "index": "05",
+      "name": "后验审计",
+      "detail": "来源账本和证据映射只做审计，绝不改写答案。"
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="TongHarness 可靠执行框架离线可视化 Demo"
+    />
+    <title>TongHarness · 可靠执行框架 Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="#" aria-label="TongHarness Demo">
+          <span class="brand-symbol">
+            <i></i><i></i><i></i>
+          </span>
+          <span class="brand-copy">
+            <strong>TongHarness</strong>
+            <small>面向 Deep Research 的 Agent 可靠执行框架</small>
+          </span>
+        </a>
+        <div class="header-meta">
+          <div class="artifact-mode">
+            <span class="status-dot"></span>
+            <span id="provenance-label">正式轨迹重放</span>
+          </div>
+          <span class="experiment-id visually-hidden" id="experiment-short">
+            loading experiment
+          </span>
+          <span class="offline-badge">离线重放 · 不调用 API</span>
+          <button class="reset-button" id="reset-button" type="button" title="重置重放">
+            重置
+          </button>
+        </div>
+      </header>
+
+      <section class="hero">
+        <div class="hero-question">
+          <p class="eyebrow">输入任务</p>
+          <h1 id="question">正在加载正式实验任务…</h1>
+        </div>
+        <div class="parity-strip" id="parity-strip"></div>
+      </section>
+
+      <section class="policy-map">
+        <div class="policy-title">
+          <span class="policy-index">01</span>
+          <div>
+            <small>基于给定框架实现</small>
+            <strong>SimpleAgent → AgentHarness</strong>
+          </div>
+        </div>
+        <div class="policy-rule" aria-label="共享策略约束">
+          <span>相同提示词</span>
+          <span>相同工具</span>
+          <span>相同模型与预算</span>
+        </div>
+        <div class="policy-branch simple-branch">
+          <div>
+            <small>主办方给定基础框架</small>
+            <strong>SimpleAgent</strong>
+          </div>
+          <span>ReAct + 搜索 + 抓取</span>
+        </div>
+        <div class="branch-arrow" aria-hidden="true">↳</div>
+        <div class="policy-branch harness-branch">
+          <div>
+            <small>可靠执行扩展</small>
+            <strong>AgentHarness 长程研究系统</strong>
+          </div>
+          <div class="service-tags">
+            <span>检查点 / 恢复</span>
+            <span>重试 / 预算</span>
+            <span>轨迹 / 审计</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="primary-grid">
+        <section class="trace-panel card">
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">正式实验轨迹重放</p>
+              <h2>执行轨迹</h2>
+              <small id="event-counter">0 / 0 个事件</small>
+            </div>
+            <div class="trace-selector" id="trace-selector"></div>
+            <div class="replay-controls">
+              <button id="step-button" class="secondary-button" type="button">
+                单步
+              </button>
+              <button id="replay-button" class="primary-button" type="button">
+                <span class="play-symbol">▶</span> 重放执行轨迹
+              </button>
+            </div>
+          </div>
+          <div class="trace-provenance">
+            <span>当前轨迹目录</span>
+            <code id="trace-source-path">正在加载…</code>
+          </div>
+          <div class="timeline-stage" id="timeline-stage">
+            <div class="timeline-empty">
+              <span class="trace-icon">▶</span>
+              <p>正式轨迹已加载</p>
+              <small>点击“重放执行轨迹”查看 Agent 如何完成研究</small>
+            </div>
+          </div>
+        </section>
+
+        <aside class="run-panel card">
+          <div class="card-header compact-header">
+            <div>
+              <p class="eyebrow">运行快照</p>
+              <h2>本次运行</h2>
+            </div>
+            <span class="auditable-badge">可审计</span>
+          </div>
+
+          <div class="metric-grid">
+            <article class="metric-card token-card">
+              <span>Token 用量</span>
+              <strong id="token-value">0</strong>
+              <small><b id="token-percent">0%</b> <span id="token-limit">/ 60,000</span></small>
+              <div class="progress-line"><i id="token-meter"></i></div>
+            </article>
+            <article class="metric-card">
+              <span>模型调用</span>
+              <strong id="model-calls">0 / 16</strong>
+              <div class="progress-line"><i id="model-bar"></i></div>
+            </article>
+            <article class="metric-card">
+              <span>搜索 / 抓取</span>
+              <strong><b id="search-calls">0 / 4</b><em>·</em><b id="fetch-calls">0 / 6</b></strong>
+              <div class="dual-progress">
+                <div class="progress-line"><i id="search-bar"></i></div>
+                <div class="progress-line"><i id="fetch-bar"></i></div>
+              </div>
+            </article>
+            <article class="metric-card">
+              <span>运行耗时</span>
+              <strong id="wall-time">0.0 / 600s</strong>
+              <div class="progress-line"><i id="wall-bar"></i></div>
+            </article>
+          </div>
+
+          <div class="answer-card pending" id="answer-card">
+            <div class="answer-heading">
+              <span>最终短答案</span>
+              <span id="answer-status">等待</span>
+            </div>
+            <p id="answer-value">等待轨迹重放。</p>
+            <div class="answer-checks">
+              <span id="raw-check">原始答案 = 最终答案</span>
+              <span id="score-check">评分待显示</span>
+            </div>
+          </div>
+
+          <div class="integrity-note">
+            <span class="integrity-mark">保</span>
+            <div>
+              <strong>运行保障，不代替模型回答</strong>
+              <small>模型生成答案；Harness 负责预算、恢复和完整记录</small>
+            </div>
+          </div>
+
+          <div class="record-coverage">
+            <div class="record-heading">
+              <strong>完整运行记录</strong>
+              <span id="record-status">6 / 6 已保存</span>
+            </div>
+            <div class="record-grid">
+              <span>输入任务 <b>task.json</b></span>
+              <span>工具轨迹 <b>trace.jsonl</b></span>
+              <span>引用证据 <b id="record-sources">0 个来源</b></span>
+              <span>最终结果 <b>result.json</b></span>
+              <span>评分结果 <b id="record-score">待重放</b></span>
+              <span>成本时延 <b>实时统计</b></span>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <footer>
+        <span>TongHarness · SimpleAgent 的可靠执行扩展</span>
+        <span id="git-sha">git · loading</span>
+        <span>轨迹来自冻结实验 · 不包含参考答案</span>
+      </footer>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
